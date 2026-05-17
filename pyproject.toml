@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirafrag"
+version = "0.1.0"
+description = "Foundation-encoder mass spectrum prediction"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "MiraFrag developers" }]
+license = { text = "MIT" }
+dependencies = [
+  "numpy",
+  "pandas",
+  "torch",
+  "rdkit",
+  "opt_einsum_fx",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff==0.15.2",
+]
+aimnet = [
+  "aimnet",
+]
+mace = [
+  "mace-model",
+]
+all = [
+  "aimnet",
+  "mace-model",
+]
+
+[project.scripts]
+mirafrag-train = "mirafrag.cli.train:main"
+mirafrag-eval = "mirafrag.cli.eval:main"
+mirafrag-predict = "mirafrag.cli.predict:main"
+mirafrag-cache = "mirafrag.cli.cache:main"
+
+[tool.uv.sources]
+mace-model = { path = "../mace-model", editable = true }
+aimnet = { path = "../aimnetcentral", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mirafrag", "mirafrag.*"]
+
+[tool.ruff]
+required-version = "==0.15.2"
+include = ["src/**/*.py", "tests/**/*.py"]
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "PL"]
+ignore = [
+  "E501",
+  "PLC0415",
+  "PLR0912",
+  "PLR0913",
+  "PLR0915",
+  "PLR2004",
+]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+line-ending = "auto"

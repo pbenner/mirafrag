@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+.cache/
+.pytest_cache/
+.ruff_cache/
+
+*.egg-info/
+# MassSpecGym workflow outputs
+resources/massspecgym/checkpoints/
+resources/massspecgym/predictions/
+resources/massspecgym/data/cache/
+resources/massspecgym/data/*
+!resources/massspecgym/data/.gitkeep
