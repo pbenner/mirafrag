@@ -14,14 +14,25 @@ MASS_SPEC_GYM_NUM_BINS = 100500
 
 
 def _is_missing(value) -> bool:
+    """
+    Return whether a table value should be treated as missing.
+    """
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
 def num_spectrum_bins(mz_max: float, bin_width: float) -> int:
+    """
+    Return the number of half-open m/z bins for a range and bin width.
+    """
     return int(math.ceil(float(mz_max) / float(bin_width)))
 
 
 def parse_number_list(value) -> list[float]:
+    """
+    Parse a MassSpecGym-style numeric list field into floats.
+
+    The parser accepts Python lists, NumPy arrays, comma-separated strings, whitespace-separated strings, and bracketed representations.
+    """
     if _is_missing(value):
         values = []
     elif isinstance(value, np.ndarray):
@@ -51,6 +62,9 @@ def parse_peaks(
     intensities_col: str = 'intensities',
     peaks_col: str = 'peaks',
 ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Parse m/z and intensity arrays from a spectrum table row.
+    """
     if peaks_col in row and not _is_missing(row[peaks_col]):
         peaks = row[peaks_col]
         if isinstance(peaks, str):
@@ -82,6 +96,11 @@ def bin_spectrum(
     bin_width: float = MASS_SPEC_GYM_BIN_WIDTH,
     normalize: str = 'l1',
 ) -> torch.Tensor:
+    """
+    Convert sparse peaks to a dense normalized binned spectrum.
+
+    Peaks outside the configured m/z range are ignored. Intensities can be L1-normalized or square-root transformed before normalization.
+    """
     mz_arr = np.asarray(list(mzs), dtype=np.float32)
     int_arr = np.asarray(list(intensities), dtype=np.float32)
     num_bins = num_spectrum_bins(mz_max, bin_width)
@@ -113,6 +132,9 @@ def cosine_similarity(
     sqrt: bool = False,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute cosine similarity between two dense spectra.
+    """
     pred = pred.float()
     target = target.float()
     if sqrt:
@@ -131,6 +153,9 @@ def peaks_from_bins(
     min_intensity: float = 0.001,
     top_k: int | None = 100,
 ) -> dict[str, list[float]]:
+    """
+    Convert dense binned intensities back to sparse peak lists.
+    """
     values = probs.detach().float().cpu()
     if values.ndim != 1:
         raise ValueError('peaks_from_bins expects a single spectrum vector.')

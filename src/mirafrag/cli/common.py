@@ -16,6 +16,11 @@ FRAGMENT_CONFIG_ARG_FIELDS = (
 
 
 def resolve_device(device: str) -> str:
+    """
+    Resolve the CLI device string to a concrete torch device string.
+
+    ``auto`` selects the first CUDA device when available and otherwise CPU. Explicit device strings are returned unchanged.
+    """
     if device == 'auto':
         return 'cuda:0' if torch.cuda.is_available() else 'cpu'
     return device
@@ -27,6 +32,11 @@ def validate_checkpoint_bin_config(
     mz_max: float,
     bin_width: float,
 ) -> None:
+    """
+    Ensure runtime bin settings match a loaded checkpoint.
+
+    The spectrum head has a fixed number of output bins. This guard prevents evaluating or resuming a checkpoint with incompatible ``mz_max`` and ``bin_width`` settings.
+    """
     requested_bins = num_spectrum_bins(mz_max, bin_width)
     if requested_bins != model.config.num_bins:
         raise SystemExit(
@@ -39,6 +49,11 @@ def validate_checkpoint_bin_config(
 
 
 def apply_fragment_args_to_model_config(config, args) -> None:
+    """
+    Apply safe fragment-candidate overrides to a model config.
+
+    Only candidate-generation settings are updated. Head architecture settings are deliberately excluded because changing them would invalidate saved checkpoint weights.
+    """
     # Candidate-generation settings are safe to override on a loaded checkpoint.
     # Head architecture fields, such as fragment_gnn_layers, are intentionally
     # excluded because they belong to the saved spectrum head.
@@ -49,4 +64,9 @@ def apply_fragment_args_to_model_config(config, args) -> None:
 
 
 def value_or_default(value, default):
+    """
+    Return a fallback when an optional CLI value is unset.
+
+    This keeps CLI-to-config conversion explicit without repeating ``if value is None`` logic at every field.
+    """
     return default if value is None else value

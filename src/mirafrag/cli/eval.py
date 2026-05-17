@@ -22,6 +22,11 @@ from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for checkpoint evaluation.
+
+    The options select the MassSpecGym split, checkpoint, bin settings, cache behavior, and exported prediction formatting.
+    """
     parser = argparse.ArgumentParser(
         prog='mirafrag-eval',
         description='Evaluate a MiraFrag checkpoint on a MassSpecGym split.',
@@ -66,6 +71,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    Run evaluation for a MiraFrag checkpoint.
+
+    The command loads the checkpoint, validates bin compatibility, builds a filtered dataset, evaluates sparse predictions, prints summary metrics, and optionally writes a CSV.
+    """
     args = parse_args()
     quiet_rdkit_logs()
     device = resolve_device(args.device)

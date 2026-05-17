@@ -6,6 +6,11 @@ import torch
 def fragment_oos_log_probs(
     pred: dict[str, torch.Tensor | int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Normalize fragment logits and OOS logits into log probabilities per spectrum.
+
+    Each spectrum has its own softmax over its fragment candidates plus one optional OOS bucket. The function returns candidate log probabilities aligned to ``pred['logits']`` and one OOS log probability per spectrum.
+    """
     logits = pred['logits']
     if not isinstance(logits, torch.Tensor):
         raise TypeError("pred['logits'] must be a tensor.")

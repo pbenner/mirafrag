@@ -6,6 +6,12 @@ from typing import Any
 
 @dataclass
 class MiraFragConfig:
+    """
+    Serializable model and candidate-support configuration.
+
+    The dataclass stores head architecture, fragment generation limits, encoder family, foundation model identifiers, and fine-tuning strategy. It is saved in checkpoints and must remain explicit so old and new runs can be distinguished.
+    """
+
     num_bins: int
     hidden_dim: int = 512
     num_layers: int = 2
@@ -29,6 +35,11 @@ class MiraFragConfig:
 
 
 def mirafrag_config_from_dict(data: dict[str, Any]) -> MiraFragConfig:
+    """
+    Reconstruct :class:`MiraFragConfig` from checkpoint data.
+
+    The loader is intentionally strict: missing or unknown fields raise errors rather than being silently ignored. This prevents ambiguous checkpoint compatibility after architecture changes.
+    """
     expected = {field.name for field in fields(MiraFragConfig)}
     supplied = set(data)
     missing = expected - supplied

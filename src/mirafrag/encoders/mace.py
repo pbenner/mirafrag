@@ -14,6 +14,11 @@ def load_mace_encoder(
     model_path: str | None = None,
     device: str | torch.device = 'cpu',
 ) -> nn.Module:
+    """
+    Load a MACE foundation model through ``mace-model``.
+
+    The model can come from a serialized local path or from the foundation-model downloader. The returned torch backend model is moved to the requested device and patched for cuequivariance compatibility.
+    """
     try:
         from mace_model import (
             convert_torch_model,
@@ -48,6 +53,11 @@ def load_mace_encoder(
 
 
 def repair_mace_cuequivariance_config(module: nn.Module) -> None:
+    """
+    Patch missing cuequivariance config objects on converted MACE modules.
+
+    Some converted checkpoints deserialize modules whose symmetric-contraction blocks expect a ``cueq_config`` attribute. This helper restores the minimal config needed for forward passes.
+    """
     for child in module.modules():
         if not hasattr(child, 'symmetric_contractions'):
             continue

@@ -20,6 +20,12 @@ def quiet_rdkit_logs() -> None:
 
 @dataclass(frozen=True)
 class GraphConfig:
+    """
+    Configuration for deterministic SMILES-to-3D-graph conversion.
+
+    The config records encoder-supported atomic numbers, the radial cutoff used for edges, RDKit embedding behavior, geometry optimization options, and validation controls. It is part of the feature-cache key because changing it changes graph tensors.
+    """
+
     atomic_numbers: tuple[int, ...]
     cutoff: float
     seed: int = 17
@@ -33,6 +39,11 @@ class GraphConfig:
 
 
 def atomic_number_index(atomic_numbers: list[int] | tuple[int, ...]) -> dict[int, int]:
+    """
+    Map atomic numbers to one-hot column indices.
+
+    The returned dictionary is used to build ``node_attrs`` tensors matching the selected foundation encoder's supported element ordering.
+    """
     return {int(z): i for i, z in enumerate(atomic_numbers)}
 
 
@@ -43,6 +54,11 @@ def infer_graph_config(
     add_hydrogens: bool = True,
     optimize: bool = True,
 ) -> GraphConfig:
+    """
+    Build a :class:`GraphConfig` from a foundation encoder.
+
+    Encoders are expected to expose ``atomic_numbers`` and ``r_max`` buffers or tensors. Those values define element filtering and graph edge construction for all downstream datasets.
+    """
     atomic_numbers = tuple(int(z) for z in encoder.atomic_numbers.detach().cpu())
     cutoff = float(encoder.r_max.detach().cpu().item())
     return GraphConfig(
@@ -55,6 +71,11 @@ def infer_graph_config(
 
 
 def _embed_molecule(smiles: str, config: GraphConfig) -> Chem.Mol:
+    """
+    Generate a conformer-bearing RDKit molecule from SMILES.
+
+    The routine adds hydrogens when configured, tries several ETKDG parameter variants, optionally relaxes coordinates, validates bonded distances, and may fall back to 2D coordinates for robustness.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f'Invalid SMILES: {smiles!r}')
@@ -90,6 +111,11 @@ def _embed_molecule(smiles: str, config: GraphConfig) -> Chem.Mol:
 
 
 def _embedding_parameter_variants(config: GraphConfig):
+    """
+    Yield increasingly permissive RDKit embedding settings.
+
+    The first variants preserve normal stereochemical and torsional assumptions. Later variants relax constraints to handle difficult molecules that otherwise block dataset loading.
+    """
     variants = [
         {},
         {'useRandomCoords': True},
@@ -114,6 +140,11 @@ def _embedding_parameter_variants(config: GraphConfig):
 
 
 def _set_embed_param(params, name: str, value) -> None:
+    """
+    Set an RDKit embedding parameter when available.
+
+    RDKit exposes slightly different parameter attributes across versions. This helper keeps the code version-tolerant by ignoring missing attributes.
+    """
     try:
         setattr(params, name, value)
     except AttributeError:
@@ -121,6 +152,11 @@ def _set_embed_param(params, name: str, value) -> None:
 
 
 def _optimize_molecule(mol: Chem.Mol, config: GraphConfig) -> Chem.Mol:
+    """
+    Relax an embedded molecule with classical force fields.
+
+    UFF is tried first because it has broad element coverage; MMFF is used as a fallback when all parameters are available. The input molecule is returned even when optimization fails.
+    """
     if not config.optimize:
         return mol
     try:
@@ -140,6 +176,11 @@ def _optimize_molecule(mol: Chem.Mol, config: GraphConfig) -> Chem.Mol:
 
 
 def _has_reasonable_bond_geometry(mol: Chem.Mol, config: GraphConfig) -> bool:
+    """
+    Check whether bonded atoms have plausible distances.
+
+    Bond lengths are compared against covalent-radius sums with broad tolerances. This rejects collapsed or exploded conformers before they are passed to a neural encoder.
+    """
     if not config.validate_bond_geometry:
         return True
     if mol.GetNumConformers() == 0:
@@ -170,6 +211,11 @@ def _has_reasonable_bond_geometry(mol: Chem.Mol, config: GraphConfig) -> bool:
 
 
 def _directed_edges(positions: np.ndarray, cutoff: float) -> torch.Tensor:
+    """
+    Create directed atom-pair edges under a distance cutoff.
+
+    The output has shape ``(2, E)`` and includes both directions for every atom pair within the encoder cutoff, excluding self edges.
+    """
     coords = torch.as_tensor(positions, dtype=torch.get_default_dtype())
     distances = torch.cdist(coords, coords)
     mask = (distances <= float(cutoff)) & ~torch.eye(
@@ -180,6 +226,11 @@ def _directed_edges(positions: np.ndarray, cutoff: float) -> torch.Tensor:
 
 
 def smiles_to_graph(smiles: str, config: GraphConfig) -> TensorDict:
+    """
+    Convert a SMILES string into a foundation-encoder graph.
+
+    The returned dictionary contains positions, atomic numbers, one-hot node attributes, directed edges, zero periodic shifts, cell, and related tensors expected by the MACE and AIMNet adapters.
+    """
     mol = _embed_molecule(smiles, config)
     conformer = mol.GetConformer()
     positions = np.asarray(conformer.GetPositions(), dtype=np.float64)
@@ -215,6 +266,11 @@ def smiles_to_graph(smiles: str, config: GraphConfig) -> TensorDict:
 
 
 def collate_graphs(graphs: list[Mapping[str, torch.Tensor]]) -> TensorDict:
+    """
+    Batch per-molecule graph dictionaries into one graph.
+
+    Node tensors are concatenated, edge indices are offset, and ``batch`` plus ``ptr`` tensors are added so model code can recover molecule membership.
+    """
     if not graphs:
         raise ValueError('Cannot collate an empty graph list.')
 
@@ -268,4 +324,9 @@ def collate_graphs(graphs: list[Mapping[str, torch.Tensor]]) -> TensorDict:
 
 
 def move_graph_to_device(graph: TensorDict, device: torch.device | str) -> TensorDict:
+    """
+    Move every tensor in a graph dictionary to a device.
+
+    This small helper is useful for standalone graph workflows outside the full dataset batch mover.
+    """
     return {key: value.to(device) for key, value in graph.items()}

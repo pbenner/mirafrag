@@ -33,6 +33,11 @@ def smiles_to_fragment_candidates(
     adduct: str | None = None,
     config: FragmentConfig | None = None,
 ) -> dict[str, Any]:
+    """
+    Generate sparse fragment peak candidates for a molecule.
+
+    The generator parses SMILES, builds a recursive atom-removal fragment tree, enumerates hydrogen transfers, applies adduct masses and optional isotope peaks, prunes candidate formulas, and constructs fragment-graph edges.
+    """
     config = config or FragmentConfig()
     adduct_spec = parse_fragment_adduct(adduct, default_mass=float(config.proton_mass))
     mol = Chem.MolFromSmiles(smiles)
@@ -97,6 +102,11 @@ def _prune_fragment_candidates(
     *,
     max_fragments: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[int]]:
+    """
+    Select the retained fragment formulas and isotope peaks.
+
+    Candidates are grouped by atom mask and hydrogen shift, ranked by fragmentation score and mass-related tie breakers, and trimmed to the configured formula budget.
+    """
     if int(max_fragments) <= 0:
         return [], [], []
 
@@ -129,12 +139,18 @@ def _prune_fragment_candidates(
 
 
 def _representative_formula_peak(group: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Choose the representative peak for a formula group.
+    """
     return min(group, key=lambda item: (int(item['isotope_rank']), float(item['mz'])))
 
 
 def _formula_sort_key(
     item: dict[str, Any],
 ) -> tuple[float, int, int, int, float, int, Any]:
+    """
+    Return the deterministic pruning key for a formula candidate.
+    """
     return (
         float(item['score']),
         int(item.get('max_broken', item['num_broken_bonds'])),
@@ -157,6 +173,9 @@ def _formula_features(
     max_bonds: float,
     max_isotope_peaks: float,
 ) -> list[float]:
+    """
+    Build normalized hand-crafted features for one fragment formula.
+    """
     isotope_prob = sum(float(peak['isotope_prob']) for peak in formula_peaks)
     return [
         float(item['mz']) / max(float(mz_max), 1.0),
@@ -173,6 +192,9 @@ def _formula_features(
 def _formula_peak_groups(
     peaks: list[dict[str, Any]],
 ) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    """
+    Group isotope peak candidates by formula identity.
+    """
     groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
     for peak in peaks:
         groups.setdefault((int(peak['mask']), int(peak['h_shift'])), []).append(peak)
@@ -191,6 +213,11 @@ def _add_recursive_fragments(
     adduct_spec: FragmentAdduct,
     config: FragmentConfig,
 ) -> None:
+    """
+    Populate raw candidates from the recursive fragment engine.
+
+    Each generated fragment mask is expanded over allowed hydrogen transfers, adduct masses, and isotope peaks before pruning.
+    """
     engine = _MiraFragFragmentEngine(
         mol=mol,
         atom_hs=atom_hs,
@@ -223,6 +250,9 @@ def _add_recursive_fragments(
 
 
 def _mask_to_atom_indices(mask: int, num_atoms: int) -> tuple[int, ...]:
+    """
+    Convert a bit-mask fragment representation to ordered atom indices.
+    """
     return tuple(atom_idx for atom_idx in range(num_atoms) if mask & (1 << atom_idx))
 
 
@@ -246,6 +276,11 @@ def _add_fragment_candidate(
     adduct_spec: FragmentAdduct,
     config: FragmentConfig,
 ) -> None:
+    """
+    Add all valid peak candidates for one fragment mask.
+
+    The function computes break scores, allowed hydrogen shifts, formula masses, isotope priors, m/z bins, and keeps the best duplicate candidate for each atom/hydrogen/bin/isotope key.
+    """
     if not atom_indices:
         return
     if len(atom_indices) == mol.GetNumAtoms() and int(cut_count) > 0:

@@ -12,6 +12,12 @@ from mirafrag.probability import fragment_oos_log_probs
 
 @dataclass(frozen=True)
 class LossSpec:
+    """
+    Registry entry for a spectrum loss.
+
+    Each entry pairs the callable implementation with the display name printed in progress bars and epoch summaries.
+    """
+
     compute: Callable[..., torch.Tensor]
     display_name: str
 
@@ -27,6 +33,11 @@ def spectrum_loss(
     kl_weight: float = 0.7,
     coverage_weight: float = 0.1,
 ) -> torch.Tensor:
+    """
+    Compute the configured sparse spectrum training loss.
+
+    The prediction dictionary must come from :class:`MiraFragModel` and the batch must contain flattened target m/z, target intensity, and target batch tensors. The returned scalar is suitable for backpropagation.
+    """
     return _sparse_spectrum_loss(
         pred,
         batch,
@@ -50,6 +61,9 @@ def _sparse_spectrum_loss(
     kl_weight: float,
     coverage_weight: float,
 ) -> torch.Tensor:
+    """
+    Dispatch a sparse prediction to the selected registered loss implementation.
+    """
     try:
         loss_spec = LOSS_REGISTRY[loss]
     except KeyError as exc:
@@ -75,6 +89,11 @@ def sparse_binned_cosine_similarity(
     sqrt: bool = False,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute MassSpecGym-style binned cosine for sparse predictions.
+
+    Fragment probabilities are aggregated into bins, OOS probability contributes to the prediction norm but not the target dot product, and one cosine value is returned per spectrum.
+    """
     fragment_log_probs, oos_log_probs = fragment_oos_log_probs(pred)
     pred_values = torch.exp(fragment_log_probs)
     oos_values = torch.exp(oos_log_probs)
@@ -130,6 +149,11 @@ def sparse_tolerance_cosine_similarity(
     tolerance_min_mz: float = 200.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute cosine similarity using m/z tolerance matching instead of exact bins.
+
+    Each target peak is matched to the largest predicted probability within absolute or relative tolerance. OOS probability still contributes to the prediction norm.
+    """
     fragment_log_probs, oos_log_probs = fragment_oos_log_probs(pred)
     pred_values = torch.exp(fragment_log_probs)
     oos_values = torch.exp(oos_log_probs)
@@ -180,6 +204,11 @@ def sparse_binned_kl_divergence(
     *,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute binned KL divergence from target bins to predicted sparse bins.
+
+    Target intensities are normalized per spectrum. Missing target bins are assigned to the learned OOS probability, which lets the model account for peaks outside generated support.
+    """
     logits = pred['logits']
     pred_bins = pred['bins'].long()
     pred_batch = pred['batch'].long()
@@ -234,6 +263,11 @@ def projected_sparse_binned_kl_divergence(
     *,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute KL on target bins projected onto generated support plus OOS.
+
+    This has the same reachable-support optimum as binned cosine while retaining KL-style gradients and explicit supervision for unreachable target mass.
+    """
     logits = pred['logits']
     pred_bins = pred['bins'].long()
     pred_batch = pred['batch'].long()
@@ -291,6 +325,11 @@ def soft_projected_sparse_kl_divergence(
     tolerance_min_mz: float = 200.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute projected KL with Gaussian target-to-candidate assignment.
+
+    Measured peaks distribute their probability mass over nearby candidate m/z values within tolerance, reducing hard bin-boundary effects while keeping an OOS term for unmatched peaks.
+    """
     logits = pred['logits']
     pred_mzs = pred['mzs'].to(device=logits.device, dtype=logits.dtype)
     pred_batch = pred['batch'].long()
@@ -366,6 +405,11 @@ def soft_binned_coverage_kl_divergence(
     coverage_weight: float = 0.1,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute soft-binned KL plus an explicit coverage penalty.
+
+    Predicted and target peaks are smoothed into neighboring bins with Gaussian kernels. A separate coverage term rewards placing probability within tolerance of measured peaks.
+    """
     logits = pred['logits']
     pred_mzs = pred['mzs'].to(device=logits.device, dtype=logits.dtype)
     pred_batch = pred['batch'].long()
@@ -473,6 +517,11 @@ def soft_binned_kl_divergence(
     tolerance_min_mz: float = 200.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute KL between softly binned target and predicted distributions.
+
+    Both measured peaks and candidate probabilities are spread into neighboring bins with Gaussian kernels, preserving probability mass while reducing hard bin artifacts.
+    """
     logits = pred['logits']
     pred_mzs = pred['mzs'].to(device=logits.device, dtype=logits.dtype)
     pred_batch = pred['batch'].long()
@@ -566,6 +615,11 @@ def fragnnet_sparse_cross_entropy(
     gaussian_renormalize: bool = True,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """
+    Compute FraGNNet-style sparse Gaussian cross entropy.
+
+    Predicted fragment probabilities define a Gaussian mixture over m/z. Target peaks within tolerance are trained against that mixture, while unmatched target mass is trained against the OOS probability.
+    """
     logits = pred['logits']
     pred_mzs = pred['mzs'].to(device=logits.device, dtype=logits.dtype)
     pred_batch = pred['batch'].long()
@@ -640,6 +694,9 @@ def _loss_kl(
     batch: dict[str, Any],
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for sparse binned KL.
+    """
     return sparse_binned_kl_divergence(pred, batch).mean()
 
 
@@ -648,6 +705,9 @@ def _loss_projected_kl(
     batch: dict[str, Any],
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for projected sparse binned KL.
+    """
     return projected_sparse_binned_kl_divergence(pred, batch).mean()
 
 
@@ -660,6 +720,9 @@ def _loss_soft_projected_kl(
     mass_tolerance_min_mz: float,
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for soft projected KL.
+    """
     return soft_projected_sparse_kl_divergence(
         pred,
         batch,
@@ -678,6 +741,9 @@ def _loss_soft_binned_kl(
     mass_tolerance_min_mz: float,
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for soft binned KL.
+    """
     return soft_binned_kl_divergence(
         pred,
         batch,
@@ -697,6 +763,9 @@ def _loss_soft_binned_coverage_kl(
     coverage_weight: float,
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for soft binned KL with coverage penalty.
+    """
     return soft_binned_coverage_kl_divergence(
         pred,
         batch,
@@ -716,6 +785,9 @@ def _loss_fragnnet_ce(
     mass_tolerance_min_mz: float,
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for FraGNNet-style sparse cross entropy.
+    """
     return fragnnet_sparse_cross_entropy(
         pred,
         batch,
@@ -730,6 +802,9 @@ def _loss_cosine(
     batch: dict[str, Any],
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for direct binned cosine loss.
+    """
     return 1.0 - sparse_binned_cosine_similarity(pred, batch).mean()
 
 
@@ -740,6 +815,9 @@ def _loss_kl_cosine(
     kl_weight: float,
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for weighted KL and cosine losses.
+    """
     kl_weight = max(0.0, min(float(kl_weight), 1.0))
     kl = sparse_binned_kl_divergence(pred, batch).mean()
     cosine_loss = 1.0 - sparse_binned_cosine_similarity(pred, batch).mean()
@@ -751,6 +829,9 @@ def _loss_sqrt_cosine(
     batch: dict[str, Any],
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for square-root transformed cosine loss.
+    """
     return (
         1.0
         - sparse_binned_cosine_similarity(
@@ -770,6 +851,9 @@ def _loss_tolerance_cosine(
     mass_tolerance_min_mz: float,
     **_: Any,
 ) -> torch.Tensor:
+    """
+    Loss-registry wrapper for tolerance-based cosine loss.
+    """
     return (
         1.0
         - sparse_tolerance_cosine_similarity(
@@ -806,6 +890,9 @@ def _binned_log_probs_from_log_probs(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Aggregate candidate log probabilities by m/z bin using stable log-sum-exp.
+    """
     unique_bins, inverse = torch.unique(bins.long(), sorted=True, return_inverse=True)
     if unique_bins.numel() == 0:
         return unique_bins, log_probs.new_empty(0)
@@ -827,6 +914,9 @@ def _lookup_log_probs(
     eps: float,
     default_log_prob: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """
+    Look up sorted predicted log probabilities at target keys with a default fallback.
+    """
     if default_log_prob is None:
         out = pred_log_probs.new_full(target_keys.shape, math.log(eps))
     else:
@@ -849,6 +939,9 @@ def _lookup_values(
     *,
     eps: float,
 ) -> torch.Tensor:
+    """
+    Look up sorted predicted values at target keys with an epsilon fallback.
+    """
     out = pred_values.new_full(target_keys.shape, float(eps))
     positions = torch.searchsorted(pred_keys, target_keys)
     in_range = positions < pred_keys.numel()
@@ -862,6 +955,9 @@ def _lookup_values(
 
 
 def _bin_width_from_batch(batch: dict[str, Any]) -> float:
+    """
+    Read the scalar bin width stored in a collated batch.
+    """
     bin_width = batch.get('bin_width', 0.01)
     if isinstance(bin_width, torch.Tensor):
         return float(bin_width.flatten()[0].detach().cpu())
@@ -875,6 +971,9 @@ def _target_tolerances(
     relative: bool,
     tolerance_min_mz: float,
 ) -> torch.Tensor:
+    """
+    Return absolute m/z tolerances for target peaks.
+    """
     if relative:
         denominator = torch.clamp(target_mzs, min=float(tolerance_min_mz))
         return denominator * float(tolerance)
@@ -889,6 +988,9 @@ def _target_support_mask(
     relative: bool,
     tolerance_min_mz: float,
 ) -> torch.Tensor:
+    """
+    Return which target peaks have at least one candidate within tolerance.
+    """
     if pred_mzs.numel() == 0:
         return torch.zeros_like(target_mzs, dtype=torch.bool)
     tolerances = _target_tolerances(
@@ -913,6 +1015,9 @@ def _soft_binned_distribution(
     eps: float,
     normalize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Spread sparse peak values into neighboring bins with normalized Gaussian kernels.
+    """
     if mzs.numel() == 0:
         return torch.empty(0, dtype=torch.long, device=mzs.device), values.new_empty(0)
     safe_bin_width = max(float(bin_width), eps)
@@ -965,6 +1070,9 @@ def _aggregate_values(
     keys: torch.Tensor,
     values: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sum values that share the same integer key.
+    """
     unique_keys, inverse = torch.unique(keys.long(), sorted=True, return_inverse=True)
     out = values.new_zeros(unique_keys.shape)
     out.index_add_(0, inverse, values)
@@ -980,6 +1088,9 @@ def _keyed_cosine(
     eps: float,
     pred_extra_values: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """
+    Compute cosine similarity between two sparse keyed vectors.
+    """
     if pred_extra_values is None or pred_extra_values.numel() == 0:
         pred_norm = torch.linalg.vector_norm(pred_values)
     else:

@@ -21,6 +21,11 @@ def save_checkpoint(
     *,
     train_config: dict[str, Any] | None = None,
 ) -> None:
+    """
+    Write a strict MiraFrag state checkpoint.
+
+    The checkpoint stores a state dict, serializable model config, metadata config, and training configuration. It intentionally does not pickle the model object, so loading is explicit about the foundation encoder and package code in use.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -38,6 +43,11 @@ def load_checkpoint(
     *,
     device: str | torch.device = 'cpu',
 ) -> tuple[MiraFragModel, dict[str, Any]]:
+    """
+    Load a MiraFrag checkpoint and reconstruct the model.
+
+    The loader validates the checkpoint format, rebuilds the configured foundation encoder, instantiates :class:`MiraFragModel`, and loads the saved state dict. The returned model is moved to ``device`` and placed in evaluation mode.
+    """
     payload = torch.load(path, map_location=device, weights_only=True)
     _validate_checkpoint_payload(payload)
     model = _load_state_checkpoint_model(payload, device=device)
@@ -48,6 +58,11 @@ def load_checkpoint(
 
 
 def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
+    """
+    Validate the top-level checkpoint schema.
+
+    This catches old pickle-style checkpoints or partially written files before any model construction starts. A clear error is raised when required keys or the expected format marker are missing.
+    """
     required = {
         'checkpoint_format',
         'model_state_dict',
@@ -72,6 +87,11 @@ def _load_state_checkpoint_model(
     *,
     device: str | torch.device,
 ) -> MiraFragModel:
+    """
+    Instantiate a model from a validated checkpoint payload.
+
+    The function rebuilds the saved MiraFrag and metadata configs, loads the requested encoder family, and restores all model parameters from the state dict.
+    """
     config = mirafrag_config_from_dict(payload['mirafrag_config'])
     metadata_config = MetadataConfig.from_dict(payload['metadata_config'])
     encoder = load_foundation_encoder(

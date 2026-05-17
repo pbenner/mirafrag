@@ -17,6 +17,11 @@ def load_foundation_encoder(
     aimnet_path: str | None = None,
     device: str | torch.device = 'cpu',
 ) -> nn.Module:
+    """
+    Load the configured foundation atom encoder.
+
+    The returned module must expose ``atomic_numbers`` and ``r_max`` and return a dictionary containing per-atom ``node_feats`` when called by :class:`MiraFragModel`. Supported encoder families are MACE and AIMNet.
+    """
     if encoder_type == 'mace':
         return load_mace_encoder(
             source=foundation_source,

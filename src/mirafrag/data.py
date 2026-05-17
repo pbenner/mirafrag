@@ -44,6 +44,12 @@ FEATURE_CACHE_FORMAT = 'mirafrag-feature-v1'
 
 @dataclass
 class MetadataConfig:
+    """
+    Serializable metadata vocabulary and normalization statistics.
+
+    It stores categorical vocabularies for adducts and instruments plus robust collision-energy scaling learned from the training split. The model uses this object to build metadata feature vectors.
+    """
+
     adduct_to_idx: dict[str, int]
     instrument_to_idx: dict[str, int]
     precursor_mz_max: float = MASS_SPEC_GYM_MZ_MAX
@@ -56,10 +62,16 @@ class MetadataConfig:
 
     @property
     def num_adducts(self) -> int:
+        """
+        Return the adduct vocabulary size including the unknown bucket.
+        """
         return len(self.adduct_to_idx) + 1
 
     @property
     def num_instruments(self) -> int:
+        """
+        Return the instrument vocabulary size including the unknown bucket.
+        """
         return len(self.instrument_to_idx) + 1
 
     @classmethod
@@ -70,6 +82,11 @@ class MetadataConfig:
         precursor_mz_max: float = MASS_SPEC_GYM_MZ_MAX,
         collision_energy_max: float = 100.0,
     ) -> MetadataConfig:
+        """
+        Learn metadata vocabularies and collision-energy statistics from a dataframe.
+
+        Adduct and instrument labels are collected from non-missing values. Collision energy is standardized with robust median/IQR statistics globally and, when enough examples exist, per instrument.
+        """
         adduct_col = find_column(df, ADDUCT_ALIASES, required=False)
         instrument_col = find_column(df, INSTRUMENT_ALIASES, required=False)
         ce_col = find_column(df, CE_ALIASES, required=False)
@@ -112,6 +129,11 @@ class MetadataConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MetadataConfig:
+        """
+        Load metadata configuration from a strict checkpoint dictionary.
+
+        Unknown or missing keys raise errors so checkpoint metadata cannot drift silently from the model code's expectations.
+        """
         required = {
             'adduct_to_idx',
             'instrument_to_idx',
@@ -151,6 +173,9 @@ class MetadataConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """
+        Return a JSON-serializable dictionary representation.
+        """
         return asdict(self)
 
 
@@ -160,6 +185,11 @@ def find_column(
     *,
     required: bool = True,
 ) -> str | None:
+    """
+    Find the first available column among known aliases.
+
+    When ``required`` is true, a descriptive error is raised if none of the aliases exist. Optional lookups return ``None`` instead.
+    """
     for name in names:
         if name in df.columns:
             return name
@@ -169,6 +199,11 @@ def find_column(
 
 
 def read_table(path: str | Path | None) -> pd.DataFrame:
+    """
+    Read a CSV, TSV, JSONL, or MassSpecGym-provided table.
+
+    When ``path`` is omitted, the function tries to load MassSpecGym through its Python package. Local paths are parsed based on file suffix.
+    """
     if path is None:
         try:
             from massspecgym.utils import load_massspecgym
@@ -188,6 +223,11 @@ def read_table(path: str | Path | None) -> pd.DataFrame:
 
 
 def filter_massspecgym_simulation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Select MassSpecGym spectrum-simulation rows with collision energy.
+
+    The simulation-challenge flag is interpreted from booleans, numeric values, and common truthy strings. Rows without collision energy are removed because the training task uses CE metadata.
+    """
     out = df.copy()
     if 'simulation_challenge' in out.columns:
         out = out[_boolean_mask(out['simulation_challenge'])]
@@ -198,6 +238,11 @@ def filter_massspecgym_simulation(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _boolean_mask(series: pd.Series) -> pd.Series:
+    """
+    Convert a heterogeneous series to a boolean mask.
+
+    The helper accepts real booleans, numeric values, and common truthy strings while treating missing values as false.
+    """
     truthy = {'1', 'true', 't', 'yes', 'y'}
 
     def coerce(value) -> bool:
@@ -218,6 +263,11 @@ def filter_supported_elements(
     supported_atomic_numbers: tuple[int, ...] | list[int],
     smiles_col: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
+    """
+    Drop molecules containing elements unsupported by the encoder.
+
+    The function parses each SMILES with RDKit, compares atomic numbers with the encoder support set, and returns both the filtered dataframe and detailed drop statistics.
+    """
     smiles_col = smiles_col or find_column(df, SMILES_ALIASES)
     supported = {int(z) for z in supported_atomic_numbers}
     keep = []
@@ -261,6 +311,11 @@ def select_split(
     split_col: str = 'auto',
     split_value: str | None = None,
 ) -> pd.DataFrame:
+    """
+    Select rows from a named train/validation/test split.
+
+    The split column can be inferred from common names, or a caller can pass an explicit column and split value. Labels are normalized to handle common aliases such as ``valid`` and ``validation``.
+    """
     if split_value is not None:
         if split_col == 'auto':
             split_col = _infer_split_col(df)
@@ -284,6 +339,9 @@ def select_split(
 
 
 def _infer_split_col(df: pd.DataFrame, required: bool = True) -> str | None:
+    """
+    Infer the dataframe column that stores split labels.
+    """
     for col in ('split', 'fold', 'datasplit', 'data_split'):
         if col in df.columns:
             return col
@@ -295,6 +353,9 @@ def _infer_split_col(df: pd.DataFrame, required: bool = True) -> str | None:
 
 
 def _coerce_float(value, default: float = 0.0) -> float:
+    """
+    Convert a value to float with a default for missing or invalid values.
+    """
     try:
         if value is None or (isinstance(value, float) and np.isnan(value)):
             return default
@@ -304,6 +365,9 @@ def _coerce_float(value, default: float = 0.0) -> float:
 
 
 def _coerce_string(value) -> str:
+    """
+    Convert a dataframe value to a clean string, mapping missing values to empty string.
+    """
     if value is None:
         return ''
     try:
@@ -315,6 +379,9 @@ def _coerce_string(value) -> str:
 
 
 def _coerce_optional_float(value) -> float:
+    """
+    Convert a value to float and use NaN for missing or invalid values.
+    """
     try:
         if value is None or (isinstance(value, float) and np.isnan(value)):
             return float('nan')
@@ -325,6 +392,9 @@ def _coerce_optional_float(value) -> float:
 
 
 def _finite_float_array(values) -> np.ndarray:
+    """
+    Convert a sequence to a finite-only NumPy float array.
+    """
     out = np.asarray([_coerce_optional_float(value) for value in values], dtype=float)
     return out[np.isfinite(out)]
 
@@ -334,6 +404,11 @@ def _robust_center_scale(
     *,
     fallback_scale: float,
 ) -> tuple[float, float]:
+    """
+    Compute robust center and scale for collision-energy normalization.
+
+    The center is the median and the scale is IQR adjusted to standard-deviation units. Standard deviation and a safe fallback are used when the robust scale collapses.
+    """
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
     safe_fallback = max(float(fallback_scale), 1.0)
@@ -358,6 +433,11 @@ def _collision_energy_stats_by_instrument(
     fallback_scale: float,
     min_values: int = 5,
 ) -> dict[str, dict[str, float]]:
+    """
+    Compute per-instrument robust collision-energy normalization statistics.
+
+    Instrument groups with too few finite values are skipped so rare instruments fall back to the global normalization.
+    """
     stats: dict[str, dict[str, float]] = {}
     for instrument, group in df.groupby(instrument_col, dropna=True):
         values = _finite_float_array(group[ce_col])
@@ -369,6 +449,12 @@ def _collision_energy_stats_by_instrument(
 
 
 class BinnedSpectrumDataset(Dataset):
+    """
+    Dataset that yields graph, metadata, spectrum targets, and fragment candidates.
+
+    Despite the historical name, predictions are sparse fragment candidates; the dense bin settings are used for target binning, cache keys, and MassSpecGym metric compatibility. Optional disk and memory caches avoid recomputing expensive graph and fragment features.
+    """
+
     def __init__(
         self,
         df: pd.DataFrame,
@@ -385,6 +471,11 @@ class BinnedSpectrumDataset(Dataset):
         slow_sample_seconds: float = 0.0,
         trace_samples: bool = False,
     ) -> None:
+        """
+        Initialize dataframe columns, cache settings, and feature-generation configs.
+
+        The dataset keeps a reset-index copy of the dataframe and resolves column aliases once. Graphs and fragments can be cached in memory per worker and/or on disk across runs.
+        """
         self.df = df.reset_index(drop=True).copy()
         self.graph_config = graph_config
         self.metadata_config = metadata_config
@@ -407,9 +498,17 @@ class BinnedSpectrumDataset(Dataset):
         self.ce_col = find_column(self.df, CE_ALIASES, required=False)
 
     def __len__(self) -> int:
+        """
+        Return the number of dataframe rows available to the dataset.
+        """
         return len(self.df)
 
     def _graph(self, idx: int) -> dict[str, torch.Tensor]:
+        """
+        Load or compute the encoder graph for one row.
+
+        Disk cache keys include the SMILES string and graph configuration, so different encoders or embedding settings do not share incompatible graph tensors.
+        """
         if self.memory_cache and idx in self._graph_cache:
             return self._graph_cache[idx]
         smiles = str(self.df.at[idx, self.smiles_col])
@@ -434,6 +533,11 @@ class BinnedSpectrumDataset(Dataset):
         return graph
 
     def _fragments(self, idx: int) -> dict[str, Any]:
+        """
+        Load or compute fragment candidates for one row.
+
+        Fragment cache keys include SMILES, adduct, mass range, bin width, and fragment settings because each of those changes candidate m/z support.
+        """
         if self.memory_cache and idx in self._fragment_cache:
             return self._fragment_cache[idx]
         smiles = str(self.df.at[idx, self.smiles_col])
@@ -475,6 +579,11 @@ class BinnedSpectrumDataset(Dataset):
         smiles: str,
         settings: dict[str, Any],
     ) -> Path:
+        """
+        Build the deterministic disk cache path for one feature payload.
+
+        The cache path is a SHA-256 digest over format version, feature kind, SMILES, and settings, which keeps filenames short while preserving invalidation behavior.
+        """
         if self.disk_cache_dir is None:
             raise RuntimeError('disk_cache_dir is not configured.')
         payload = {
@@ -488,6 +597,11 @@ class BinnedSpectrumDataset(Dataset):
         return self.disk_cache_dir / kind / f'{digest}.pt'
 
     def _metadata(self, row) -> dict[str, torch.Tensor]:
+        """
+        Convert one dataframe row into model metadata tensors.
+
+        The returned tensors include precursor m/z, collision energy, categorical indices, and parsed adduct charge for charge-aware encoders such as AIMNet.
+        """
         precursor_mz = (
             _coerce_float(row.get(self.precursor_col), 0.0)
             if self.precursor_col
@@ -522,6 +636,11 @@ class BinnedSpectrumDataset(Dataset):
         }
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        """
+        Return one training/evaluation sample dictionary.
+
+        The item always contains graph, metadata, identifiers, and bin width. Spectrum targets and fragment candidates are included according to dataset configuration, with optional slow-sample diagnostics.
+        """
         start = time.perf_counter()
         row = self.df.iloc[idx]
         smiles = str(row[self.smiles_col])
@@ -568,6 +687,11 @@ class BinnedSpectrumDataset(Dataset):
 
 
 def collate_spectrum_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Collate dataset samples into a model-ready batch.
+
+    Graphs are concatenated, metadata tensors are stacked, variable-length target peaks are flattened with a target-batch index, and fragment candidates are offset into global graph node coordinates.
+    """
     graph = collate_graphs([item['graph'] for item in items])
     batch = {
         'graph': graph,
@@ -626,6 +750,11 @@ def dataloader_performance_kwargs(
     num_workers: int,
     device: torch.device | str,
 ) -> dict[str, Any]:
+    """
+    Return DataLoader options tuned for the selected worker/device setup.
+
+    CUDA loaders use pinned memory, and multi-worker loaders use persistent workers, small prefetching, and an RDKit log-silencing worker initializer.
+    """
     kwargs: dict[str, Any] = {}
     if _is_cuda_device(device):
         kwargs['pin_memory'] = True
@@ -637,6 +766,11 @@ def dataloader_performance_kwargs(
 
 
 def _load_feature_cache(path: Path) -> Any | None:
+    """
+    Load a feature cache file and validate its format/version.
+
+    Invalid, stale, or unreadable cache files are deleted and treated as misses so future accesses can regenerate them.
+    """
     if not path.exists():
         return None
     try:
@@ -657,6 +791,11 @@ def _load_feature_cache(path: Path) -> Any | None:
 
 
 def _save_feature_cache(path: Path, value: Any) -> None:
+    """
+    Atomically write a graph or fragment feature cache file.
+
+    A process-specific temporary file is written first and then replaced into position to reduce corruption when multiple workers fill the same cache.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
     try:
@@ -677,12 +816,20 @@ def _save_feature_cache(path: Path, value: Any) -> None:
 
 
 def _quiet_rdkit_worker_init(_worker_id: int) -> None:
+    """
+    Silence RDKit logs inside a DataLoader worker process.
+    """
     quiet_rdkit_logs()
 
 
 def move_batch_to_device(
     batch: dict[str, Any], device: torch.device | str
 ) -> dict[str, Any]:
+    """
+    Move tensors in a collated batch to a torch device.
+
+    Nested graph and fragment dictionaries are handled recursively one level deep, while non-tensor metadata such as SMILES strings and identifiers stays on the host.
+    """
     non_blocking = _is_cuda_device(device)
     out = {}
     for key, value in batch.items():
@@ -698,4 +845,7 @@ def move_batch_to_device(
 
 
 def _is_cuda_device(device: torch.device | str) -> bool:
+    """
+    Return whether a torch device string or object refers to CUDA.
+    """
     return torch.device(device).type == 'cuda'

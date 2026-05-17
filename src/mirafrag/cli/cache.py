@@ -31,6 +31,11 @@ from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for cache precomputation.
+
+    The options define input data, encoder selection, fragment support settings, splits, and DataLoader behavior for filling disk feature caches.
+    """
     parser = argparse.ArgumentParser(
         prog='mirafrag-cache',
         description='Precompute MiraFrag graph and fragment feature caches.',
@@ -117,10 +122,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def _precompute_collate(items: list[dict]) -> int:
+    """
+    Return the number of samples in a cache precompute batch.
+
+    All useful work happens in ``Dataset.__getitem__`` when graph and fragment caches are generated, so the collate function only reports progress counts.
+    """
     return len(items)
 
 
 def main() -> None:
+    """
+    Run the feature-cache precomputation command.
+
+    The command loads either a checkpoint-defined encoder/config or a fresh foundation encoder, filters rows to supported elements, deduplicates cache keys, and fills graph/fragment cache files.
+    """
     args = parse_args()
     quiet_rdkit_logs()
     device = resolve_device(args.device)
@@ -186,6 +201,11 @@ def _precompute_frame(
     fragment_config: FragmentConfig,
     args: argparse.Namespace,
 ) -> None:
+    """
+    Precompute cache entries for one selected dataframe split.
+
+    Rows are element-filtered and deduplicated by SMILES/adduct before a DataLoader walks the dataset, causing missing graph and fragment cache files to be written.
+    """
     df, element_stats = filter_supported_elements(
         df,
         supported_atomic_numbers=graph_config.atomic_numbers,
@@ -256,6 +276,11 @@ def _precompute_frame(
 
 
 def _deduplicate_cache_rows(df):
+    """
+    Drop repeated rows that map to the same cache entries.
+
+    Graph caches depend on SMILES and fragment caches depend on SMILES plus adduct, so repeated spectra with identical keys do not need to be recomputed.
+    """
     smiles_col = find_column(df, SMILES_ALIASES)
     adduct_col = find_column(df, ADDUCT_ALIASES, required=False)
     subset = [smiles_col]
@@ -268,10 +293,20 @@ def _apply_fragment_args_to_model_config(
     config: MiraFragConfig,
     args: argparse.Namespace,
 ) -> None:
+    """
+    Apply candidate-support overrides to a loaded config.
+
+    This wrapper keeps cache CLI code aligned with the shared fragment-argument policy in ``cli.common``.
+    """
     apply_fragment_args_to_model_config(config, args)
 
 
 def _fragment_config_from_args(args: argparse.Namespace) -> FragmentConfig:
+    """
+    Build a fragment-generation config from CLI arguments.
+
+    Unset command-line values fall back to :class:`FragmentConfig` defaults, which lets the cache command run without requiring a checkpoint.
+    """
     default = FragmentConfig()
     return FragmentConfig(
         max_tree_depth=value_or_default(

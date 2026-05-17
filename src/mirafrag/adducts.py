@@ -35,12 +35,23 @@ ADDUCT_FORMULA_ALIASES = {
 
 @dataclass(frozen=True)
 class Adduct:
+    """
+    Parsed ion adduct description.
+
+    The object stores the bracket label, molecule multiplier, signed mass delta, and ion charge. It is used by fragmentation and metadata code to convert neutral fragment masses into observed m/z values.
+    """
+
     label: str
     molecule_multiplier: int
     mass_delta: float
     charge: int
 
     def mz(self, neutral_mass: float) -> float:
+        """
+        Convert a neutral molecular or fragment mass to m/z.
+
+        The calculation applies the molecule multiplier, adds the parsed adduct mass delta, and divides by the absolute ion charge. A zero charge is guarded as singly charged to keep malformed fallbacks from crashing downstream code.
+        """
         charge_abs = max(abs(int(self.charge)), 1)
         return (
             float(self.molecule_multiplier) * float(neutral_mass)
@@ -49,6 +60,11 @@ class Adduct:
 
 
 def parse_adduct(adduct: str | None, *, default_mass: float = PROTON_MASS) -> Adduct:
+    """
+    Parse a bracketed mass-spectrometry adduct string.
+
+    Supported inputs include common signed forms such as ``[M+H]+``, ``[M-H]-``, ``[M+Na]+``, ``[M+2H]2+``, and formula modifiers such as ``[M+FA-H]-``. Missing or NaN labels fall back to protonation so prediction-only inputs still produce candidate masses.
+    """
     label = str(adduct or '').strip()
     if not label or label.lower() == 'nan':
         return Adduct('[M+H]+', 1, float(default_mass), 1)
@@ -88,6 +104,11 @@ def parse_adduct(adduct: str | None, *, default_mass: float = PROTON_MASS) -> Ad
 
 
 def parse_adduct_charge(adduct: str | None) -> int:
+    """
+    Return the integer ion charge encoded in an adduct label.
+
+    This helper only reads the suffix after the closing bracket, for example ``+``, ``-``, ``2+``, or ``3-``. Invalid or missing suffixes return zero so callers can decide how strict they want to be.
+    """
     text = str(adduct or '').strip()
     match = _ADDUCT_CHARGE_PATTERN.search(text)
     if match is None:
@@ -97,6 +118,11 @@ def parse_adduct_charge(adduct: str | None) -> int:
 
 
 def parse_adduct_charge_suffix(suffix: str) -> int:
+    """
+    Parse a bare charge suffix into a signed integer.
+
+    The suffix is expected to end in ``+`` or ``-`` with an optional leading magnitude. Empty strings and malformed suffixes return zero rather than raising.
+    """
     if not suffix:
         return 0
     sign = suffix[-1]
@@ -110,10 +136,20 @@ def parse_adduct_charge_suffix(suffix: str) -> int:
 def adduct_mass_delta(
     adduct: str | None, *, default_mass: float = PROTON_MASS
 ) -> float:
+    """
+    Return only the signed mass delta for an adduct.
+
+    This is a convenience wrapper around :func:`parse_adduct` for call sites that need ion mass adjustment but do not need the molecule multiplier or charge.
+    """
     return parse_adduct(adduct, default_mass=default_mass).mass_delta
 
 
 def _adduct_expression_mass(expression: str) -> float:
+    """
+    Evaluate the signed expression inside an adduct body.
+
+    The expression is the part after ``M`` and is parsed as a sequence of ``+TERM`` or ``-TERM`` modifiers. Each term can be a formula or a supported alias such as ``FA`` or ``ACN``.
+    """
     if not expression:
         return 0.0
     total = 0.0
@@ -135,6 +171,11 @@ def _adduct_expression_mass(expression: str) -> float:
 
 
 def _adduct_term_mass(term: str) -> float:
+    """
+    Convert one adduct modifier term to a neutral mass.
+
+    Terms may have a leading multiplier and may use formula aliases. The returned value does not include electron-mass correction; that is applied once the net ion charge is known.
+    """
     formula = ADDUCT_FORMULA_ALIASES.get(term.upper(), term)
     pos = 0
     multiplier_text = ''
@@ -146,6 +187,11 @@ def _adduct_term_mass(term: str) -> float:
 
 
 def formula_mass(formula: str) -> float:
+    """
+    Compute a monoisotopic mass for a simple chemical formula.
+
+    The parser supports element symbols followed by optional integer counts. It intentionally rejects unknown elements and malformed formula strings so unsupported adducts do not silently produce wrong masses.
+    """
     if not formula:
         raise ValueError('Empty adduct formula.')
     total = 0.0

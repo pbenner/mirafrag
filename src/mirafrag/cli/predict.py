@@ -20,6 +20,11 @@ from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for prediction-only inference.
+
+    Prediction inputs require structures and may include metadata columns. The output is a CSV of sparse predicted peak lists.
+    """
     parser = argparse.ArgumentParser(
         prog='mirafrag-predict',
         description='Predict MS/MS spectra with a MiraFrag checkpoint.',
@@ -55,6 +60,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    Run prediction-only inference with a MiraFrag checkpoint.
+
+    The command loads a checkpoint, filters unsupported elements, builds fragment candidates, evaluates the model without targets, and writes predicted spectra.
+    """
     args = parse_args()
     quiet_rdkit_logs()
     device = resolve_device(args.device)

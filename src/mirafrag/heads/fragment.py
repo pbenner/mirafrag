@@ -10,7 +10,16 @@ from mirafrag.fragments import FRAGMENT_EDGE_FEATURE_DIM
 
 
 class FragmentSpectrumHead(nn.Module):
+    """
+    Sparse candidate-based spectrum head.
+
+    The head pools foundation encoder atom features over fragment formulas, appends fragment features and precursor metadata, optionally runs message passing over the fragment graph, scores formulas, expands scores to isotope/adduct peak candidates, and predicts an OOS logit.
+    """
+
     def __init__(self, config: MiraFragConfig) -> None:
+        """
+        Create fragment encoders, optional graph message layers, candidate scorer, and OOS scorer.
+        """
         super().__init__()
         self.num_bins = int(config.num_bins)
         self.fragment_gnn_layers = nn.ModuleList(
@@ -45,6 +54,9 @@ class FragmentSpectrumHead(nn.Module):
 
     @staticmethod
     def _make_oos_scorer(config: MiraFragConfig) -> nn.Module:
+        """
+        Build the small network that predicts out-of-support probability per spectrum.
+        """
         metadata_feature_dim = 2 + 2 * int(config.metadata_dim)
         return nn.Sequential(
             nn.Linear(metadata_feature_dim, config.hidden_dim),
@@ -58,6 +70,11 @@ class FragmentSpectrumHead(nn.Module):
         fragments: dict[str, torch.Tensor],
         metadata_features: torch.Tensor,
     ) -> dict[str, Any]:
+        """
+        Score sparse fragment peak candidates for a batch.
+
+        The returned dictionary contains candidate logits, OOS logits, m/z values, bins, formula indices, graph edges, batch indices, and shape metadata consumed by losses and evaluation.
+        """
         fragment_batch = fragments['batch'].to(device=node_feats.device).long()
         batch_size = int(metadata_features.shape[0])
         if fragment_batch.numel() == 0:
@@ -143,6 +160,9 @@ class FragmentSpectrumHead(nn.Module):
         atom_index: torch.Tensor,
         atom_ptr: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Mean-pool atom features for each fragment formula using atom pointer ranges.
+        """
         num_fragments = max(int(atom_ptr.numel()) - 1, 0)
         pooled = node_feats.new_zeros(num_fragments, node_feats.shape[-1])
         if num_fragments == 0:
@@ -160,7 +180,16 @@ class FragmentSpectrumHead(nn.Module):
 
 
 class FragmentGraphMessageLayer(nn.Module):
+    """
+    One message-passing layer over the fragment relationship graph.
+
+    Messages are gated by edge features, averaged at each destination formula, and combined with residual MLP updates and layer normalization.
+    """
+
     def __init__(self, *, hidden_dim: int, edge_dim: int, dropout: float) -> None:
+        """
+        Initialize source projection, edge gate, residual update, norms, and dropout.
+        """
         super().__init__()
         self.source = nn.Linear(hidden_dim, hidden_dim)
         self.edge_gate = nn.Sequential(
@@ -184,6 +213,9 @@ class FragmentGraphMessageLayer(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Apply one round of edge-conditioned message passing to fragment features.
+        """
         if edge_index.numel() == 0:
             return node_features
 

@@ -20,6 +20,11 @@ class _MiraFragFragmentEngine:
         max_tree_depth: int,
         max_broken_bonds: int,
     ) -> None:
+        """
+        Initialize graph structures used by recursive atom removal.
+
+        The engine stores atom symbols, hydrogen counts, bond adjacency, bond-order weights, hetero-bond scores, and global limits for tree depth and broken-bond budget.
+        """
         self.mol = Chem.Mol(mol)
         try:
             Chem.Kekulize(self.mol, clearAromaticFlags=True)
@@ -53,6 +58,11 @@ class _MiraFragFragmentEngine:
         self.frag_to_entry: dict[str, dict[str, Any]] = {}
 
     def generate_fragments(self) -> list[tuple[str, dict[str, Any]]]:
+        """
+        Generate the recursive fragment tree.
+
+        Starting from the full molecule, the engine removes one atom at each step, keeps connected components, collapses isomorphic fragments by WL hash, and records parent links and budgets.
+        """
         current_id = 0
         root_mask = (1 << self.natoms) - 1
         root_hash = self.wl_hash(root_mask)
@@ -115,6 +125,9 @@ class _MiraFragFragmentEngine:
         )
 
     def score_fragment(self, fragment: int) -> tuple[int, int]:
+        """
+        Return broken-bond count and weighted break score for a fragment mask.
+        """
         score = 0
         breaks = 0
         for bond_bits in self.bonds:
@@ -124,6 +137,11 @@ class _MiraFragFragmentEngine:
         return breaks, score
 
     def atom_pass_stats(self, fragment: int, *, depth: int | None) -> dict[str, int]:
+        """
+        Compute hydrogen-transfer bounds for a fragment mask.
+
+        The allowed removal/addition counts are limited by fragment hydrogens, complement hydrogens, total broken-bond budget, and optionally the current traversal depth.
+        """
         frag_hs = 0
         for atom_idx in range(self.natoms):
             if int(fragment) & (1 << atom_idx):
@@ -140,6 +158,11 @@ class _MiraFragFragmentEngine:
         }
 
     def remove_atom(self, fragment: int, atom_idx: int) -> list[dict[str, Any]]:
+        """
+        Remove one atom from a fragment and return connected child fragments.
+
+        If removal splits the fragment into components, each component adjacent to the removed atom becomes a candidate child with the corresponding removed bond order.
+        """
         atom_bit = 1 << int(atom_idx)
         if not (atom_bit & int(fragment)):
             return []
@@ -182,6 +205,11 @@ class _MiraFragFragmentEngine:
         return out
 
     def wl_hash(self, template_fragment: int) -> str:
+        """
+        Compute a Weisfeiler-Lehman-style hash for a fragment mask.
+
+        The hash is invariant to many symmetric atom-ordering cases and is used to collapse duplicate fragment states in the recursive tree.
+        """
         cur_hashes = [str(symbol) for symbol in self.atom_symbols]
 
         def graph_hash(full_hashes: list[str]) -> str:
@@ -231,6 +259,9 @@ def _extend_fragment(
     bonded_atoms: list[list[int]],
     template_fragment: int,
 ) -> int:
+    """
+    Return the connected component reachable from one atom inside a mask.
+    """
     root_bit = 1 << int(atom_idx)
     if not (root_bit & int(template_fragment)):
         return 0
@@ -248,4 +279,7 @@ def _extend_fragment(
 
 
 def _hash_label(label: str, digest_size: int = 32) -> str:
+    """
+    Hash a WL label string into a fixed-length ASCII digest.
+    """
     return blake2b(label.encode('ascii'), digest_size=digest_size).hexdigest()

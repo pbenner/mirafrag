@@ -12,6 +12,11 @@ def collate_fragment_candidates(
     *,
     node_offsets: list[int],
 ) -> dict[str, torch.Tensor]:
+    """
+    Batch variable-size fragment candidate dictionaries.
+
+    Formula atom indices are offset by graph node offsets, peak formula indices are remapped to global formula rows, and fragment-graph edges are converted to one concatenated edge index.
+    """
     atom_indices: list[int] = []
     atom_ptr = [0]
     formula_batch: list[int] = []

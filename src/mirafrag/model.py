@@ -15,6 +15,9 @@ from mirafrag.probability import fragment_oos_log_probs
 
 
 def _adduct_charge_lookup(metadata_config: MetadataConfig) -> list[float]:
+    """
+    Build a lookup table from metadata adduct index to ion charge.
+    """
     size = max(metadata_config.adduct_to_idx.values(), default=-1) + 2
     charges = [0.0] * max(size, 1)
     for adduct, idx in metadata_config.adduct_to_idx.items():
@@ -24,6 +27,12 @@ def _adduct_charge_lookup(metadata_config: MetadataConfig) -> list[float]:
 
 
 class MiraFragModel(nn.Module):
+    """
+    Foundation-encoder model for sparse MS/MS spectrum prediction.
+
+    The model wraps a MACE or AIMNet atom encoder, builds precursor metadata features, and applies a candidate-based fragment spectrum head. Encoder adaptation is controlled by head-only, delta, or full fine-tuning strategy.
+    """
+
     def __init__(
         self,
         encoder: nn.Module,
@@ -31,6 +40,9 @@ class MiraFragModel(nn.Module):
         metadata_config: MetadataConfig,
         config: MiraFragConfig,
     ) -> None:
+        """
+        Initialize encoder, metadata embeddings, adduct-charge lookup, and fragment head.
+        """
         super().__init__()
         self.metadata_config = metadata_config
         self.config = config
@@ -52,6 +64,9 @@ class MiraFragModel(nn.Module):
         self.head = FragmentSpectrumHead(self.config)
 
     def _prepare_encoder(self, encoder: nn.Module) -> nn.Module:
+        """
+        Apply the configured fine-tuning strategy to the foundation encoder.
+        """
         strategy = self._encoder_finetune_strategy()
         if strategy == 'head':
             for param in encoder.parameters():
@@ -69,15 +84,28 @@ class MiraFragModel(nn.Module):
         )
 
     def _encoder_finetune_strategy(self) -> str:
+        """
+        Return the active encoder fine-tuning strategy with a safe default.
+        """
         return str(self.config.encoder_finetune_strategy or 'head')
 
     def train(self, mode: bool = True) -> MiraFragModel:
+        """
+        Set module training mode while keeping frozen encoders in eval mode.
+
+        Head-only fine-tuning should not update encoder state such as dropout or normalization behavior, so the encoder is forced back to evaluation mode when frozen.
+        """
         super().train(mode)
         if self._encoder_finetune_strategy() == 'head':
             self.encoder.eval()
         return self
 
     def metadata_features(self, batch: dict[str, Any]) -> torch.Tensor:
+        """
+        Build dense precursor metadata features for a batch.
+
+        The vector concatenates scaled precursor m/z, normalized collision energy, adduct embedding, and instrument embedding.
+        """
         precursor_mz = batch['precursor_mz'].float().unsqueeze(-1)
         precursor_mz = precursor_mz / max(self.metadata_config.precursor_mz_max, 1.0)
         collision_energy = self._normalized_collision_energy(batch)
@@ -86,6 +114,9 @@ class MiraFragModel(nn.Module):
         return torch.cat([precursor_mz, collision_energy, adduct, instrument], dim=-1)
 
     def _normalized_collision_energy(self, batch: dict[str, Any]) -> torch.Tensor:
+        """
+        Normalize collision energy using global and instrument-specific robust statistics.
+        """
         collision_energy = batch['collision_energy'].float()
         instrument = batch['instrument_type'].long()
         global_center = self._metadata_float('collision_energy_center', 0.0)
@@ -114,12 +145,20 @@ class MiraFragModel(nn.Module):
         return ((collision_energy - center) / scale).unsqueeze(-1)
 
     def _metadata_float(self, name: str, default: float) -> float:
+        """
+        Read a float attribute from metadata config with a robust fallback.
+        """
         try:
             return float(getattr(self.metadata_config, name, default))
         except Exception:
             return float(default)
 
     def _molecular_charge(self, batch: dict[str, Any]) -> torch.Tensor:
+        """
+        Return one molecular ion charge per batch item.
+
+        The value comes from the collated ``adduct_charge`` tensor when available, otherwise it is looked up from the adduct categorical index.
+        """
         if 'adduct_charge' in batch:
             return batch['adduct_charge'].to(
                 device=self.adduct_charge_by_idx.device,
@@ -130,6 +169,9 @@ class MiraFragModel(nn.Module):
         return self.adduct_charge_by_idx[adduct]
 
     def _encoder_dtype(self) -> torch.dtype:
+        """
+        Return the floating dtype used by encoder parameters.
+        """
         try:
             return next(self.encoder.parameters()).dtype
         except StopIteration:
@@ -138,6 +180,9 @@ class MiraFragModel(nn.Module):
     def _cast_graph_for_encoder(
         self, graph: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        """
+        Cast floating graph tensors to the encoder dtype while preserving integer tensors.
+        """
         dtype = self._encoder_dtype()
         return {
             key: value.to(dtype=dtype) if value.is_floating_point() else value
@@ -150,6 +195,9 @@ class MiraFragModel(nn.Module):
         *,
         molecular_charge: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """
+        Public wrapper for obtaining encoder node features from a graph.
+        """
         return self._encode_node_features(
             graph,
             molecular_charge=molecular_charge,
@@ -161,6 +209,11 @@ class MiraFragModel(nn.Module):
         *,
         molecular_charge: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """
+        Run the foundation encoder with correct grad and charge handling.
+
+        Frozen encoders are evaluated under ``no_grad``. Delta and full fine-tuning keep gradients enabled during training, and charge-aware encoders receive molecular charges.
+        """
         graph = self._cast_graph_for_encoder(graph)
         trainable_encoder = (
             self.training
@@ -189,12 +242,20 @@ class MiraFragModel(nn.Module):
         return out['node_feats'].float()
 
     def _encoder_uses_molecular_charge(self) -> bool:
+        """
+        Return whether the wrapped encoder expects molecular charge inputs.
+        """
         encoder = self.encoder
         if isinstance(encoder, TorchDeltaFineTuneWrapper):
             encoder = encoder.base_module
         return bool(getattr(encoder, 'uses_molecular_charge', False))
 
     def forward(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """
+        Predict sparse fragment spectrum logits for a collated batch.
+
+        The batch must include graph tensors, metadata tensors, and fragment candidate tensors. The return value is a sparse prediction dictionary consumed by losses and evaluation.
+        """
         metadata_features = self.metadata_features(batch)
         if 'fragments' not in batch:
             raise ValueError("MiraFrag requires batch['fragments'].")
@@ -205,6 +266,9 @@ class MiraFragModel(nn.Module):
         return self.head(node_feats, batch['fragments'], metadata_features)
 
     def predict_proba(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """
+        Return sparse prediction log-probabilities including OOS probability.
+        """
         pred = self.forward(batch)
         pred = pred.copy()
         fragment_log_probs, oos_log_probs = fragment_oos_log_probs(pred)
@@ -214,6 +278,11 @@ class MiraFragModel(nn.Module):
 
 
 def set_encoder_finetune_strategy(model: MiraFragModel, strategy: str) -> None:
+    """
+    Switch the encoder adaptation strategy of an existing model.
+
+    Delta mode wraps the encoder in additive delta parameters, full mode trains base weights, and head mode freezes encoder weights. Existing delta wrappers are merged when leaving delta mode.
+    """
     if strategy not in {'head', 'delta', 'full'}:
         raise ValueError(
             f'Unknown encoder_finetune_strategy {strategy!r}; '

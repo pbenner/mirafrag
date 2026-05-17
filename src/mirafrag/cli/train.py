@@ -37,6 +37,11 @@ from mirafrag.training import train_model
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for MiraFrag training.
+
+    The parser covers encoder selection, checkpoint resume, fragment-support settings, losses, optimizer and scheduler controls, cache behavior, and MassSpecGym split selection.
+    """
     parser = argparse.ArgumentParser(
         prog='mirafrag-train',
         description='Fine-tune a foundation encoder with a spectrum prediction head.',
@@ -277,6 +282,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    Run the end-to-end training command.
+
+    This entry point reads and filters data, creates or restores a model, prepares datasets and caches, builds DataLoaders, and calls the training loop with the resolved configuration.
+    """
     args = parse_args()
     quiet_rdkit_logs()
     torch.manual_seed(args.seed)
@@ -521,6 +531,11 @@ def main() -> None:
 
 
 def _prefill_cache_collate(items: list[dict]) -> int:
+    """
+    Return the sample count for a training cache-fill batch.
+
+    The cache prefill DataLoader only needs to trigger dataset item creation. The count is used to update the tqdm progress bar.
+    """
     return len(items)
 
 
@@ -533,6 +548,11 @@ def _prefill_feature_cache(
     dataloader_timeout: float,
     show_progress: bool,
 ) -> None:
+    """
+    Fill missing graph and fragment cache files before training.
+
+    This makes expensive cache work visible with a dedicated progress bar and avoids mixing first-epoch training progress with preprocessing latency.
+    """
     if len(dataset) == 0:
         return
     loader = DataLoader(
@@ -567,6 +587,11 @@ def _validate_loaded_checkpoint_config(
     mz_max: float,
     bin_width: float,
 ) -> None:
+    """
+    Validate runtime bin settings for a resumed checkpoint.
+
+    The wrapper keeps the train CLI symmetric with evaluation and centralizes the checkpoint/bin compatibility check.
+    """
     validate_checkpoint_bin_config(model, mz_max=mz_max, bin_width=bin_width)
 
 
@@ -574,10 +599,20 @@ def _apply_fragment_args_to_model_config(
     config: MiraFragConfig,
     args: argparse.Namespace,
 ) -> None:
+    """
+    Apply safe fragment candidate overrides to a loaded model config.
+
+    This excludes head architecture fields so resuming from a checkpoint cannot accidentally change tensor shapes in the saved head.
+    """
     apply_fragment_args_to_model_config(config, args)
 
 
 def _mirafrag_config_value(value, field_name: str):
+    """
+    Return a CLI value or the MiraFragConfig default for a field.
+
+    The helper is used while constructing new model configs from optional fragment arguments.
+    """
     if value is not None:
         return value
     return MiraFragConfig.__dataclass_fields__[field_name].default
@@ -588,6 +623,11 @@ def _train_config(
     *,
     fine_tune_strategy: str,
 ) -> dict[str, object]:
+    """
+    Serialize training command arguments for checkpoint metadata.
+
+    The returned dictionary records the raw CLI settings plus the resolved fine-tune strategy for later inspection.
+    """
     config = vars(args).copy()
     config['resolved_fine_tune_strategy'] = fine_tune_strategy
     return config

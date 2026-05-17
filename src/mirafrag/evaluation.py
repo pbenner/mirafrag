@@ -28,6 +28,11 @@ def evaluate_model(
     top_k: int = 100,
     show_progress: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Evaluate a MiraFrag model and return predictions plus summary metrics.
+
+    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result.
+    """
     model.to(device)
     model.eval()
     rows = []
@@ -86,6 +91,11 @@ def _sparse_prediction_rows(
     min_intensity: float,
     top_k: int,
 ) -> list[dict[str, list[float]]]:
+    """
+    Convert sparse fragment probabilities into exported peak lists.
+
+    Candidate probabilities are aggregated by bin, optionally truncated to top-k bins, filtered by minimum intensity, normalized to base peak 100, and converted back to bin-center m/z values.
+    """
     log_probs, _oos_log_probs = fragment_oos_log_probs(pred)
     values = torch.exp(log_probs).detach()
     bins = pred['bins'].detach().long()

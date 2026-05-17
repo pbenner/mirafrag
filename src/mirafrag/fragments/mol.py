@@ -8,6 +8,9 @@ from mirafrag.fragments.constants import _BOND_TYPE_WEIGHT, _HETERO_BOND_WEIGHT
 
 
 def _atom_implicit_hydrogens(mol: Chem.Mol) -> list[int]:
+    """
+    Return total hydrogens attached to each atom in an RDKit molecule.
+    """
     return [
         int(atom.GetNumImplicitHs()) + int(atom.GetNumExplicitHs())
         for atom in mol.GetAtoms()
@@ -15,6 +18,9 @@ def _atom_implicit_hydrogens(mol: Chem.Mol) -> list[int]:
 
 
 def _bond_break_stats(mol: Chem.Mol) -> list[dict[str, Any]]:
+    """
+    Collect bond metadata used to score fragment cuts.
+    """
     stats = []
     for bond in mol.GetBonds():
         begin = int(bond.GetBeginAtomIdx())
@@ -39,6 +45,9 @@ def _fragment_break_score(
     atom_set: set[int],
     bond_stats: list[dict[str, Any]],
 ) -> tuple[int, float]:
+    """
+    Compute broken-bond count and weighted score for an atom-set fragment.
+    """
     num_broken = 0
     score = 0.0
     for bond in bond_stats:

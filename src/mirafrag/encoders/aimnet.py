@@ -12,6 +12,11 @@ def load_aimnet_encoder(
     model_path: str | None = None,
     device: str | torch.device = 'cpu',
 ) -> nn.Module:
+    """
+    Create an AIMNet node-feature encoder adapter.
+
+    A local path takes precedence over the registry model name. The adapter exposes AIMNet hidden atom features through the same interface used by the MACE encoder.
+    """
     return AimnetNodeEncoder(
         model=model_path or model or 'aimnet2',
         device=device,
@@ -29,6 +34,11 @@ class AimnetNodeEncoder(nn.Module):
         model: str = 'aimnet2',
         device: str | torch.device = 'cpu',
     ) -> None:
+        """
+        Load AIMNet2 and expose metadata needed by MiraFrag.
+
+        The constructor initializes the AIMNet calculator in train-capable mode, registers supported atomic numbers and cutoff radius, and keeps the underlying AIMNet model available as a child module.
+        """
         super().__init__()
         try:
             from aimnet.calculators import AIMNet2Calculator
@@ -64,6 +74,11 @@ class AimnetNodeEncoder(nn.Module):
         self.eval()
 
     def train(self, mode: bool = True) -> AimnetNodeEncoder:
+        """
+        Set training/evaluation mode on both adapter and AIMNet calculator.
+
+        AIMNet's calculator keeps its own training flag, so this override keeps it synchronized with PyTorch module mode.
+        """
         super().train(mode)
         self.model.train(mode)
         if hasattr(self.calculator, '_train'):
@@ -81,6 +96,11 @@ class AimnetNodeEncoder(nn.Module):
         compute_node_feats: bool = True,
         molecular_charge: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        """
+        Return AIMNet hidden atom features for a batched molecular graph.
+
+        The graph must contain positions, atomic numbers, and optional batch/ptr tensors. Charge-aware inputs pass one molecular charge per graph, and the output is ``{'node_feats': tensor}`` aligned to the original atoms.
+        """
         del compute_force, compute_virials, compute_stress
         if bool(training) != self.training:
             self.train(bool(training))
@@ -133,6 +153,9 @@ class AimnetNodeEncoder(nn.Module):
         return {'node_feats': out['aim'][: positions.shape[0]]}
 
     def _device(self) -> torch.device:
+        """
+        Return the current device of the wrapped AIMNet model.
+        """
         try:
             return next(self.model.parameters()).device
         except StopIteration:

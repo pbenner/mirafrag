@@ -29,6 +29,9 @@ def _fragment_element_counts(
     atom_hs: list[int],
     h_shift: int,
 ) -> dict[str, int]:
+    """
+    Count elements for a fragment formula after a hydrogen shift.
+    """
     counts: dict[str, int] = {}
     hydrogen_count = int(h_shift)
     for atom_idx in atom_indices:
@@ -50,6 +53,11 @@ def _formula_isotope_peaks(
     threshold: float,
     max_peaks: int,
 ) -> list[tuple[float, float]]:
+    """
+    Return isotope mass/probability peaks for an element-count formula.
+
+    When isotope expansion is disabled, only the monoisotopic mass is returned. Otherwise a truncated convolution of element isotope distributions is cached and normalized.
+    """
     if not include_isotopes:
         mass = sum(
             float(count) * float(PERIODIC_TABLE.GetMostCommonIsotopeMass(symbol))
@@ -101,6 +109,9 @@ def _formula_isotope_peaks(
 
 
 def _element_isotopes(symbol: str) -> list[tuple[float, float]]:
+    """
+    Return normalized isotope masses and probabilities for one element symbol.
+    """
     cached = _ELEMENT_ISOTOPE_CACHE.get(symbol)
     if cached is not None:
         return cached
@@ -134,6 +145,9 @@ def _convolve_isotope_distribution(
     threshold: float,
     max_states: int,
 ) -> list[tuple[float, float]]:
+    """
+    Convolve a running isotope distribution with one element isotope distribution.
+    """
     merged: dict[float, float] = {}
     for base_mass, base_prob in distribution:
         for isotope_mass, isotope_prob in isotopes:

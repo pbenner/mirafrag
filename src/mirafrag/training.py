@@ -42,6 +42,11 @@ def run_epoch(
     kl_weight: float = 0.7,
     coverage_weight: float = 0.1,
 ) -> dict[str, float]:
+    """
+    Run one training or evaluation epoch.
+
+    The loop moves batches to device, computes the configured loss, optionally updates optimizer and step scheduler, tracks example-weighted averages, and reports tqdm progress statistics.
+    """
     if scheduler_interval not in {'epoch', 'step'}:
         raise ValueError('scheduler_interval must be one of: epoch, step.')
     training = optimizer is not None
@@ -144,6 +149,11 @@ def train_model(
     kl_weight: float = 0.7,
     coverage_weight: float = 0.1,
 ) -> dict[str, list[float]]:
+    """
+    Train a MiraFrag model and save the best checkpoint by validation loss.
+
+    The routine materializes lazy head layers, builds optimizer and scheduler, optionally evaluates the initial checkpoint state, runs train/validation epochs, saves improving checkpoints, and writes a history JSON file.
+    """
     model.to(device)
     _materialize_lazy_modules(model, train_loader, device=device)
     optimizer = torch.optim.AdamW(
@@ -286,6 +296,9 @@ def _append_history(
     train_stats: dict[str, float] | None,
     val_stats: dict[str, float],
 ) -> None:
+    """
+    Append one epoch's train and validation statistics to the history dictionary.
+    """
     history['epoch'].append(epoch)
     if train_stats is None:
         history['train_loss'].append(float('nan'))
@@ -298,6 +311,9 @@ def _append_history(
 
 
 def _objective_display_name(loss_name: str) -> str:
+    """
+    Return the progress-display name for a registered loss.
+    """
     loss_spec = LOSS_REGISTRY.get(loss_name)
     if loss_spec is None:
         return 'loss'
@@ -310,6 +326,9 @@ def _materialize_lazy_modules(
     *,
     device: str | torch.device,
 ) -> None:
+    """
+    Run one dummy forward pass so lazy modules create their parameters before optimizer setup.
+    """
     try:
         first_item = loader.dataset[0]
     except IndexError as exc:

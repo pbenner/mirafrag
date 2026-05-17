@@ -15,6 +15,11 @@ def _optimizer_param_groups(
     lr: float,
     weight_decay: float,
 ) -> list[dict[str, Any]]:
+    """
+    Build AdamW parameter groups for head and trainable encoder parameters.
+
+    The spectrum head always has zero weight decay. Encoder or delta parameters use the configured weight decay, and uninitialized lazy parameters are skipped until materialized.
+    """
     encoder_params = [
         param
         for param in model.encoder.parameters()
@@ -56,6 +61,9 @@ def _optimizer_param_groups(
 
 
 def _print_optimizer_groups(optimizer: torch.optim.Optimizer) -> None:
+    """
+    Print parameter counts and hyperparameters for optimizer groups.
+    """
     parts = []
     for idx, group in enumerate(optimizer.param_groups):
         name = str(group.get('name', f'group{idx}'))
@@ -73,6 +81,9 @@ def _print_optimizer_groups(optimizer: torch.optim.Optimizer) -> None:
 
 
 def _is_uninitialized_parameter(param: torch.nn.Parameter) -> bool:
+    """
+    Return whether a parameter belongs to an unmaterialized lazy module.
+    """
     return isinstance(param, UninitializedParameter)
 
 
@@ -86,6 +97,11 @@ def _build_scheduler(
     plateau_factor: float = 0.5,
     plateau_patience: int = 2,
 ) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """
+    Create the configured learning-rate scheduler.
+
+    Supported policies are constant, exponential, cosine, plateau, and none. Exponential and cosine are implemented with a minimum learning-rate ratio floor.
+    """
     if scheduler_name == 'none':
         return None
     min_lr_ratio = max(0.0, min(float(min_lr_ratio), 1.0))
@@ -123,6 +139,9 @@ def _scheduler_total_steps(
     steps_per_epoch: int,
     scheduler_interval: str,
 ) -> int:
+    """
+    Return scheduler step count implied by epochs and interval.
+    """
     if scheduler_interval == 'epoch':
         return int(epochs)
     if scheduler_interval == 'step':
@@ -131,4 +150,7 @@ def _scheduler_total_steps(
 
 
 def _current_lr(optimizer: torch.optim.Optimizer) -> float:
+    """
+    Return the largest current learning rate across optimizer groups.
+    """
     return float(max(group['lr'] for group in optimizer.param_groups))

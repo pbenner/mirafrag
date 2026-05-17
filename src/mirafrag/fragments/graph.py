@@ -12,6 +12,11 @@ def _fragment_graph_edges(
     max_h_transfers: int,
     max_isotope_peaks: int,
 ) -> tuple[list[tuple[int, int]], list[list[float]]]:
+    """
+    Construct typed directed edges between retained fragment formulas.
+
+    Edges connect parent/child tree relationships, same formula isotope neighbors, same atom-set hydrogen-transfer neighbors, and local same-bin alternatives.
+    """
     if max_edges <= 0 or len(ordered) <= 1:
         return [], []
 
@@ -102,6 +107,9 @@ def _connect_neighbors(
     relation: str,
     add_edge: Callable[[int, int, str], bool],
 ) -> bool:
+    """
+    Add bidirectional neighbor edges through an ordered list of formula indices.
+    """
     if len(indices) <= 1:
         return True
     for src, dst in zip(indices[:-1], indices[1:]):
@@ -121,6 +129,9 @@ def _fragment_edge_features(
     max_h_transfers: int,
     max_isotope_peaks: int,
 ) -> list[float]:
+    """
+    Encode relation type and normalized deltas for one fragment-graph edge.
+    """
     mass_delta = (float(dst['mz']) - float(src['mz'])) / max(float(mz_max), 1.0)
     h_delta = (int(dst['h_shift']) - int(src['h_shift'])) / max(
         float(max_h_transfers),
