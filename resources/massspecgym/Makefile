@@ -18,7 +18,7 @@ DELTA_INIT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
 DELTA_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_delta.pt
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
-FEATURE_CACHE_DIR ?= $(RESOURCE_DIR)/data/cache/mirafrag_features
+DISK_CACHE_DIR ?= $(RESOURCE_DIR)/data/cache/mirafrag_features
 CACHE_SOURCE_MODEL ?=
 CACHE_SPLITS ?= train val test
 CACHE_NUM_WORKERS ?= $(shell nproc)
@@ -57,7 +57,7 @@ MASS_TOLERANCE_MIN_MZ ?= 200
 NUM_WORKERS ?= 16
 MAX_ROWS ?=
 PROGRESS ?= 1
-CACHE_GRAPHS ?= 0
+MEMORY_CACHE ?= 0
 SLOW_SAMPLE_SECONDS ?= 0
 DATALOADER_TIMEOUT ?= 0
 TRACE_SAMPLES ?= 0
@@ -73,7 +73,7 @@ FRAGMENT_GNN_LAYERS ?= 2
 INCLUDE_FRAGMENT_ISOTOPES ?= 1
 FRAGMENT_ISOTOPE_THRESHOLD ?= 0.001
 MAX_FRAGMENT_ISOTOPE_PEAKS ?= 1
-FINE_TUNE_STRATEGY ?= head
+FINE_TUNE_STRATEGY ?= full
 OVERRIDE_FRAGMENT_CONFIG ?= 0
 
 TRAIN_SPLIT ?= train
@@ -100,13 +100,13 @@ PROGRESS_ARGS += --no-progress
 endif
 
 CACHE_ARGS =
-ifeq ($(strip $(CACHE_GRAPHS)),1)
-CACHE_ARGS += --cache-graphs
+ifeq ($(strip $(MEMORY_CACHE)),1)
+CACHE_ARGS += --memory-cache
 else
-CACHE_ARGS += --no-cache-graphs
+CACHE_ARGS += --no-memory-cache
 endif
-ifneq ($(strip $(FEATURE_CACHE_DIR)),)
-CACHE_ARGS += --cache-dir $(FEATURE_CACHE_DIR)
+ifneq ($(strip $(DISK_CACHE_DIR)),)
+CACHE_ARGS += --disk-cache-dir $(DISK_CACHE_DIR)
 endif
 
 ISOTOPE_FRAGMENT_ARGS =
@@ -207,7 +207,7 @@ help:
 		'  INIT_MODEL=$(INIT_MODEL)' \
 		'  DELTA_INIT_MODEL=$(DELTA_INIT_MODEL)' \
 		'  DELTA_MODEL=$(DELTA_MODEL)' \
-		'  FEATURE_CACHE_DIR=$(FEATURE_CACHE_DIR)' \
+		'  DISK_CACHE_DIR=$(DISK_CACHE_DIR)' \
 		'  CACHE_SOURCE_MODEL=$(CACHE_SOURCE_MODEL)' \
 		'  CACHE_SPLITS=$(CACHE_SPLITS)' \
 		'  CACHE_NUM_WORKERS=$(CACHE_NUM_WORKERS)' \
@@ -236,7 +236,7 @@ help:
 		'  SLOW_SAMPLE_SECONDS=$(SLOW_SAMPLE_SECONDS)' \
 		'  DATALOADER_TIMEOUT=$(DATALOADER_TIMEOUT)' \
 		'  TRACE_SAMPLES=$(TRACE_SAMPLES)' \
-		'  CACHE_GRAPHS=$(CACHE_GRAPHS)' \
+		'  MEMORY_CACHE=$(MEMORY_CACHE)' \
 		'  HIDDEN_DIM=$(HIDDEN_DIM)' \
 		'  NUM_LAYERS=$(NUM_LAYERS)' \
 		'  DROPOUT=$(DROPOUT)' \
@@ -262,10 +262,10 @@ prepare-data: install-data-deps
 	$(UV) run --no-project --with huggingface_hub --with hf_xet python -c "from huggingface_hub import hf_hub_download; path = hf_hub_download(repo_id='$(DATASET_REPO)', filename='$(DATASET_FILE)', repo_type='dataset', revision='$(DATASET_REVISION)', local_dir='$(DATASET_LOCAL_DIR)'); print(path)"
 
 prepare-cache:
-	mkdir -p $(FEATURE_CACHE_DIR)
+	mkdir -p $(DISK_CACHE_DIR)
 	PYTHONPATH=$(PYTHONPATH) $(CACHE_PYTHON) -m mirafrag.cli.cache \
 		--input $(INPUT) \
-		--cache-dir $(FEATURE_CACHE_DIR) \
+		--disk-cache-dir $(DISK_CACHE_DIR) \
 		$(CACHE_MODEL_ARGS) \
 		--device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --batch-size $(CACHE_BATCH_SIZE) --num-workers $(CACHE_NUM_WORKERS) $(PROGRESS_ARGS) \
 		$(LOADER_DEBUG_ARGS) \
@@ -274,7 +274,6 @@ prepare-cache:
 		--splits $(CACHE_SPLITS) \
 		--split-col $(SPLIT_COL)
 
-train: FINE_TUNE_STRATEGY = full
 train:
 	mkdir -p $(dir $(MODEL))
 	PYTHONPATH=$(PYTHONPATH) $(TRAIN_PYTHON) -m mirafrag.cli.train \

@@ -32,6 +32,18 @@ The loss derivations for `LOSS=soft_projected_kl`, `LOSS=soft_binned_kl`,
 `LOSS=soft_binned_coverage_kl`, and `LOSS=fragnnet_ce` are documented in
 [docs/losses/README.md](docs/losses/README.md).
 
+## Code Structure
+
+The package separates the main concerns into focused modules:
+
+- `config.py`: serializable MiraFrag model configuration
+- `encoders/`: MACE and AIMNet foundation encoder adapters
+- `heads/fragment.py`: candidate-based fragment spectrum head
+- `checkpoint.py`: strict state-dict checkpoint save/load
+- `losses.py`: sparse spectrum losses and binned/tolerance metrics
+- `training.py`, `optim.py`, `evaluation.py`: training loop, optimizer/scheduler helpers, and evaluation/export
+- `adducts.py`: shared adduct charge and mass parsing used by data and fragmentation
+
 ## Model
 
 MiraFrag uses a molecular foundation model as the atom encoder and replaces the
@@ -153,11 +165,13 @@ Use `make -C resources/massspecgym prepare-data` to download the MassSpecGym TSV
 into `resources/massspecgym/data/`. Use `make -C resources/massspecgym
 prepare-cache` to precompute graph and fragment caches before training or
 evaluation; the MassSpecGym `train`, `eval`, and `predict` targets pass the
-same cache directory by default. When a training cache directory is configured,
-the `train` target pre-fills missing train/val cache entries with explicit
-`cache train` and `cache val` tqdm bars before the first epoch. `prepare-cache` uses the foundation model
-and the Makefile fragment settings unless you pass
-`CACHE_SOURCE_MODEL=resources/massspecgym/checkpoints/mirafrag.pt`.
+same disk cache directory by default. Disk caching is controlled by
+`DISK_CACHE_DIR` / `--disk-cache-dir`; per-worker in-memory reuse is controlled
+by `MEMORY_CACHE` / `--memory-cache`. When a training disk cache directory is
+configured, the `train` target pre-fills missing train/val cache entries with
+explicit `cache train` and `cache val` tqdm bars before the first epoch.
+`prepare-cache` uses the foundation model and the Makefile fragment settings
+unless you pass `CACHE_SOURCE_MODEL=resources/massspecgym/checkpoints/mirafrag.pt`.
 
 ## Train
 

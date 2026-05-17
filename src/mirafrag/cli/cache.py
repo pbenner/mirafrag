@@ -5,12 +5,14 @@ import argparse
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
     apply_fragment_args_to_model_config,
     resolve_device,
     value_or_default,
 )
+from mirafrag.config import MiraFragConfig
 from mirafrag.data import (
     ADDUCT_ALIASES,
     SMILES_ALIASES,
@@ -23,8 +25,8 @@ from mirafrag.data import (
     read_table,
     select_split,
 )
+from mirafrag.encoders import load_foundation_encoder
 from mirafrag.fragments import FragmentConfig, fragment_config_from_model_config
-from mirafrag.model import MiraFragConfig, load_checkpoint, load_foundation_encoder
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
@@ -34,7 +36,9 @@ def parse_args() -> argparse.Namespace:
         description='Precompute MiraFrag graph and fragment feature caches.',
     )
     parser.add_argument('-i', '--input', default=None, help='MassSpecGym TSV/CSV path.')
-    parser.add_argument('--cache-dir', required=True, help='Output feature cache dir.')
+    parser.add_argument(
+        '--disk-cache-dir', required=True, help='Output feature cache dir.'
+    )
     parser.add_argument(
         '--init-checkpoint',
         default=None,
@@ -216,8 +220,8 @@ def _precompute_frame(
         mz_max=args.mz_max,
         bin_width=args.bin_width,
         require_spectrum=False,
-        cache_graphs=False,
-        cache_dir=args.cache_dir,
+        memory_cache=False,
+        disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
         fragment_config=fragment_config,
         slow_sample_seconds=args.slow_sample_seconds,
@@ -247,7 +251,7 @@ def _precompute_frame(
         total += int(count)
     print(
         f'cached {total} rows for split={split_name} '
-        f'cache_dir={args.cache_dir} fragments=True'
+        f'disk_cache_dir={args.disk_cache_dir} fragments=True'
     )
 
 

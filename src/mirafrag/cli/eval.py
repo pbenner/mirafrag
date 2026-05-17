@@ -4,6 +4,7 @@ import argparse
 
 from torch.utils.data import DataLoader
 
+from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import resolve_device, validate_checkpoint_bin_config
 from mirafrag.data import (
@@ -15,10 +16,9 @@ from mirafrag.data import (
     read_table,
     select_split,
 )
+from mirafrag.evaluation import evaluate_model
 from mirafrag.fragments import fragment_config_from_model_config
-from mirafrag.model import load_checkpoint
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
-from mirafrag.training import evaluate_model
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,13 +38,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument(
-        '--cache-graphs',
+        '--memory-cache',
         action=argparse.BooleanOptionalAction,
         default=False,
         help='Keep decoded graphs/fragments in each worker process.',
     )
     parser.add_argument(
-        '--cache-dir',
+        '--disk-cache-dir',
         default=None,
         help='Optional disk cache for precomputed encoder graphs and fragments.',
     )
@@ -109,8 +109,8 @@ def main() -> None:
         mz_max=args.mz_max,
         bin_width=args.bin_width,
         require_spectrum=True,
-        cache_graphs=args.cache_graphs,
-        cache_dir=args.cache_dir,
+        memory_cache=args.memory_cache,
+        disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
         fragment_config=fragment_config_from_model_config(model.config),
     )

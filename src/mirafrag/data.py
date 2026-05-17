@@ -15,7 +15,7 @@ import torch
 from rdkit import Chem
 from torch.utils.data import Dataset
 
-from mirafrag.adducts import parse_adduct_charge
+from mirafrag.adducts import parse_adduct
 from mirafrag.chem import (
     GraphConfig,
     collate_graphs,
@@ -38,7 +38,8 @@ PRECURSOR_ALIASES = ('precursor_mz', 'PrecursorMZ', 'PRECURSORMZ', 'PEPMASS')
 ADDUCT_ALIASES = ('adduct', 'precursor_type', 'Precursor_type', 'PRECURSORTYPE')
 INSTRUMENT_ALIASES = ('instrument_type', 'Instrument_type', 'INSTRUMENTTYPE')
 CE_ALIASES = ('collision_energy', 'CE', 'CollisionEnergy', 'COLLISIONENERGY')
-FEATURE_CACHE_VERSION = 'v11'
+FEATURE_CACHE_VERSION = 'v12'
+FEATURE_CACHE_FORMAT = 'mirafrag-feature-v1'
 
 
 @dataclass
@@ -111,28 +112,41 @@ class MetadataConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MetadataConfig:
+        required = {
+            'adduct_to_idx',
+            'instrument_to_idx',
+            'precursor_mz_max',
+            'collision_energy_max',
+            'collision_energy_center',
+            'collision_energy_scale',
+            'collision_energy_by_instrument',
+        }
+        missing = required - set(data)
+        unknown = set(data) - required
+        if missing or unknown:
+            parts = []
+            if missing:
+                parts.append(f'missing={sorted(missing)}')
+            if unknown:
+                parts.append(f'unknown={sorted(unknown)}')
+            raise ValueError(
+                'Invalid MetadataConfig checkpoint payload: ' + ', '.join(parts)
+            )
         return cls(
             adduct_to_idx={str(k): int(v) for k, v in data['adduct_to_idx'].items()},
             instrument_to_idx={
                 str(k): int(v) for k, v in data['instrument_to_idx'].items()
             },
-            precursor_mz_max=float(data.get('precursor_mz_max', MASS_SPEC_GYM_MZ_MAX)),
-            collision_energy_max=float(data.get('collision_energy_max', 100.0)),
-            collision_energy_center=float(data.get('collision_energy_center', 0.0)),
-            collision_energy_scale=float(
-                data.get(
-                    'collision_energy_scale',
-                    data.get('collision_energy_max', 100.0),
-                )
-            ),
+            precursor_mz_max=float(data['precursor_mz_max']),
+            collision_energy_max=float(data['collision_energy_max']),
+            collision_energy_center=float(data['collision_energy_center']),
+            collision_energy_scale=float(data['collision_energy_scale']),
             collision_energy_by_instrument={
                 str(instrument): {
                     'center': float(stats['center']),
                     'scale': float(stats['scale']),
                 }
-                for instrument, stats in data.get(
-                    'collision_energy_by_instrument', {}
-                ).items()
+                for instrument, stats in data['collision_energy_by_instrument'].items()
             },
         )
 
@@ -364,8 +378,8 @@ class BinnedSpectrumDataset(Dataset):
         mz_max: float = MASS_SPEC_GYM_MZ_MAX,
         bin_width: float = MASS_SPEC_GYM_BIN_WIDTH,
         require_spectrum: bool = True,
-        cache_graphs: bool = False,
-        cache_dir: str | Path | None = None,
+        memory_cache: bool = False,
+        disk_cache_dir: str | Path | None = None,
         include_fragments: bool = False,
         fragment_config: FragmentConfig | None = None,
         slow_sample_seconds: float = 0.0,
@@ -377,8 +391,8 @@ class BinnedSpectrumDataset(Dataset):
         self.mz_max = float(mz_max)
         self.bin_width = float(bin_width)
         self.require_spectrum = require_spectrum
-        self.cache_graphs = cache_graphs
-        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.memory_cache = memory_cache
+        self.disk_cache_dir = Path(disk_cache_dir) if disk_cache_dir else None
         self.include_fragments = include_fragments
         self.fragment_config = fragment_config or FragmentConfig()
         self.slow_sample_seconds = float(slow_sample_seconds)
@@ -396,10 +410,10 @@ class BinnedSpectrumDataset(Dataset):
         return len(self.df)
 
     def _graph(self, idx: int) -> dict[str, torch.Tensor]:
-        if self.cache_graphs and idx in self._graph_cache:
+        if self.memory_cache and idx in self._graph_cache:
             return self._graph_cache[idx]
         smiles = str(self.df.at[idx, self.smiles_col])
-        if self.cache_dir is not None:
+        if self.disk_cache_dir is not None:
             path = self._feature_cache_path(
                 'graphs',
                 smiles,
@@ -409,24 +423,24 @@ class BinnedSpectrumDataset(Dataset):
             )
             graph = _load_feature_cache(path)
             if graph is not None:
-                if self.cache_graphs:
+                if self.memory_cache:
                     self._graph_cache[idx] = graph
                 return graph
         graph = smiles_to_graph(smiles, self.graph_config)
-        if self.cache_dir is not None:
+        if self.disk_cache_dir is not None:
             _save_feature_cache(path, graph)
-        if self.cache_graphs:
+        if self.memory_cache:
             self._graph_cache[idx] = graph
         return graph
 
     def _fragments(self, idx: int) -> dict[str, Any]:
-        if self.cache_graphs and idx in self._fragment_cache:
+        if self.memory_cache and idx in self._fragment_cache:
             return self._fragment_cache[idx]
         smiles = str(self.df.at[idx, self.smiles_col])
         adduct = (
             _coerce_string(self.df.at[idx, self.adduct_col]) if self.adduct_col else ''
         )
-        if self.cache_dir is not None:
+        if self.disk_cache_dir is not None:
             path = self._feature_cache_path(
                 'fragments',
                 smiles,
@@ -439,7 +453,7 @@ class BinnedSpectrumDataset(Dataset):
             )
             fragments = _load_feature_cache(path)
             if fragments is not None:
-                if self.cache_graphs:
+                if self.memory_cache:
                     self._fragment_cache[idx] = fragments
                 return fragments
         fragments = smiles_to_fragment_candidates(
@@ -449,9 +463,9 @@ class BinnedSpectrumDataset(Dataset):
             adduct=adduct,
             config=self.fragment_config,
         )
-        if self.cache_dir is not None:
+        if self.disk_cache_dir is not None:
             _save_feature_cache(path, fragments)
-        if self.cache_graphs:
+        if self.memory_cache:
             self._fragment_cache[idx] = fragments
         return fragments
 
@@ -461,8 +475,8 @@ class BinnedSpectrumDataset(Dataset):
         smiles: str,
         settings: dict[str, Any],
     ) -> Path:
-        if self.cache_dir is None:
-            raise RuntimeError('cache_dir is not configured.')
+        if self.disk_cache_dir is None:
+            raise RuntimeError('disk_cache_dir is not configured.')
         payload = {
             'version': FEATURE_CACHE_VERSION,
             'kind': kind,
@@ -471,7 +485,7 @@ class BinnedSpectrumDataset(Dataset):
         }
         text = json.dumps(payload, sort_keys=True, separators=(',', ':'))
         digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
-        return self.cache_dir / kind / f'{digest}.pt'
+        return self.disk_cache_dir / kind / f'{digest}.pt'
 
     def _metadata(self, row) -> dict[str, torch.Tensor]:
         precursor_mz = (
@@ -496,7 +510,7 @@ class BinnedSpectrumDataset(Dataset):
                 dtype=torch.long,
             ),
             'adduct_charge': torch.tensor(
-                parse_adduct_charge(adduct),
+                parse_adduct(adduct).charge,
                 dtype=torch.float32,
             ),
             'instrument_type': torch.tensor(
@@ -626,7 +640,14 @@ def _load_feature_cache(path: Path) -> Any | None:
     if not path.exists():
         return None
     try:
-        return torch.load(path, map_location='cpu', weights_only=False)
+        payload = torch.load(path, map_location='cpu', weights_only=True)
+        if not isinstance(payload, dict):
+            raise ValueError('feature cache payload is not a dict')
+        if payload.get('cache_format') != FEATURE_CACHE_FORMAT:
+            raise ValueError('feature cache format mismatch')
+        if payload.get('feature_cache_version') != FEATURE_CACHE_VERSION:
+            raise ValueError('feature cache version mismatch')
+        return payload['value']
     except Exception:
         try:
             path.unlink()
@@ -639,7 +660,14 @@ def _save_feature_cache(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
     try:
-        torch.save(value, tmp_path)
+        torch.save(
+            {
+                'cache_format': FEATURE_CACHE_FORMAT,
+                'feature_cache_version': FEATURE_CACHE_VERSION,
+                'value': value,
+            },
+            tmp_path,
+        )
         os.replace(tmp_path, path)
     finally:
         try:

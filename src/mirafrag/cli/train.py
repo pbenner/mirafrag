@@ -6,12 +6,14 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
     apply_fragment_args_to_model_config,
     resolve_device,
     validate_checkpoint_bin_config,
 )
+from mirafrag.config import MiraFragConfig
 from mirafrag.data import (
     BinnedSpectrumDataset,
     MetadataConfig,
@@ -22,14 +24,10 @@ from mirafrag.data import (
     read_table,
     select_split,
 )
+from mirafrag.encoders import load_foundation_encoder
 from mirafrag.fragments import fragment_config_from_model_config
-from mirafrag.model import (
-    MiraFragConfig,
-    MiraFragModel,
-    load_checkpoint,
-    load_foundation_encoder,
-    set_encoder_finetune_strategy,
-)
+from mirafrag.losses import LOSS_NAMES
+from mirafrag.model import MiraFragModel, set_encoder_finetune_strategy
 from mirafrag.spectra import (
     MASS_SPEC_GYM_BIN_WIDTH,
     MASS_SPEC_GYM_MZ_MAX,
@@ -190,18 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--bin-width', type=float, default=MASS_SPEC_GYM_BIN_WIDTH)
     parser.add_argument(
         '--loss',
-        choices=[
-            'kl',
-            'projected_kl',
-            'soft_projected_kl',
-            'soft_binned_kl',
-            'soft_binned_coverage_kl',
-            'fragnnet_ce',
-            'kl_cosine',
-            'cosine',
-            'sqrt_cosine',
-            'tolerance_cosine',
-        ],
+        choices=LOSS_NAMES,
         default='kl',
     )
     parser.add_argument(
@@ -252,10 +239,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=17)
     parser.add_argument('--max-rows', type=int, default=None)
     parser.add_argument(
-        '--cache-graphs', action=argparse.BooleanOptionalAction, default=False
+        '--memory-cache', action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument(
-        '--cache-dir',
+        '--disk-cache-dir',
         default=None,
         help='Optional disk cache for precomputed encoder graphs and fragment candidates.',
     )
@@ -435,8 +422,8 @@ def main() -> None:
         metadata_config=metadata_config,
         mz_max=args.mz_max,
         bin_width=args.bin_width,
-        cache_graphs=args.cache_graphs,
-        cache_dir=args.cache_dir,
+        memory_cache=args.memory_cache,
+        disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
         fragment_config=fragment_config,
         slow_sample_seconds=args.slow_sample_seconds,
@@ -449,8 +436,8 @@ def main() -> None:
             metadata_config=metadata_config,
             mz_max=args.mz_max,
             bin_width=args.bin_width,
-            cache_graphs=args.cache_graphs,
-            cache_dir=args.cache_dir,
+            memory_cache=args.memory_cache,
+            disk_cache_dir=args.disk_cache_dir,
             include_fragments=True,
             fragment_config=fragment_config,
             slow_sample_seconds=args.slow_sample_seconds,
@@ -459,7 +446,7 @@ def main() -> None:
         if not val_df.empty
         else None
     )
-    if args.cache_dir is not None:
+    if args.disk_cache_dir is not None:
         _prefill_feature_cache(
             train_ds,
             split_name='train',
