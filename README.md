@@ -42,6 +42,27 @@ produces per-atom node features. The spectrum head pools those atom features ove
 each generated fragment formula and concatenates them with hand-built fragment
 features plus precursor metadata.
 
+The 3D graph construction is deterministic for a given seed. MiraFrag first asks
+RDKit to turn the SMILES string into a molecule and to make all hydrogens
+explicit. It then asks RDKit to propose a plausible 3D arrangement of the atoms.
+Technically, this uses RDKit's ETKDGv3 conformer generator, which is a rule-based
+method for placing atoms in 3D using typical bond lengths, bond angles, ring
+shapes, and stereochemistry. MiraFrag tries a few increasingly permissive RDKit
+settings when the default attempt fails.
+
+After a 3D arrangement is found, MiraFrag relaxes the coordinates with a simple
+classical force field. UFF is tried first because it covers many element types;
+MMFF is used as a fallback when available. These force fields are not the model
+being trained. They are only a preprocessing step that moves atoms into a more
+reasonable geometry before the molecular encoder sees them.
+
+MiraFrag then checks whether bonded atoms are at chemically plausible distances
+using covalent radii. If relaxation creates an implausible geometry, the original
+unrelaxed RDKit geometry is tried instead. If all 3D attempts fail, MiraFrag can
+fall back to RDKit 2D coordinates, but that should be rare and is mainly a
+robustness path. Encoder graph edges connect atom pairs that are closer than the
+selected encoder cutoff radius.
+
 The metadata vector contains scaled precursor m/z, standardized collision
 energy, an adduct embedding, and an instrument-type embedding. Collision energy
 is standardized from the training split with robust median/IQR statistics, with
