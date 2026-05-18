@@ -63,6 +63,33 @@ def fill_feature_cache_unordered(
     return processed
 
 
+def prefill_feature_cache(
+    dataset: BinnedSpectrumDataset,
+    *,
+    split_name: str,
+    chunk_size: int,
+    num_workers: int,
+    show_progress: bool,
+) -> None:
+    """
+    Fill missing graph and fragment cache files with a visible progress bar.
+
+    Training and evaluation use this before constructing ordered DataLoaders so
+    expensive cache misses are handled by the unordered worker pool instead of
+    blocking model batches behind slow samples.
+    """
+    if len(dataset) == 0:
+        return
+    total = fill_feature_cache_unordered(
+        dataset,
+        desc=f'cache {split_name}',
+        num_workers=num_workers,
+        chunk_size=chunk_size,
+        show_progress=show_progress,
+    )
+    print(f'cache {split_name} ready rows={total}')
+
+
 def _multiprocessing_start_method() -> str:
     """
     Return a cache-fill start method that avoids unsafe CUDA forks.

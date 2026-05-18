@@ -85,10 +85,10 @@ def parse_args() -> argparse.Namespace:
         help='Apply the MassSpecGym simulation-challenge filter.',
     )
     parser.add_argument(
-        '--batch-size',
+        '--chunk-size',
         type=int,
         default=64,
-        help='Worker chunk size for unordered cache filling.',
+        help='Number of dataset indices handed to each cache worker task.',
     )
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument(
@@ -105,12 +105,6 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help='Print every dataset sample as it starts loading.',
-    )
-    parser.add_argument(
-        '--dataloader-timeout',
-        type=float,
-        default=0.0,
-        help='Deprecated for unordered cache filling; kept for Makefile compatibility.',
     )
     parser.add_argument('--seed', type=int, default=17)
     parser.add_argument('--max-rows', type=int, default=None)
@@ -244,7 +238,7 @@ def _precompute_frame(
         dataset,
         desc=f'cache {split_name}',
         num_workers=args.num_workers,
-        chunk_size=args.batch_size,
+        chunk_size=args.chunk_size,
         show_progress=args.progress,
     )
     print(

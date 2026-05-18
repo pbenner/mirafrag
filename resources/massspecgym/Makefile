@@ -22,7 +22,7 @@ DISK_CACHE_DIR ?= $(RESOURCE_DIR)/data/cache/mirafrag_features
 CACHE_SOURCE_MODEL ?=
 CACHE_SPLITS ?= train val test
 CACHE_NUM_WORKERS ?= $(shell nproc)
-CACHE_BATCH_SIZE ?= 1
+CACHE_CHUNK_SIZE ?= 1
 
 DATASET_REPO ?= roman-bushuiev/MassSpecGym
 DATASET_FILE ?= data/MassSpecGym.tsv
@@ -135,12 +135,13 @@ TRAIN_FOUNDATION_ARGS =
 endif
 
 COMMON_ARGS = --device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --batch-size $(BATCH_SIZE) --num-workers $(NUM_WORKERS) $(PROGRESS_ARGS)
-LOADER_DEBUG_ARGS = --slow-sample-seconds $(SLOW_SAMPLE_SECONDS) --dataloader-timeout $(DATALOADER_TIMEOUT)
+SAMPLE_DEBUG_ARGS = --slow-sample-seconds $(SLOW_SAMPLE_SECONDS)
 ifeq ($(strip $(TRACE_SAMPLES)),1)
-LOADER_DEBUG_ARGS += --trace-samples
+SAMPLE_DEBUG_ARGS += --trace-samples
 else
-LOADER_DEBUG_ARGS += --no-trace-samples
+SAMPLE_DEBUG_ARGS += --no-trace-samples
 endif
+LOADER_DEBUG_ARGS = $(SAMPLE_DEBUG_ARGS) --dataloader-timeout $(DATALOADER_TIMEOUT)
 ARCH_ARGS = --hidden-dim $(HIDDEN_DIM) --num-layers $(NUM_LAYERS) --dropout $(DROPOUT) --metadata-dim $(METADATA_DIM) --fragment-gnn-layers $(FRAGMENT_GNN_LAYERS)
 FRAGMENT_ARGS = --max-fragment-tree-depth $(MAX_FRAGMENT_TREE_DEPTH) --max-fragment-broken-bonds $(MAX_FRAGMENT_BROKEN_BONDS) --max-fragments $(MAX_FRAGMENTS) --max-fragment-edges $(MAX_FRAGMENT_EDGES) $(ISOTOPE_FRAGMENT_ARGS) --fragment-isotope-threshold $(FRAGMENT_ISOTOPE_THRESHOLD) --max-fragment-isotope-peaks $(MAX_FRAGMENT_ISOTOPE_PEAKS)
 HEAD_ARGS = $(ARCH_ARGS) $(FRAGMENT_ARGS)
@@ -168,6 +169,12 @@ else
 LOSS_ARGS += --no-relative-mass-tolerance
 endif
 LOSS_ARGS += --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
+EVAL_DIAGNOSTIC_ARGS = --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
+ifeq ($(strip $(RELATIVE_MASS_TOLERANCE)),1)
+EVAL_DIAGNOSTIC_ARGS += --relative-mass-tolerance
+else
+EVAL_DIAGNOSTIC_ARGS += --no-relative-mass-tolerance
+endif
 SCHEDULER_ARGS = --scheduler $(SCHEDULER) --min-lr-ratio $(MIN_LR_RATIO)
 ifneq ($(filter $(strip $(SCHEDULER)),cosine constant exponential),)
 SCHEDULER_ARGS += --scheduler-interval $(SCHEDULER_INTERVAL)
@@ -211,7 +218,7 @@ help:
 		'  CACHE_SOURCE_MODEL=$(CACHE_SOURCE_MODEL)' \
 		'  CACHE_SPLITS=$(CACHE_SPLITS)' \
 		'  CACHE_NUM_WORKERS=$(CACHE_NUM_WORKERS)' \
-		'  CACHE_BATCH_SIZE=$(CACHE_BATCH_SIZE)' \
+		'  CACHE_CHUNK_SIZE=$(CACHE_CHUNK_SIZE)' \
 		'  ENCODER=$(ENCODER)' \
 		'  CHECKPOINT_ENCODER=$(CHECKPOINT_ENCODER)' \
 		'  FOUNDATION_SOURCE=$(FOUNDATION_SOURCE)' \
@@ -267,8 +274,8 @@ prepare-cache:
 		--input $(INPUT) \
 		--disk-cache-dir $(DISK_CACHE_DIR) \
 		$(CACHE_MODEL_ARGS) \
-		--device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --batch-size $(CACHE_BATCH_SIZE) --num-workers $(CACHE_NUM_WORKERS) $(PROGRESS_ARGS) \
-		$(LOADER_DEBUG_ARGS) \
+		--device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --chunk-size $(CACHE_CHUNK_SIZE) --num-workers $(CACHE_NUM_WORKERS) $(PROGRESS_ARGS) \
+		$(SAMPLE_DEBUG_ARGS) \
 		$(CACHE_HEAD_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--splits $(CACHE_SPLITS) \
@@ -325,6 +332,7 @@ eval:
 		--output $(PREDICTIONS) \
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
+		$(EVAL_DIAGNOSTIC_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)

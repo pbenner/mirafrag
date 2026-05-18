@@ -4,6 +4,7 @@ import argparse
 
 from torch.utils.data import DataLoader
 
+from mirafrag.cache_fill import prefill_feature_cache
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import resolve_device, validate_checkpoint_bin_config
@@ -56,6 +57,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--min-intensity', type=float, default=0.001)
     parser.add_argument('--top-k', type=int, default=100)
     parser.add_argument('--max-rows', type=int, default=None)
+    parser.add_argument(
+        '--mass-tolerance',
+        type=float,
+        default=0.01,
+        help='Absolute or relative m/z tolerance for oracle support diagnostics.',
+    )
+    parser.add_argument(
+        '--relative-mass-tolerance',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Interpret --mass-tolerance as a relative tolerance for diagnostics.',
+    )
+    parser.add_argument(
+        '--mass-tolerance-min-mz',
+        type=float,
+        default=200.0,
+        help='Minimum m/z denominator for relative diagnostic tolerance.',
+    )
     parser.add_argument(
         '--progress',
         action=argparse.BooleanOptionalAction,
@@ -124,6 +143,14 @@ def main() -> None:
         include_fragments=True,
         fragment_config=fragment_config_from_model_config(model.config),
     )
+    if args.disk_cache_dir is not None:
+        prefill_feature_cache(
+            ds,
+            split_name=str(args.split_value or args.split),
+            chunk_size=args.batch_size,
+            num_workers=args.num_workers,
+            show_progress=args.progress,
+        )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -142,11 +169,18 @@ def main() -> None:
         min_intensity=args.min_intensity,
         top_k=args.top_k,
         show_progress=args.progress,
+        mass_tolerance=args.mass_tolerance,
+        relative_mass_tolerance=args.relative_mass_tolerance,
+        mass_tolerance_min_mz=args.mass_tolerance_min_mz,
     )
     print(
         f'n={len(predictions)} '
         f'cosine_mean={summary["cosine_mean"]:.5f} '
-        f'sqrt_cosine_mean={summary["sqrt_cosine_mean"]:.5f}'
+        f'sqrt_cosine_mean={summary["sqrt_cosine_mean"]:.5f} '
+        f'candidate_coverage_mean={summary["candidate_coverage_mean"]:.5f} '
+        f'oos_target_mass_mean={summary["oos_target_mass_mean"]:.5f} '
+        f'oracle_binned_cosine_mean={summary["oracle_binned_cosine_mean"]:.5f} '
+        f'oracle_tolerance_cosine_mean={summary["oracle_tolerance_cosine_mean"]:.5f}'
     )
     if args.output:
         predictions.to_csv(args.output, index=False)

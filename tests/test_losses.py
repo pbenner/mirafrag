@@ -27,7 +27,7 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.encoders.mace import repair_mace_cuequivariance_config
-from mirafrag.evaluation import _sparse_prediction_rows
+from mirafrag.evaluation import _sparse_prediction_rows, support_diagnostics
 from mirafrag.fragments import (
     FRAGMENT_EDGE_FEATURE_DIM,
     PROTON_MASS,
@@ -198,6 +198,30 @@ def test_prediction_rows_aggregate_duplicate_bins_before_top_k():
     )
 
     assert rows == [{'mz': [1.5], 'intensity': [100.0]}]
+
+
+def test_support_diagnostics_report_candidate_oracle_bounds():
+    pred = {
+        'mzs': torch.tensor([1.5, 3.5]),
+        'bins': torch.tensor([1, 3]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 5,
+    }
+    batch = {
+        'target_mz': torch.tensor([1.5, 2.5, 3.5]),
+        'target_intensity': torch.tensor([1.0, 2.0, 2.0]),
+        'target_batch': torch.tensor([0, 0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    diagnostics = support_diagnostics(pred, batch, tolerance=0.01)
+
+    assert torch.allclose(diagnostics['candidate_coverage'], torch.tensor([0.6]))
+    assert torch.allclose(diagnostics['oos_target_mass'], torch.tensor([0.4]))
+    expected_oracle = torch.sqrt(torch.tensor([5.0])) / 3.0
+    assert torch.allclose(diagnostics['oracle_binned_cosine'], expected_oracle)
+    assert torch.allclose(diagnostics['oracle_tolerance_cosine'], expected_oracle)
 
 
 def test_projected_kl_assigns_unreachable_target_bins_to_oos():

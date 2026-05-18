@@ -5,7 +5,7 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 
-from mirafrag.cache_fill import fill_feature_cache_unordered
+from mirafrag.cache_fill import prefill_feature_cache
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
@@ -457,21 +457,19 @@ def main() -> None:
         else None
     )
     if args.disk_cache_dir is not None:
-        _prefill_feature_cache(
+        prefill_feature_cache(
             train_ds,
             split_name='train',
-            batch_size=args.batch_size,
+            chunk_size=args.batch_size,
             num_workers=args.num_workers,
-            dataloader_timeout=args.dataloader_timeout,
             show_progress=args.progress,
         )
         if val_ds is not None:
-            _prefill_feature_cache(
+            prefill_feature_cache(
                 val_ds,
                 split_name='val',
-                batch_size=args.batch_size,
+                chunk_size=args.batch_size,
                 num_workers=args.num_workers,
-                dataloader_timeout=args.dataloader_timeout,
                 show_progress=args.progress,
             )
 
@@ -528,33 +526,6 @@ def main() -> None:
         kl_weight=args.kl_weight,
         coverage_weight=args.coverage_weight,
     )
-
-
-def _prefill_feature_cache(
-    dataset: BinnedSpectrumDataset,
-    *,
-    split_name: str,
-    batch_size: int,
-    num_workers: int,
-    dataloader_timeout: float,
-    show_progress: bool,
-) -> None:
-    """
-    Fill missing graph and fragment cache files before training.
-
-    This makes expensive cache work visible with a dedicated progress bar and uses unordered multiprocessing so slow samples do not block faster workers from receiving new work.
-    """
-    if len(dataset) == 0:
-        return
-    del dataloader_timeout
-    total = fill_feature_cache_unordered(
-        dataset,
-        desc=f'cache {split_name}',
-        num_workers=num_workers,
-        chunk_size=batch_size,
-        show_progress=show_progress,
-    )
-    print(f'cache {split_name} ready rows={total}')
 
 
 def _validate_loaded_checkpoint_config(

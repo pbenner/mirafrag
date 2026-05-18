@@ -12,6 +12,7 @@ from mirafrag.data import move_batch_to_device
 from mirafrag.losses import (
     _aggregate_values,
     _bin_width_from_batch,
+    _target_tolerances,
     sparse_binned_cosine_similarity,
 )
 from mirafrag.model import MiraFragModel
@@ -27,6 +28,9 @@ def evaluate_model(
     min_intensity: float = 0.001,
     top_k: int = 100,
     show_progress: bool = True,
+    mass_tolerance: float = 0.01,
+    relative_mass_tolerance: bool = False,
+    mass_tolerance_min_mz: float = 200.0,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """
     Evaluate a MiraFrag model and return predictions plus summary metrics.
@@ -38,6 +42,10 @@ def evaluate_model(
     rows = []
     all_cos = []
     all_sqrt = []
+    all_candidate_coverage = []
+    all_oos_target_mass = []
+    all_oracle_binned = []
+    all_oracle_tolerance = []
 
     progress = tqdm(
         loader,
@@ -51,12 +59,31 @@ def evaluate_model(
     for raw_batch in progress:
         batch = move_batch_to_device(raw_batch, device)
         probs = model.predict_proba(batch)
-        cos = sqrt_cos = None
+        cos = sqrt_cos = diagnostics = None
         if 'target_mz' in batch:
             cos = sparse_binned_cosine_similarity(probs, batch)
             sqrt_cos = sparse_binned_cosine_similarity(probs, batch, sqrt=True)
+            diagnostics = support_diagnostics(
+                probs,
+                batch,
+                tolerance=mass_tolerance,
+                relative=relative_mass_tolerance,
+                tolerance_min_mz=mass_tolerance_min_mz,
+            )
             all_cos.extend(float(x) for x in cos.detach().cpu())
             all_sqrt.extend(float(x) for x in sqrt_cos.detach().cpu())
+            all_candidate_coverage.extend(
+                float(x) for x in diagnostics['candidate_coverage'].detach().cpu()
+            )
+            all_oos_target_mass.extend(
+                float(x) for x in diagnostics['oos_target_mass'].detach().cpu()
+            )
+            all_oracle_binned.extend(
+                float(x) for x in diagnostics['oracle_binned_cosine'].detach().cpu()
+            )
+            all_oracle_tolerance.extend(
+                float(x) for x in diagnostics['oracle_tolerance_cosine'].detach().cpu()
+            )
         sparse_rows = _sparse_prediction_rows(
             probs,
             bin_width=_bin_width_from_batch(batch),
@@ -70,18 +97,142 @@ def evaluate_model(
                 'smiles': smiles,
                 'pred_peaks': json.dumps(sparse_rows[i]),
             }
-            if cos is not None and sqrt_cos is not None:
+            if cos is not None and sqrt_cos is not None and diagnostics is not None:
                 row['cosine'] = float(cos[i].detach().cpu())
                 row['sqrt_cosine'] = float(sqrt_cos[i].detach().cpu())
+                row['candidate_coverage'] = float(
+                    diagnostics['candidate_coverage'][i].detach().cpu()
+                )
+                row['oos_target_mass'] = float(
+                    diagnostics['oos_target_mass'][i].detach().cpu()
+                )
+                row['oracle_binned_cosine'] = float(
+                    diagnostics['oracle_binned_cosine'][i].detach().cpu()
+                )
+                row['oracle_tolerance_cosine'] = float(
+                    diagnostics['oracle_tolerance_cosine'][i].detach().cpu()
+                )
             rows.append(row)
 
     summary = {
-        'cosine_mean': float(sum(all_cos) / len(all_cos)) if all_cos else float('nan'),
-        'sqrt_cosine_mean': float(sum(all_sqrt) / len(all_sqrt))
-        if all_sqrt
-        else float('nan'),
+        'cosine_mean': _mean_or_nan(all_cos),
+        'sqrt_cosine_mean': _mean_or_nan(all_sqrt),
+        'candidate_coverage_mean': _mean_or_nan(all_candidate_coverage),
+        'oos_target_mass_mean': _mean_or_nan(all_oos_target_mass),
+        'oracle_binned_cosine_mean': _mean_or_nan(all_oracle_binned),
+        'oracle_tolerance_cosine_mean': _mean_or_nan(all_oracle_tolerance),
     }
     return pd.DataFrame(rows), summary
+
+
+def support_diagnostics(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    tolerance: float = 0.01,
+    relative: bool = False,
+    tolerance_min_mz: float = 200.0,
+    eps: float = 1e-12,
+) -> dict[str, torch.Tensor]:
+    """
+    Compute candidate-support upper bounds for sparse fragment predictions.
+
+    ``candidate_coverage`` is the target intensity fraction whose binned m/z is
+    present in the generated candidate support. ``oos_target_mass`` is the
+    complementary target mass. The oracle cosine values ignore learned logits and
+    ask how well any scorer could do if it placed probability only on reachable
+    target peaks, under exact MassSpecGym bins or m/z tolerance matching.
+    """
+    pred_bins = pred['bins'].long()
+    pred_mzs = pred['mzs'].to(device=pred_bins.device, dtype=torch.get_default_dtype())
+    pred_batch = pred['batch'].long()
+    target_mzs = batch['target_mz'].to(device=pred_bins.device, dtype=pred_mzs.dtype)
+    target_values = batch['target_intensity'].to(
+        device=pred_bins.device,
+        dtype=pred_mzs.dtype,
+    )
+    target_batch = batch['target_batch'].to(device=pred_bins.device).long()
+    target_bins = torch.floor(target_mzs / _bin_width_from_batch(batch)).long()
+    batch_size = int(pred['batch_size'])
+    num_bins = int(pred['num_bins'])
+    candidate_coverage = target_values.new_zeros(batch_size)
+    oos_target_mass = target_values.new_zeros(batch_size)
+    oracle_binned_cosine = target_values.new_zeros(batch_size)
+    oracle_tolerance_cosine = target_values.new_zeros(batch_size)
+
+    for batch_idx in range(batch_size):
+        p_mask = pred_batch == batch_idx
+        t_mask = target_batch == batch_idx
+        if not bool(t_mask.any()):
+            continue
+
+        t_bins, t_bin_values = _aggregate_values(
+            target_bins[t_mask].clamp(0, num_bins - 1),
+            target_values[t_mask],
+        )
+        total_mass = torch.clamp(t_bin_values.sum(), min=eps)
+        target_norm = torch.clamp(torch.linalg.vector_norm(t_bin_values), min=eps)
+        if bool(p_mask.any()):
+            p_bins = torch.unique(pred_bins[p_mask].clamp(0, num_bins - 1), sorted=True)
+            reachable_bins = _membership_mask(t_bins, p_bins)
+        else:
+            reachable_bins = torch.zeros_like(t_bins, dtype=torch.bool)
+        reachable_mass = torch.sum(t_bin_values[reachable_bins])
+        reachable_norm = torch.linalg.vector_norm(t_bin_values[reachable_bins])
+        candidate_coverage[batch_idx] = reachable_mass / total_mass
+        oos_target_mass[batch_idx] = 1.0 - candidate_coverage[batch_idx]
+        oracle_binned_cosine[batch_idx] = reachable_norm / target_norm
+
+        t_mzs = target_mzs[t_mask]
+        t_values = target_values[t_mask]
+        tolerance_target_norm = torch.clamp(torch.linalg.vector_norm(t_values), min=eps)
+        if bool(p_mask.any()):
+            p_mzs = pred_mzs[p_mask]
+            tolerances = _target_tolerances(
+                t_mzs,
+                tolerance=tolerance,
+                relative=relative,
+                tolerance_min_mz=tolerance_min_mz,
+            )
+            reachable_peaks = (
+                torch.abs(t_mzs.unsqueeze(1) - p_mzs.unsqueeze(0))
+                <= tolerances.unsqueeze(1)
+            ).any(dim=1)
+        else:
+            reachable_peaks = torch.zeros_like(t_mzs, dtype=torch.bool)
+        tolerance_reachable_norm = torch.linalg.vector_norm(t_values[reachable_peaks])
+        oracle_tolerance_cosine[batch_idx] = (
+            tolerance_reachable_norm / tolerance_target_norm
+        )
+
+    return {
+        'candidate_coverage': candidate_coverage,
+        'oos_target_mass': oos_target_mass,
+        'oracle_binned_cosine': oracle_binned_cosine,
+        'oracle_tolerance_cosine': oracle_tolerance_cosine,
+    }
+
+
+def _membership_mask(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    """
+    Return whether each sorted value is present in a sorted support tensor.
+    """
+    if support.numel() == 0 or values.numel() == 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    positions = torch.searchsorted(support, values)
+    in_range = positions < support.numel()
+    out = torch.zeros_like(values, dtype=torch.bool)
+    if bool(in_range.any()):
+        in_range_positions = positions[in_range]
+        out[in_range] = support[in_range_positions] == values[in_range]
+    return out
+
+
+def _mean_or_nan(values: list[float]) -> float:
+    """
+    Return the arithmetic mean or NaN for an empty sequence.
+    """
+    return float(sum(values) / len(values)) if values else float('nan')
 
 
 def _sparse_prediction_rows(
