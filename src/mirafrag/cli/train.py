@@ -4,8 +4,8 @@ import argparse
 
 import torch
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
+from mirafrag.cache_fill import fill_feature_cache_unordered
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
@@ -530,15 +530,6 @@ def main() -> None:
     )
 
 
-def _prefill_cache_collate(items: list[dict]) -> int:
-    """
-    Return the sample count for a training cache-fill batch.
-
-    The cache prefill DataLoader only needs to trigger dataset item creation. The count is used to update the tqdm progress bar.
-    """
-    return len(items)
-
-
 def _prefill_feature_cache(
     dataset: BinnedSpectrumDataset,
     *,
@@ -551,33 +542,18 @@ def _prefill_feature_cache(
     """
     Fill missing graph and fragment cache files before training.
 
-    This makes expensive cache work visible with a dedicated progress bar and avoids mixing first-epoch training progress with preprocessing latency.
+    This makes expensive cache work visible with a dedicated progress bar and uses unordered multiprocessing so slow samples do not block faster workers from receiving new work.
     """
     if len(dataset) == 0:
         return
-    loader = DataLoader(
+    del dataloader_timeout
+    total = fill_feature_cache_unordered(
         dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=_prefill_cache_collate,
-        timeout=dataloader_timeout,
-        **dataloader_performance_kwargs(
-            num_workers=num_workers,
-            device='cpu',
-        ),
-    )
-    total = 0
-    progress = tqdm(
-        loader,
         desc=f'cache {split_name}',
-        total=len(loader),
-        dynamic_ncols=True,
-        leave=False,
-        disable=not show_progress,
+        num_workers=num_workers,
+        chunk_size=batch_size,
+        show_progress=show_progress,
     )
-    for count in progress:
-        total += int(count)
     print(f'cache {split_name} ready rows={total}')
 
 

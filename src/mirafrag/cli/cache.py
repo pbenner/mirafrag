@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-
+from mirafrag.cache_fill import fill_feature_cache_unordered
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
@@ -18,7 +16,6 @@ from mirafrag.data import (
     SMILES_ALIASES,
     BinnedSpectrumDataset,
     MetadataConfig,
-    dataloader_performance_kwargs,
     filter_massspecgym_simulation,
     filter_supported_elements,
     find_column,
@@ -34,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     """
     Parse command-line arguments for cache precomputation.
 
-    The options define input data, encoder selection, fragment support settings, splits, and DataLoader behavior for filling disk feature caches.
+    The options define input data, encoder selection, fragment support settings, splits, and unordered worker-pool behavior for filling disk feature caches.
     """
     parser = argparse.ArgumentParser(
         prog='mirafrag-cache',
@@ -87,7 +84,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help='Apply the MassSpecGym simulation-challenge filter.',
     )
-    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=64,
+        help='Worker chunk size for unordered cache filling.',
+    )
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument(
         '--slow-sample-seconds',
@@ -108,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         '--dataloader-timeout',
         type=float,
         default=0.0,
-        help='Seconds before a DataLoader worker timeout; 0 disables the timeout.',
+        help='Deprecated for unordered cache filling; kept for Makefile compatibility.',
     )
     parser.add_argument('--seed', type=int, default=17)
     parser.add_argument('--max-rows', type=int, default=None)
@@ -121,24 +123,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _precompute_collate(items: list[dict]) -> int:
-    """
-    Return the number of samples in a cache precompute batch.
-
-    All useful work happens in ``Dataset.__getitem__`` when graph and fragment caches are generated, so the collate function only reports progress counts.
-    """
-    return len(items)
-
-
 def main() -> None:
     """
     Run the feature-cache precomputation command.
 
-    The command loads either a checkpoint-defined encoder/config or a fresh foundation encoder, filters rows to supported elements, deduplicates cache keys, and fills graph/fragment cache files.
+    The command loads either a checkpoint-defined encoder/config or a fresh foundation encoder on CPU by default, filters rows to supported elements, deduplicates cache keys, and fills graph/fragment cache files.
     """
     args = parse_args()
     quiet_rdkit_logs()
-    device = resolve_device(args.device)
+    device = 'cpu' if args.device == 'auto' else resolve_device(args.device)
 
     if args.init_checkpoint:
         model, _payload = load_checkpoint(args.init_checkpoint, device=device)
@@ -204,7 +197,7 @@ def _precompute_frame(
     """
     Precompute cache entries for one selected dataframe split.
 
-    Rows are element-filtered and deduplicated by SMILES/adduct before a DataLoader walks the dataset, causing missing graph and fragment cache files to be written.
+    Rows are element-filtered and deduplicated by SMILES/adduct before an unordered worker pool materializes dataset items, causing missing graph and fragment cache files to be written.
     """
     df, element_stats = filter_supported_elements(
         df,
@@ -247,28 +240,13 @@ def _precompute_frame(
         slow_sample_seconds=args.slow_sample_seconds,
         trace_samples=args.trace_samples,
     )
-    loader = DataLoader(
+    total = fill_feature_cache_unordered(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=_precompute_collate,
-        timeout=args.dataloader_timeout,
-        **dataloader_performance_kwargs(
-            num_workers=args.num_workers,
-            device='cpu',
-        ),
-    )
-    total = 0
-    progress = tqdm(
-        loader,
         desc=f'cache {split_name}',
-        total=len(loader),
-        dynamic_ncols=True,
-        disable=not args.progress,
+        num_workers=args.num_workers,
+        chunk_size=args.batch_size,
+        show_progress=args.progress,
     )
-    for count in progress:
-        total += int(count)
     print(
         f'cached {total} rows for split={split_name} '
         f'disk_cache_dir={args.disk_cache_dir} fragments=True'

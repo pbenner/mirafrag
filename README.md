@@ -169,7 +169,9 @@ same disk cache directory by default. Disk caching is controlled by
 `DISK_CACHE_DIR` / `--disk-cache-dir`; per-worker in-memory reuse is controlled
 by `MEMORY_CACHE` / `--memory-cache`. When a training disk cache directory is
 configured, the `train` target pre-fills missing train/val cache entries with
-explicit `cache train` and `cache val` tqdm bars before the first epoch.
+explicit `cache train` and `cache val` tqdm bars before the first epoch. Cache
+filling uses an unordered multiprocessing pool, so each worker receives another
+sample as soon as it finishes instead of waiting for earlier slow samples.
 `prepare-cache` uses the foundation model and the Makefile fragment settings
 unless you pass `CACHE_SOURCE_MODEL=resources/massspecgym/checkpoints/mirafrag.pt`.
 
