@@ -753,15 +753,18 @@ def dataloader_performance_kwargs(
     """
     Return DataLoader options tuned for the selected worker/device setup.
 
-    CUDA loaders use pinned memory, and multi-worker loaders use persistent workers, small prefetching, and an RDKit log-silencing worker initializer.
+    CUDA loaders use pinned memory for faster host-to-device transfers. When CUDA is active and workers are requested, workers are started with ``spawn`` instead of ``fork`` so they do not inherit an already-initialized CUDA runtime from checkpoint loading, cache prefill, or initial validation.
     """
     kwargs: dict[str, Any] = {}
-    if _is_cuda_device(device):
+    use_cuda = _is_cuda_device(device)
+    if use_cuda:
         kwargs['pin_memory'] = True
     if num_workers > 0:
         kwargs['persistent_workers'] = True
         kwargs['prefetch_factor'] = 2
         kwargs['worker_init_fn'] = _quiet_rdkit_worker_init
+        if use_cuda:
+            kwargs['multiprocessing_context'] = 'spawn'
     return kwargs
 
 

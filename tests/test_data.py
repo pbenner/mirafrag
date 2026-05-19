@@ -139,3 +139,18 @@ def test_filter_supported_elements_drops_unsupported_boron():
 def test_dataloader_workers_silence_rdkit_logs():
     kwargs = dataloader_performance_kwargs(num_workers=2, device='cpu')
     assert callable(kwargs['worker_init_fn'])
+    assert kwargs['persistent_workers'] is True
+    assert 'pin_memory' not in kwargs
+    assert 'multiprocessing_context' not in kwargs
+
+
+def test_cuda_dataloader_workers_use_spawn_and_pinned_memory():
+    kwargs = dataloader_performance_kwargs(num_workers=2, device='cuda')
+    assert kwargs['pin_memory'] is True
+    assert kwargs['persistent_workers'] is True
+    assert kwargs['multiprocessing_context'] == 'spawn'
+
+
+def test_cuda_single_process_loader_uses_pinned_memory_without_spawn():
+    kwargs = dataloader_performance_kwargs(num_workers=0, device='cuda')
+    assert kwargs == {'pin_memory': True}
