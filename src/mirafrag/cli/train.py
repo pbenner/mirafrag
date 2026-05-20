@@ -208,6 +208,21 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help='Coverage penalty weight for --loss soft_binned_coverage_kl.',
     )
+    parser.add_argument(
+        '--target-power',
+        type=float,
+        default=1.0,
+        help=(
+            'Sharpen target intensities before KL normalization. '
+            '1.0 keeps standard intensity-normalized KL.'
+        ),
+    )
+    parser.add_argument(
+        '--entropy-weight',
+        type=float,
+        default=0.0,
+        help='Optional entropy penalty on predicted fragment-plus-OOS probabilities.',
+    )
     parser.add_argument('--train-split', default='train')
     parser.add_argument('--val-split', default='val')
     parser.add_argument('--split-col', default='auto')
@@ -525,6 +540,8 @@ def main() -> None:
         mass_tolerance_min_mz=args.mass_tolerance_min_mz,
         kl_weight=args.kl_weight,
         coverage_weight=args.coverage_weight,
+        target_power=args.target_power,
+        entropy_weight=args.entropy_weight,
     )
 
 

@@ -72,7 +72,9 @@ CE(q, p) = -sum_i q_i log p_i
 ```
 
 The OOS term gives explicit supervision for target intensity that the current
-fragment generator cannot explain.
+fragment generator cannot explain. Since OOS is one model outcome, all
+unreachable target bins are summed into one target OOS mass before computing the
+KL term.
 
 If no target bin is reachable for a spectrum, `projected_kl` now trains the OOS
 bucket for that target intensity instead of contributing zero.
@@ -224,6 +226,37 @@ To reproduce FraGNNet's default tolerance setting, use relative 10 ppm matching:
 
 ```bash
 make -C resources/massspecgym train LOSS=fragnnet_ce RELATIVE_MASS_TOLERANCE=1 MASS_TOLERANCE=1e-5
+```
+
+## Target Sharpening And Entropy Regularization
+
+The KL-family losses can optionally sharpen the measured target distribution before computing KL. First, target intensities are normalized per spectrum:
+
+```text
+y_i = intensity_i / sum_j intensity_j
+```
+
+Then `--target-power alpha`, or `TARGET_POWER=alpha`, transforms the target distribution as:
+
+```text
+q_i = y_i^alpha / sum_j y_j^alpha
+```
+
+`alpha = 1` is the standard KL target and is the default. Values above one emphasize high-intensity peaks and downweight small peaks. This can improve cosine because binned cosine is strongly influenced by the dominant peaks, but it can also overfit earlier if the model becomes too specialized to the training spectra.
+
+MiraFrag can also add an entropy penalty to the predicted fragment-plus-OOS distribution:
+
+```text
+H(p) = -sum_j p_j log p_j - p_oos log p_oos
+loss = base_loss + beta H(p)
+```
+
+`beta` is controlled by `--entropy-weight` or `ENTROPY_WEIGHT`; the default is `0`. A small positive value encourages sharper predicted spectra. It should be kept small because too much entropy penalty can make the model overconfident and hurt validation performance.
+
+Example:
+
+```bash
+make -C resources/massspecgym train LOSS=kl TARGET_POWER=1.5 ENTROPY_WEIGHT=0.001
 ```
 
 ## Available Losses

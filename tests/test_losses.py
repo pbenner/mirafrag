@@ -47,6 +47,8 @@ from mirafrag.losses import (
     soft_projected_sparse_kl_divergence,
     sparse_binned_cosine_similarity,
     sparse_binned_kl_divergence,
+    sparse_oos_probability,
+    sparse_prediction_entropy,
     spectrum_loss,
 )
 from mirafrag.model import MiraFragModel, set_encoder_finetune_strategy
@@ -602,3 +604,94 @@ def test_kl_cosine_loss_matches_weighted_components():
     )
     expected = kl_weight * kl_loss + (1.0 - kl_weight) * cosine_loss
     assert torch.allclose(hybrid_loss, expected)
+
+
+def test_sparse_oos_probability_and_cosine_without_oos():
+    batch = {
+        'target_mz': torch.tensor([1.2]),
+        'target_intensity': torch.tensor([1.0]),
+        'target_batch': torch.tensor([0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    pred = {
+        'logits': torch.tensor([0.0]),
+        'oos_logits': torch.tensor([0.0]),
+        'bins': torch.tensor([1]),
+        'batch': torch.tensor([0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+
+    assert torch.allclose(sparse_oos_probability(pred), torch.tensor([0.5]))
+    assert sparse_binned_cosine_similarity(pred, batch).item() < 1.0
+    assert torch.allclose(
+        sparse_binned_cosine_similarity(pred, batch, include_oos=False),
+        torch.ones(1),
+    )
+
+
+def test_sparse_prediction_entropy_regularizer_adds_to_loss():
+    pred = {
+        'logits': torch.tensor([0.0, 0.0]),
+        'oos_logits': torch.tensor([0.0]),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+    batch = {
+        'target_mz': torch.tensor([1.2]),
+        'target_intensity': torch.tensor([1.0]),
+        'target_batch': torch.tensor([0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    base = spectrum_loss(pred, batch, loss='kl')
+    regularized = spectrum_loss(pred, batch, loss='kl', entropy_weight=0.1)
+
+    assert sparse_prediction_entropy(pred).item() > 0.0
+    assert regularized > base
+
+
+def test_kl_target_power_emphasizes_intense_peaks():
+    batch = {
+        'target_mz': torch.tensor([1.2, 2.2]),
+        'target_intensity': torch.tensor([0.1, 0.9]),
+        'target_batch': torch.tensor([0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    pred = {
+        'logits': torch.log(torch.tensor([0.5, 0.5])),
+        'oos_logits': torch.tensor([-100.0]),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+
+    standard = sparse_binned_kl_divergence(pred, batch, target_power=1.0)
+    sharpened = sparse_binned_kl_divergence(pred, batch, target_power=2.0)
+
+    assert sharpened > standard
+
+
+def test_sparse_binned_kl_aggregates_unreachable_bins_into_single_oos_event():
+    pred = {
+        'logits': torch.log(torch.tensor([0.2])),
+        'oos_logits': torch.log(torch.tensor([0.8])),
+        'bins': torch.tensor([1]),
+        'batch': torch.tensor([0]),
+        'batch_size': 1,
+        'num_bins': 8,
+    }
+    batch = {
+        'target_mz': torch.tensor([4.2, 5.2]),
+        'target_intensity': torch.tensor([0.5, 0.5]),
+        'target_batch': torch.tensor([0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    loss = sparse_binned_kl_divergence(pred, batch)
+
+    assert loss.item() >= 0.0
+    assert torch.allclose(loss, -torch.log(torch.tensor([0.8])), atol=1e-6)

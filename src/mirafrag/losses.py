@@ -32,6 +32,8 @@ def spectrum_loss(
     mass_tolerance_min_mz: float = 200.0,
     kl_weight: float = 0.7,
     coverage_weight: float = 0.1,
+    target_power: float = 1.0,
+    entropy_weight: float = 0.0,
 ) -> torch.Tensor:
     """
     Compute the configured sparse spectrum training loss.
@@ -47,6 +49,8 @@ def spectrum_loss(
         mass_tolerance_min_mz=mass_tolerance_min_mz,
         kl_weight=kl_weight,
         coverage_weight=coverage_weight,
+        target_power=target_power,
+        entropy_weight=entropy_weight,
     )
 
 
@@ -60,6 +64,8 @@ def _sparse_spectrum_loss(
     mass_tolerance_min_mz: float,
     kl_weight: float,
     coverage_weight: float,
+    target_power: float,
+    entropy_weight: float,
 ) -> torch.Tensor:
     """
     Dispatch a sparse prediction to the selected registered loss implementation.
@@ -71,7 +77,7 @@ def _sparse_spectrum_loss(
             f'Loss {loss!r} is not supported for sparse fragment predictions. '
             f'Supported losses: {", ".join(LOSS_NAMES)}.'
         ) from exc
-    return loss_spec.compute(
+    loss_value = loss_spec.compute(
         pred,
         batch,
         mass_tolerance=mass_tolerance,
@@ -79,7 +85,13 @@ def _sparse_spectrum_loss(
         mass_tolerance_min_mz=mass_tolerance_min_mz,
         kl_weight=kl_weight,
         coverage_weight=coverage_weight,
+        target_power=target_power,
     )
+    if entropy_weight > 0.0:
+        loss_value = (
+            loss_value + float(entropy_weight) * sparse_prediction_entropy(pred).mean()
+        )
+    return loss_value
 
 
 def sparse_binned_cosine_similarity(
@@ -87,12 +99,13 @@ def sparse_binned_cosine_similarity(
     batch: dict[str, Any],
     *,
     sqrt: bool = False,
+    include_oos: bool = True,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     """
     Compute MassSpecGym-style binned cosine for sparse predictions.
 
-    Fragment probabilities are aggregated into bins, OOS probability contributes to the prediction norm but not the target dot product, and one cosine value is returned per spectrum.
+    Fragment probabilities are aggregated into bins, OOS probability optionally contributes to the prediction norm but not the target dot product, and one cosine value is returned per spectrum.
     """
     fragment_log_probs, oos_log_probs = fragment_oos_log_probs(pred)
     pred_values = torch.exp(fragment_log_probs)
@@ -135,8 +148,39 @@ def sparse_binned_cosine_similarity(
             t_keys,
             t_vals,
             eps=eps,
-            pred_extra_values=oos_values[batch_idx].reshape(1),
+            pred_extra_values=oos_values[batch_idx].reshape(1) if include_oos else None,
         )
+    return out
+
+
+def sparse_oos_probability(pred: dict[str, Any]) -> torch.Tensor:
+    """
+    Return the predicted out-of-support probability for each spectrum.
+
+    The OOS probability is the model's learned mass for peaks that cannot be represented by generated fragment candidates.
+    """
+    _, oos_log_probs = fragment_oos_log_probs(pred)
+    return torch.exp(oos_log_probs)
+
+
+def sparse_prediction_entropy(pred: dict[str, Any]) -> torch.Tensor:
+    """
+    Compute entropy of each predicted fragment-plus-OOS distribution.
+
+    Lower entropy means the model concentrates probability on fewer candidates. This is useful as a small optional regularizer when KL converges but predictions remain too diffuse.
+    """
+    fragment_log_probs, oos_log_probs = fragment_oos_log_probs(pred)
+    pred_batch = pred['batch'].long()
+    batch_size = int(pred['batch_size'])
+    out = fragment_log_probs.new_zeros(batch_size)
+    for batch_idx in range(batch_size):
+        p_mask = pred_batch == batch_idx
+        frag_entropy = fragment_log_probs.new_zeros(())
+        if bool(p_mask.any()):
+            log_probs = fragment_log_probs[p_mask]
+            frag_entropy = -torch.sum(torch.exp(log_probs) * log_probs)
+        oos_log_prob = oos_log_probs[batch_idx]
+        out[batch_idx] = frag_entropy - torch.exp(oos_log_prob) * oos_log_prob
     return out
 
 
@@ -202,6 +246,7 @@ def sparse_binned_kl_divergence(
     pred: dict[str, Any],
     batch: dict[str, Any],
     *,
+    target_power: float = 1.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     """
@@ -234,25 +279,23 @@ def sparse_binned_kl_divergence(
             target_bins[t_mask].clamp(0, num_bins - 1),
             target_values[t_mask],
         )
-        target_probs = t_vals / torch.clamp(t_vals.sum(), min=eps)
-        if not bool(p_mask.any()):
-            log_pred_at_target = oos_log_probs[batch_idx].expand_as(target_probs)
-        else:
+        target_probs = _target_probs(t_vals, target_power=target_power, eps=eps)
+        if bool(p_mask.any()):
             p_keys, p_log_probs = _binned_log_probs_from_log_probs(
                 pred_bins[p_mask].clamp(0, num_bins - 1),
                 fragment_log_probs[p_mask],
                 eps=eps,
             )
-            log_pred_at_target = _lookup_log_probs(
-                p_keys,
-                p_log_probs,
-                t_keys,
-                eps=eps,
-                default_log_prob=oos_log_probs[batch_idx],
-            )
-        out[batch_idx] = torch.sum(
-            target_probs
-            * (torch.log(torch.clamp(target_probs, min=eps)) - log_pred_at_target)
+        else:
+            p_keys = pred_bins.new_empty(0)
+            p_log_probs = logits.new_empty(0)
+        out[batch_idx] = _kl_target_bins_with_oos(
+            p_keys,
+            p_log_probs,
+            t_keys,
+            target_probs,
+            oos_log_prob=oos_log_probs[batch_idx],
+            eps=eps,
         )
     return out
 
@@ -261,6 +304,7 @@ def projected_sparse_binned_kl_divergence(
     pred: dict[str, Any],
     batch: dict[str, Any],
     *,
+    target_power: float = 1.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     """
@@ -302,16 +346,14 @@ def projected_sparse_binned_kl_divergence(
             target_bins[t_mask].clamp(0, num_bins - 1),
             target_values[t_mask],
         )
-        target_probs = t_vals / torch.clamp(t_vals.sum(), min=eps)
-        log_pred = _lookup_log_probs(
+        target_probs = _target_probs(t_vals, target_power=target_power, eps=eps)
+        out[batch_idx] = _kl_target_bins_with_oos(
             p_keys,
             p_log_probs,
             t_keys,
+            target_probs,
+            oos_log_prob=oos_log_probs[batch_idx],
             eps=eps,
-            default_log_prob=oos_log_probs[batch_idx],
-        )
-        out[batch_idx] = torch.sum(
-            target_probs * (torch.log(torch.clamp(target_probs, min=eps)) - log_pred)
         )
     return out
 
@@ -692,23 +734,29 @@ def fragnnet_sparse_cross_entropy(
 def _loss_kl(
     pred: dict[str, Any],
     batch: dict[str, Any],
+    *,
+    target_power: float,
     **_: Any,
 ) -> torch.Tensor:
     """
     Loss-registry wrapper for sparse binned KL.
     """
-    return sparse_binned_kl_divergence(pred, batch).mean()
+    return sparse_binned_kl_divergence(pred, batch, target_power=target_power).mean()
 
 
 def _loss_projected_kl(
     pred: dict[str, Any],
     batch: dict[str, Any],
+    *,
+    target_power: float,
     **_: Any,
 ) -> torch.Tensor:
     """
     Loss-registry wrapper for projected sparse binned KL.
     """
-    return projected_sparse_binned_kl_divergence(pred, batch).mean()
+    return projected_sparse_binned_kl_divergence(
+        pred, batch, target_power=target_power
+    ).mean()
 
 
 def _loss_soft_projected_kl(
@@ -813,13 +861,14 @@ def _loss_kl_cosine(
     batch: dict[str, Any],
     *,
     kl_weight: float,
+    target_power: float,
     **_: Any,
 ) -> torch.Tensor:
     """
     Loss-registry wrapper for weighted KL and cosine losses.
     """
     kl_weight = max(0.0, min(float(kl_weight), 1.0))
-    kl = sparse_binned_kl_divergence(pred, batch).mean()
+    kl = sparse_binned_kl_divergence(pred, batch, target_power=target_power).mean()
     cosine_loss = 1.0 - sparse_binned_cosine_similarity(pred, batch).mean()
     return kl_weight * kl + (1.0 - kl_weight) * cosine_loss
 
@@ -882,6 +931,74 @@ LOSS_REGISTRY: dict[str, LossSpec] = {
     'tolerance_cosine': LossSpec(_loss_tolerance_cosine, 'tolerance_cosine_loss'),
 }
 LOSS_NAMES = tuple(LOSS_REGISTRY.keys())
+
+
+def _kl_target_bins_with_oos(
+    pred_keys: torch.Tensor,
+    pred_log_probs: torch.Tensor,
+    target_keys: torch.Tensor,
+    target_probs: torch.Tensor,
+    *,
+    oos_log_prob: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Compute KL with unreachable target bins aggregated into one OOS event.
+
+    OOS is a single model outcome. Multiple unreachable target bins must therefore
+    contribute their summed target probability to one OOS KL term, not each compare
+    independently against the same OOS probability.
+    """
+    if pred_keys.numel() == 0:
+        oos_mass = torch.sum(target_probs)
+        return oos_mass * (torch.log(torch.clamp(oos_mass, min=eps)) - oos_log_prob)
+
+    positions = torch.searchsorted(pred_keys, target_keys)
+    in_range = positions < pred_keys.numel()
+    reachable = torch.zeros_like(target_keys, dtype=torch.bool)
+    if bool(in_range.any()):
+        in_range_positions = positions[in_range]
+        reachable[in_range] = pred_keys[in_range_positions] == target_keys[in_range]
+
+    loss = pred_log_probs.sum() * 0.0
+    if bool(reachable.any()):
+        reachable_targets = target_probs[reachable]
+        reachable_log_pred = _lookup_log_probs(
+            pred_keys,
+            pred_log_probs,
+            target_keys[reachable],
+            eps=eps,
+        )
+        loss = loss + torch.sum(
+            reachable_targets
+            * (torch.log(torch.clamp(reachable_targets, min=eps)) - reachable_log_pred)
+        )
+    if bool((~reachable).any()):
+        oos_mass = torch.sum(target_probs[~reachable])
+        loss = loss + oos_mass * (
+            torch.log(torch.clamp(oos_mass, min=eps)) - oos_log_prob
+        )
+    return loss
+
+
+def _target_probs(
+    values: torch.Tensor,
+    *,
+    target_power: float,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Normalize target intensities, optionally sharpening them before normalization.
+
+    target_power=1 is standard intensity normalization. Values greater than one emphasize high-intensity peaks while preserving a valid target distribution.
+    """
+    if target_power <= 0.0:
+        raise ValueError('target_power must be positive.')
+    probs = values / torch.clamp(values.sum(), min=eps)
+    if float(target_power) == 1.0:
+        return probs
+    sharpened = torch.pow(torch.clamp(probs, min=eps), float(target_power))
+    return sharpened / torch.clamp(sharpened.sum(), min=eps)
 
 
 def _binned_log_probs_from_log_probs(

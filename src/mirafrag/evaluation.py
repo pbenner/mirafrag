@@ -14,6 +14,7 @@ from mirafrag.losses import (
     _bin_width_from_batch,
     _target_tolerances,
     sparse_binned_cosine_similarity,
+    sparse_oos_probability,
 )
 from mirafrag.model import MiraFragModel
 from mirafrag.probability import fragment_oos_log_probs
@@ -42,6 +43,8 @@ def evaluate_model(
     rows = []
     all_cos = []
     all_sqrt = []
+    all_cos_no_oos = []
+    all_predicted_oos = []
     all_candidate_coverage = []
     all_oos_target_mass = []
     all_oracle_binned = []
@@ -63,6 +66,12 @@ def evaluate_model(
         if 'target_mz' in batch:
             cos = sparse_binned_cosine_similarity(probs, batch)
             sqrt_cos = sparse_binned_cosine_similarity(probs, batch, sqrt=True)
+            cos_no_oos = sparse_binned_cosine_similarity(
+                probs,
+                batch,
+                include_oos=False,
+            )
+            predicted_oos = sparse_oos_probability(probs)
             diagnostics = support_diagnostics(
                 probs,
                 batch,
@@ -72,6 +81,8 @@ def evaluate_model(
             )
             all_cos.extend(float(x) for x in cos.detach().cpu())
             all_sqrt.extend(float(x) for x in sqrt_cos.detach().cpu())
+            all_cos_no_oos.extend(float(x) for x in cos_no_oos.detach().cpu())
+            all_predicted_oos.extend(float(x) for x in predicted_oos.detach().cpu())
             all_candidate_coverage.extend(
                 float(x) for x in diagnostics['candidate_coverage'].detach().cpu()
             )
@@ -100,6 +111,10 @@ def evaluate_model(
             if cos is not None and sqrt_cos is not None and diagnostics is not None:
                 row['cosine'] = float(cos[i].detach().cpu())
                 row['sqrt_cosine'] = float(sqrt_cos[i].detach().cpu())
+                row['cosine_no_oos'] = float(cos_no_oos[i].detach().cpu())
+                row['predicted_oos_probability'] = float(
+                    predicted_oos[i].detach().cpu()
+                )
                 row['candidate_coverage'] = float(
                     diagnostics['candidate_coverage'][i].detach().cpu()
                 )
@@ -117,6 +132,8 @@ def evaluate_model(
     summary = {
         'cosine_mean': _mean_or_nan(all_cos),
         'sqrt_cosine_mean': _mean_or_nan(all_sqrt),
+        'cosine_no_oos_mean': _mean_or_nan(all_cos_no_oos),
+        'predicted_oos_probability_mean': _mean_or_nan(all_predicted_oos),
         'candidate_coverage_mean': _mean_or_nan(all_candidate_coverage),
         'oos_target_mass_mean': _mean_or_nan(all_oos_target_mass),
         'oracle_binned_cosine_mean': _mean_or_nan(all_oracle_binned),

@@ -1,7 +1,7 @@
 UV ?= uv
 RESOURCE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ROOT := $(abspath $(RESOURCE_DIR)/../..)
-ENCODER ?= mace
+ENCODER ?= aimnet
 CHECKPOINT_ENCODER ?= all
 PYTHON ?= $(UV) run --project $(ROOT) --extra $(ENCODER) python
 CHECKPOINT_PYTHON ?= $(UV) run --project $(ROOT) --extra $(CHECKPOINT_ENCODER) python
@@ -51,6 +51,8 @@ BIN_WIDTH ?= 0.01
 LOSS ?= kl
 KL_WEIGHT ?= 0.7
 COVERAGE_WEIGHT ?= 0.1
+TARGET_POWER ?= 1.0
+ENTROPY_WEIGHT ?= 0.0
 MASS_TOLERANCE ?= 0.01
 RELATIVE_MASS_TOLERANCE ?= 0
 MASS_TOLERANCE_MIN_MZ ?= 200
@@ -162,7 +164,7 @@ INIT_ARGS =
 ifneq ($(strip $(INIT_MODEL)),)
 INIT_ARGS += --init-checkpoint $(INIT_MODEL)
 endif
-LOSS_ARGS = --loss $(LOSS) --kl-weight $(KL_WEIGHT) --coverage-weight $(COVERAGE_WEIGHT)
+LOSS_ARGS = --loss $(LOSS) --kl-weight $(KL_WEIGHT) --coverage-weight $(COVERAGE_WEIGHT) --target-power $(TARGET_POWER) --entropy-weight $(ENTROPY_WEIGHT)
 ifeq ($(strip $(RELATIVE_MASS_TOLERANCE)),1)
 LOSS_ARGS += --relative-mass-tolerance
 else
@@ -231,6 +233,8 @@ help:
 		'  SCHEDULER=$(SCHEDULER)' \
 		'  LOSS=$(LOSS)' \
 		'  KL_WEIGHT=$(KL_WEIGHT)' \
+		'  TARGET_POWER=$(TARGET_POWER)' \
+		'  ENTROPY_WEIGHT=$(ENTROPY_WEIGHT)' \
 		'  MASS_TOLERANCE=$(MASS_TOLERANCE)' \
 		'  RELATIVE_MASS_TOLERANCE=$(RELATIVE_MASS_TOLERANCE)' \
 		'  MASS_TOLERANCE_MIN_MZ=$(MASS_TOLERANCE_MIN_MZ)' \

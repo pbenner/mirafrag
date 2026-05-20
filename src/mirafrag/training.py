@@ -13,6 +13,7 @@ from mirafrag.data import move_batch_to_device
 from mirafrag.losses import (
     LOSS_REGISTRY,
     sparse_binned_cosine_similarity,
+    sparse_oos_probability,
     spectrum_loss,
 )
 from mirafrag.model import MiraFragModel
@@ -41,6 +42,8 @@ def run_epoch(
     mass_tolerance_min_mz: float = 200.0,
     kl_weight: float = 0.7,
     coverage_weight: float = 0.1,
+    target_power: float = 1.0,
+    entropy_weight: float = 0.0,
 ) -> dict[str, float]:
     """
     Run one training or evaluation epoch.
@@ -56,6 +59,7 @@ def run_epoch(
     processed_batches = 0
     loss_sum = 0.0
     cosine_sum = 0.0
+    oos_sum = 0.0
     objective_name = _objective_display_name(loss_name)
     progress = tqdm(
         loader,
@@ -84,6 +88,8 @@ def run_epoch(
                 mass_tolerance_min_mz=mass_tolerance_min_mz,
                 kl_weight=kl_weight,
                 coverage_weight=coverage_weight,
+                target_power=target_power,
+                entropy_weight=entropy_weight,
             )
         if training:
             loss.backward()
@@ -95,9 +101,11 @@ def run_epoch(
             cosine_value = float(
                 sparse_binned_cosine_similarity(pred, batch).mean().cpu()
             )
+            oos_value = float(sparse_oos_probability(pred).mean().cpu())
             total_examples += batch_size
             loss_sum += loss_value * batch_size
             cosine_sum += cosine_value * batch_size
+            oos_sum += oos_value * batch_size
             if show_progress:
                 progress.set_postfix(
                     {
@@ -105,6 +113,7 @@ def run_epoch(
                             f'{loss_sum / max(total_examples, 1):.4f}'
                         ),
                         'cosine_avg': (f'{cosine_sum / max(total_examples, 1):.4f}'),
+                        'oos_avg': f'{oos_sum / max(total_examples, 1):.4f}',
                         'lr': f'{_current_lr(optimizer):.2e}'
                         if optimizer is not None
                         else 'n/a',
@@ -120,6 +129,7 @@ def run_epoch(
     return {
         'loss': float(loss_sum / max(total_examples, 1)),
         'cosine': float(cosine_sum / max(total_examples, 1)),
+        'oos_probability': float(oos_sum / max(total_examples, 1)),
     }
 
 
@@ -148,6 +158,8 @@ def train_model(
     mass_tolerance_min_mz: float = 200.0,
     kl_weight: float = 0.7,
     coverage_weight: float = 0.1,
+    target_power: float = 1.0,
+    entropy_weight: float = 0.0,
 ) -> dict[str, list[float]]:
     """
     Train a MiraFrag model and save the best checkpoint by validation loss.
@@ -183,8 +195,10 @@ def train_model(
         'epoch': [],
         'train_loss': [],
         'train_cosine': [],
+        'train_oos_probability': [],
         'val_loss': [],
         'val_cosine': [],
+        'val_oos_probability': [],
     }
     best_val = float('inf')
     objective_name = _objective_display_name(loss_name)
@@ -203,6 +217,8 @@ def train_model(
             mass_tolerance_min_mz=mass_tolerance_min_mz,
             kl_weight=kl_weight,
             coverage_weight=coverage_weight,
+            target_power=target_power,
+            entropy_weight=entropy_weight,
         )
         _append_history(
             history,
@@ -215,6 +231,7 @@ def train_model(
             'epoch=0 '
             f'val_{objective_name}={val_stats["loss"]:.5f} '
             f'val_cosine={val_stats["cosine"]:.5f} '
+            f'val_oos={val_stats["oos_probability"]:.5f} '
             f'lr={_current_lr(optimizer):.2e}'
         )
         save_checkpoint(output, model, train_config=train_config)
@@ -237,6 +254,8 @@ def train_model(
             mass_tolerance_min_mz=mass_tolerance_min_mz,
             kl_weight=kl_weight,
             coverage_weight=coverage_weight,
+            target_power=target_power,
+            entropy_weight=entropy_weight,
         )
         val_stats = (
             run_epoch(
@@ -252,6 +271,8 @@ def train_model(
                 mass_tolerance_min_mz=mass_tolerance_min_mz,
                 kl_weight=kl_weight,
                 coverage_weight=coverage_weight,
+                target_power=target_power,
+                entropy_weight=entropy_weight,
             )
             if val_loader is not None
             else train_stats
@@ -268,8 +289,10 @@ def train_model(
             f'epoch={epoch} '
             f'train_{objective_name}={train_stats["loss"]:.5f} '
             f'train_cosine={train_stats["cosine"]:.5f} '
+            f'train_oos={train_stats["oos_probability"]:.5f} '
             f'val_{objective_name}={val_stats["loss"]:.5f} '
             f'val_cosine={val_stats["cosine"]:.5f} '
+            f'val_oos={val_stats["oos_probability"]:.5f} '
             f'lr={epoch_lr:.2e}'
         )
 
@@ -303,11 +326,14 @@ def _append_history(
     if train_stats is None:
         history['train_loss'].append(float('nan'))
         history['train_cosine'].append(float('nan'))
+        history['train_oos_probability'].append(float('nan'))
     else:
         history['train_loss'].append(float(train_stats['loss']))
         history['train_cosine'].append(float(train_stats['cosine']))
+        history['train_oos_probability'].append(float(train_stats['oos_probability']))
     history['val_loss'].append(float(val_stats['loss']))
     history['val_cosine'].append(float(val_stats['cosine']))
+    history['val_oos_probability'].append(float(val_stats['oos_probability']))
 
 
 def _objective_display_name(loss_name: str) -> str:
