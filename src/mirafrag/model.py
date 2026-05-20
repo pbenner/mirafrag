@@ -263,7 +263,12 @@ class MiraFragModel(nn.Module):
             batch['graph'],
             molecular_charge=self._molecular_charge(batch),
         )
-        return self.head(node_feats, batch['fragments'], metadata_features)
+        return self.head(
+            node_feats,
+            batch['fragments'],
+            metadata_features,
+            graph_batch=batch['graph'].get('batch'),
+        )
 
     def predict_proba(self, batch: dict[str, Any]) -> dict[str, Any]:
         """

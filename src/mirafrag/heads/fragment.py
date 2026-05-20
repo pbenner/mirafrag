@@ -38,7 +38,18 @@ class FragmentSpectrumHead(nn.Module):
             nn.SiLU(),
             nn.Dropout(config.dropout),
         )
-        layers: list[nn.Module] = []
+        self.context_encoder = nn.Sequential(
+            nn.LazyLinear(config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+        )
+        layers: list[nn.Module] = [
+            nn.Linear(3 * config.hidden_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+        ]
         for _ in range(max(0, config.num_layers - 1)):
             layers.extend(
                 [
@@ -69,6 +80,7 @@ class FragmentSpectrumHead(nn.Module):
         node_feats: torch.Tensor,
         fragments: dict[str, torch.Tensor],
         metadata_features: torch.Tensor,
+        graph_batch: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """
         Score sparse fragment peak candidates for a batch.
@@ -108,18 +120,32 @@ class FragmentSpectrumHead(nn.Module):
             fragments['atom_index'].to(device=node_feats.device).long(),
             fragments['atom_ptr'].to(device=node_feats.device).long(),
         )
-        features = torch.cat(
+        molecule_atom_features = self._pool_molecule_atoms(
+            node_feats,
+            graph_batch.to(device=node_feats.device).long()
+            if graph_batch is not None
+            else None,
+            batch_size=batch_size,
+        )
+        fragment_inputs = torch.cat(
             [
                 fragment_atom_features,
                 fragments['features'].to(
                     device=node_feats.device,
                     dtype=node_feats.dtype,
                 ),
+            ],
+            dim=-1,
+        )
+        context_inputs = torch.cat(
+            [
+                molecule_atom_features[formula_batch],
                 metadata_features[formula_batch],
             ],
             dim=-1,
         )
-        formula_features = self.fragment_encoder(features)
+        formula_features = self.fragment_encoder(fragment_inputs)
+        context_features = self.context_encoder(context_inputs)
         edge_index = fragments['edge_index'].to(device=node_feats.device)
         edge_attr = fragments['edge_attr'].to(
             device=node_feats.device,
@@ -128,7 +154,15 @@ class FragmentSpectrumHead(nn.Module):
         for layer in self.fragment_gnn_layers:
             formula_features = layer(formula_features, edge_index, edge_attr)
         formula_index = fragments['formula_index'].to(device=node_feats.device).long()
-        formula_logits = self.scorer(formula_features).squeeze(-1)
+        scorer_features = torch.cat(
+            [
+                formula_features,
+                context_features,
+                formula_features * context_features,
+            ],
+            dim=-1,
+        )
+        formula_logits = self.scorer(scorer_features).squeeze(-1)
         logits = formula_logits[formula_index]
         log_prior = fragments['log_prior'].to(
             device=node_feats.device,
@@ -177,6 +211,29 @@ class FragmentSpectrumHead(nn.Module):
         return pooled / counts.to(
             dtype=node_feats.dtype, device=node_feats.device
         ).unsqueeze(-1)
+
+    @staticmethod
+    def _pool_molecule_atoms(
+        node_feats: torch.Tensor,
+        graph_batch: torch.Tensor | None,
+        *,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Mean-pool atom features for each precursor molecule in the batch.
+        """
+        pooled = node_feats.new_zeros(batch_size, node_feats.shape[-1])
+        if graph_batch is None or graph_batch.numel() == 0:
+            return pooled
+        graph_batch = graph_batch.clamp(0, batch_size - 1)
+        pooled.index_add_(0, graph_batch, node_feats)
+        counts = node_feats.new_zeros(batch_size, 1)
+        counts.index_add_(
+            0,
+            graph_batch,
+            node_feats.new_ones(graph_batch.shape[0], 1),
+        )
+        return pooled / counts.clamp_min(1.0)
 
 
 class FragmentGraphMessageLayer(nn.Module):

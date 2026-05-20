@@ -51,8 +51,9 @@ energy readout with a sparse spectrum head. MACE is the default encoder; AIMNet
 can be selected with `ENCODER=aimnet` or `--encoder aimnet`. SMILES are converted
 into 3D molecular graphs with RDKit conformers, then the selected encoder
 produces per-atom node features. The spectrum head pools those atom features over
-each generated fragment formula and concatenates them with hand-built fragment
-features plus precursor metadata.
+each generated fragment formula and over the whole precursor molecule. Fragment
+features and precursor/molecule context are encoded separately, then scored with
+an explicit elementwise fragment-context interaction.
 
 The 3D graph construction is deterministic for a given seed. MiraFrag first asks
 RDKit to turn the SMILES string into a molecule and to make all hydrogens
@@ -83,9 +84,10 @@ instrument-specific scaling when enough examples are available.
 The fragment head is candidate based:
 
 - fragment atom features are mean-pooled from encoder node features
-- fragment formula features are encoded with a small MLP
+- whole-molecule atom features are mean-pooled as precursor context
+- fragment features and precursor metadata/molecule context are encoded separately
 - optional message passing runs over a fragment graph
-- each fragment formula receives a learned logit
+- each fragment formula is scored from fragment features, context features, and their elementwise product
 - isotope/adduct peak priors are added as log priors
 - an out-of-support (OOS) logit models target peaks with no generated candidate
 
