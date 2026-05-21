@@ -44,8 +44,14 @@ class FragmentSpectrumHead(nn.Module):
             nn.SiLU(),
             nn.Dropout(config.dropout),
         )
+        self.collision_encoder = nn.Sequential(
+            nn.Linear(1, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+        )
         layers: list[nn.Module] = [
-            nn.Linear(3 * config.hidden_dim, config.hidden_dim),
+            nn.Linear(5 * config.hidden_dim, config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
             nn.SiLU(),
             nn.Dropout(config.dropout),
@@ -146,38 +152,54 @@ class FragmentSpectrumHead(nn.Module):
         )
         formula_features = self.fragment_encoder(fragment_inputs)
         context_features = self.context_encoder(context_inputs)
+        collision_features = self.collision_encoder(
+            self._collision_energy_feature(metadata_features)[formula_batch]
+        )
         edge_index = fragments['edge_index'].to(device=node_feats.device)
         edge_attr = fragments['edge_attr'].to(
             device=node_feats.device,
             dtype=node_feats.dtype,
         )
         for layer in self.fragment_gnn_layers:
-            formula_features = layer(formula_features, edge_index, edge_attr)
+            formula_features = layer(
+                formula_features,
+                edge_index,
+                edge_attr,
+                collision_features,
+            )
         formula_index = fragments['formula_index'].to(device=node_feats.device).long()
         scorer_features = torch.cat(
             [
                 formula_features,
                 context_features,
                 formula_features * context_features,
+                collision_features,
+                formula_features * collision_features,
             ],
             dim=-1,
         )
         formula_logits = self.scorer(scorer_features).squeeze(-1)
-        logits = formula_logits[formula_index]
+        peak_mzs = fragments['mz'].to(device=node_feats.device, dtype=node_feats.dtype)
+        peak_bins = (
+            fragments['bin']
+            .to(device=node_feats.device)
+            .long()
+            .clamp(
+                0,
+                self.num_bins - 1,
+            )
+        )
         log_prior = fragments['log_prior'].to(
             device=node_feats.device,
-            dtype=logits.dtype,
+            dtype=node_feats.dtype,
         )
-        logits = logits + log_prior
+        logits = formula_logits[formula_index] + log_prior
         return {
             'kind': 'sparse',
             'logits': logits,
             'oos_logits': self.oos_scorer(metadata_features).squeeze(-1),
-            'mzs': fragments['mz'].to(device=node_feats.device, dtype=node_feats.dtype),
-            'bins': fragments['bin']
-            .to(device=node_feats.device)
-            .long()
-            .clamp(0, self.num_bins - 1),
+            'mzs': peak_mzs,
+            'bins': peak_bins,
             'log_prior': log_prior,
             'formula_index': formula_index,
             'edge_index': edge_index,
@@ -187,6 +209,19 @@ class FragmentSpectrumHead(nn.Module):
             'batch_size': batch_size,
             'num_bins': self.num_bins,
         }
+
+    @staticmethod
+    def _collision_energy_feature(metadata_features: torch.Tensor) -> torch.Tensor:
+        """
+        Return the normalized collision-energy channel from metadata features.
+
+        Metadata is built as ``[precursor_mz, collision_energy, adduct_embedding,
+        instrument_embedding]``. A zero fallback keeps tests or external callers
+        with reduced metadata tensors well-defined.
+        """
+        if metadata_features.shape[-1] <= 1:
+            return metadata_features.new_zeros(metadata_features.shape[0], 1)
+        return metadata_features[:, 1:2]
 
     @staticmethod
     def _pool_fragment_atoms(
@@ -240,7 +275,7 @@ class FragmentGraphMessageLayer(nn.Module):
     """
     One message-passing layer over the fragment relationship graph.
 
-    Messages are gated by edge features, averaged at each destination formula, and combined with residual MLP updates and layer normalization.
+    Messages are gated by edge features and collision-energy conditioning, averaged at each destination formula, and combined with residual MLP updates and layer normalization.
     """
 
     def __init__(self, *, hidden_dim: int, edge_dim: int, dropout: float) -> None:
@@ -254,6 +289,8 @@ class FragmentGraphMessageLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.condition_gate = nn.Linear(hidden_dim, hidden_dim)
+        self.condition_film = nn.Linear(hidden_dim, 2 * hidden_dim)
         self.message_norm = nn.LayerNorm(hidden_dim)
         self.update = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -269,23 +306,37 @@ class FragmentGraphMessageLayer(nn.Module):
         node_features: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        conditioning_features: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Apply one round of edge-conditioned message passing to fragment features.
+        Apply one round of edge- and collision-conditioned message passing.
         """
+        hidden = self._apply_conditioning(node_features, conditioning_features)
         if edge_index.numel() == 0:
-            return node_features
+            return hidden
 
         src = edge_index[0].long()
         dst = edge_index[1].long()
-        messages = self.source(node_features[src]) * torch.sigmoid(
-            self.edge_gate(edge_attr)
+        gate_logits = self.edge_gate(edge_attr) + self.condition_gate(
+            conditioning_features[dst]
         )
-        aggregated = node_features.new_zeros(node_features.shape)
+        messages = self.source(hidden[src]) * torch.sigmoid(gate_logits)
+        aggregated = hidden.new_zeros(hidden.shape)
         aggregated.index_add_(0, dst, messages)
-        degree = node_features.new_zeros(node_features.shape[0], 1)
-        degree.index_add_(0, dst, node_features.new_ones(dst.shape[0], 1))
+        degree = hidden.new_zeros(hidden.shape[0], 1)
+        degree.index_add_(0, dst, hidden.new_ones(dst.shape[0], 1))
         aggregated = aggregated / degree.clamp_min(1.0)
 
-        hidden = self.message_norm(node_features + self.dropout(aggregated))
+        hidden = self.message_norm(hidden + self.dropout(aggregated))
         return self.update_norm(hidden + self.dropout(self.update(hidden)))
+
+    def _apply_conditioning(
+        self,
+        node_features: torch.Tensor,
+        conditioning_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply feature-wise collision-energy modulation to fragment states.
+        """
+        scale, shift = self.condition_film(conditioning_features).chunk(2, dim=-1)
+        return node_features * (1.0 + torch.tanh(scale)) + shift

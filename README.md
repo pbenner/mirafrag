@@ -53,7 +53,8 @@ into 3D molecular graphs with RDKit conformers, then the selected encoder
 produces per-atom node features. The spectrum head pools those atom features over
 each generated fragment formula and over the whole precursor molecule. Fragment
 features and precursor/molecule context are encoded separately, then scored with
-an explicit elementwise fragment-context interaction.
+explicit fragment-context and fragment-collision-energy interaction terms. The
+normalized collision energy also gates fragment-graph message passing.
 
 The 3D graph construction is deterministic for a given seed. MiraFrag first asks
 RDKit to turn the SMILES string into a molecule and to make all hydrogens
@@ -87,7 +88,8 @@ The fragment head is candidate based:
 - whole-molecule atom features are mean-pooled as precursor context
 - fragment features and precursor metadata/molecule context are encoded separately
 - optional message passing runs over a fragment graph
-- each fragment formula is scored from fragment features, context features, and their elementwise product
+- normalized collision energy conditions fragment-graph messages through feature-wise modulation and edge gates
+- each fragment formula is scored from fragment features, precursor context, collision-energy features, and multiplicative interaction terms
 - isotope/adduct peak priors are added as log priors
 - an out-of-support (OOS) logit models target peaks with no generated candidate
 
