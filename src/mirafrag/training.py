@@ -160,12 +160,15 @@ def train_model(
     coverage_weight: float = 0.1,
     target_power: float = 1.0,
     entropy_weight: float = 0.0,
+    checkpoint_metric: str = 'val_loss',
 ) -> dict[str, list[float]]:
     """
-    Train a MiraFrag model and save the best checkpoint by validation loss.
+    Train a MiraFrag model and save the best checkpoint by the selected metric.
 
     The routine materializes lazy head layers, builds optimizer and scheduler, optionally evaluates the initial checkpoint state, runs train/validation epochs, saves improving checkpoints, and writes a history JSON file.
     """
+    if checkpoint_metric not in {'val_loss', 'train_loss'}:
+        raise ValueError('checkpoint_metric must be one of: val_loss, train_loss.')
     model.to(device)
     _materialize_lazy_modules(model, train_loader, device=device)
     optimizer = torch.optim.AdamW(
@@ -191,6 +194,8 @@ def train_model(
         plateau_factor=plateau_factor,
         plateau_patience=plateau_patience,
     )
+    train_config = dict(train_config or {})
+    train_config['checkpoint_metric'] = checkpoint_metric
     history: dict[str, list[float]] = {
         'epoch': [],
         'train_loss': [],
@@ -200,7 +205,8 @@ def train_model(
         'val_cosine': [],
         'val_oos_probability': [],
     }
-    best_val = float('inf')
+    best_checkpoint_score = float('inf')
+    checkpoint_metric_name = checkpoint_metric
     objective_name = _objective_display_name(loss_name)
 
     if evaluate_initial and val_loader is not None:
@@ -226,7 +232,7 @@ def train_model(
             train_stats=None,
             val_stats=val_stats,
         )
-        best_val = val_stats['loss']
+        best_checkpoint_score = val_stats['loss']
         print(
             'epoch=0 '
             f'val_{objective_name}={val_stats["loss"]:.5f} '
@@ -235,7 +241,10 @@ def train_model(
             f'lr={_current_lr(optimizer):.2e}'
         )
         save_checkpoint(output, model, train_config=train_config)
-        print(f'saved checkpoint to {output} val_{objective_name}={best_val:.5f}')
+        print(
+            f'saved checkpoint to {output} '
+            f'{checkpoint_metric_name}={best_checkpoint_score:.5f}'
+        )
 
     for epoch in range(1, epochs + 1):
         epoch_lr = _current_lr(optimizer)
@@ -296,10 +305,17 @@ def train_model(
             f'lr={epoch_lr:.2e}'
         )
 
-        if val_stats['loss'] <= best_val:
-            best_val = val_stats['loss']
+        checkpoint_stats = (
+            train_stats if checkpoint_metric == 'train_loss' else val_stats
+        )
+        checkpoint_score = checkpoint_stats['loss']
+        if checkpoint_score <= best_checkpoint_score:
+            best_checkpoint_score = checkpoint_score
             save_checkpoint(output, model, train_config=train_config)
-            print(f'saved checkpoint to {output} val_{objective_name}={best_val:.5f}')
+            print(
+                f'saved checkpoint to {output} '
+                f'{checkpoint_metric_name}={best_checkpoint_score:.5f}'
+            )
 
         if scheduler_name == 'plateau' and scheduler is not None:
             scheduler.step(val_stats['loss'])

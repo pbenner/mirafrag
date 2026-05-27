@@ -293,6 +293,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help='Show tqdm progress bars during training and validation.',
     )
+    parser.add_argument(
+        '--checkpoint-metric',
+        choices=['val_loss', 'train_loss'],
+        default='val_loss',
+        help='Metric used to decide when to save the best checkpoint.',
+    )
     return parser.parse_args()
 
 
@@ -542,6 +548,7 @@ def main() -> None:
         coverage_weight=args.coverage_weight,
         target_power=args.target_power,
         entropy_weight=args.entropy_weight,
+        checkpoint_metric=args.checkpoint_metric,
     )
 
 

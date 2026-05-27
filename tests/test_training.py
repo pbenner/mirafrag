@@ -140,6 +140,44 @@ def test_train_model_materializes_lazy_head(tmp_path, monkeypatch):
     assert loaded(batch)['logits'].ndim == 1
 
 
+def test_train_model_can_checkpoint_by_train_loss(tmp_path):
+    df = _tiny_training_df()
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    train_loader = _tiny_loader(df, graph_config, metadata)
+    val_df = df.copy()
+    val_df['intensities'] = ['10,1', '10,1']
+    val_loader = _tiny_loader(val_df, graph_config, metadata)
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=32,
+            hidden_dim=8,
+            metadata_dim=4,
+        ),
+    )
+    output = tmp_path / 'mirafrag_train_best.pt'
+
+    history = train_model(
+        model,
+        train_loader,
+        val_loader,
+        epochs=2,
+        lr=1e-2,
+        weight_decay=0.0,
+        device='cpu',
+        output=output,
+        show_progress=False,
+        scheduler_name='none',
+        checkpoint_metric='train_loss',
+    )
+
+    payload = torch.load(output, map_location='cpu', weights_only=True)
+    assert payload['train_config']['checkpoint_metric'] == 'train_loss'
+    assert history['train_loss'][1] <= history['train_loss'][0]
+
+
 def test_train_model_records_initial_validation_for_checkpoint_resume(tmp_path):
     df = _tiny_training_df()
     graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
