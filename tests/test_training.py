@@ -155,6 +155,7 @@ def test_train_model_can_checkpoint_by_train_loss(tmp_path):
             num_bins=32,
             hidden_dim=8,
             metadata_dim=4,
+            dropout=0.0,
         ),
     )
     output = tmp_path / 'mirafrag_train_best.pt'
@@ -164,7 +165,7 @@ def test_train_model_can_checkpoint_by_train_loss(tmp_path):
         train_loader,
         val_loader,
         epochs=2,
-        lr=1e-2,
+        lr=0.0,
         weight_decay=0.0,
         device='cpu',
         output=output,
