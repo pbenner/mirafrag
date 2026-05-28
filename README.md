@@ -28,9 +28,9 @@ only to trainable encoder parameters. Set `SCHEDULER=none` to keep a fixed
 learning rate.
 
 Additional documentation is collected in [docs/README.md](docs/README.md).
-The loss derivations for `LOSS=soft_projected_kl`, `LOSS=soft_binned_kl`,
-`LOSS=soft_binned_coverage_kl`, and `LOSS=fragnnet_ce` are documented in
-[docs/losses/README.md](docs/losses/README.md).
+The loss derivations for `LOSS=decoupled_kl`, `LOSS=soft_projected_kl`,
+`LOSS=soft_binned_kl`, `LOSS=soft_binned_coverage_kl`, and `LOSS=fragnnet_ce`
+are documented in [docs/losses/README.md](docs/losses/README.md).
 
 ## Code Structure
 

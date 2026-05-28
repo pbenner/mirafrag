@@ -88,9 +88,12 @@ def _sparse_spectrum_loss(
         target_power=target_power,
     )
     if entropy_weight > 0.0:
-        loss_value = (
-            loss_value + float(entropy_weight) * sparse_prediction_entropy(pred).mean()
+        entropy = (
+            sparse_fragment_prediction_entropy(pred)
+            if loss == 'decoupled_kl'
+            else sparse_prediction_entropy(pred)
         )
+        loss_value = loss_value + float(entropy_weight) * entropy.mean()
     return loss_value
 
 
@@ -153,6 +156,64 @@ def sparse_binned_cosine_similarity(
     return out
 
 
+def sparse_fragment_only_binned_cosine_similarity(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    sqrt: bool = False,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Compute binned cosine from fragment-only probabilities.
+
+    Unlike :func:`sparse_binned_cosine_similarity`, this metric normalizes only
+    over fragment candidates and ignores the OOS logit entirely. It is intended
+    for decoupled-OOS experiments where OOS is trained as a separate support
+    probability rather than as a competing softmax bucket.
+    """
+    fragment_log_probs = _fragment_only_log_probs(pred)
+    pred_values = torch.exp(fragment_log_probs)
+    target_values = batch['target_intensity'].to(
+        device=pred_values.device,
+        dtype=pred_values.dtype,
+    )
+    if sqrt:
+        pred_values = torch.sqrt(torch.clamp(pred_values, min=0.0))
+        target_values = torch.sqrt(torch.clamp(target_values, min=0.0))
+
+    pred_bins = pred['bins'].long()
+    pred_batch = pred['batch'].long()
+    target_bins = torch.floor(
+        batch['target_mz'].to(device=pred_values.device, dtype=pred_values.dtype)
+        / _bin_width_from_batch(batch)
+    ).long()
+    target_batch = batch['target_batch'].to(device=pred_values.device).long()
+    batch_size = int(pred['batch_size'])
+    num_bins = int(pred['num_bins'])
+    out = pred_values.new_zeros(batch_size)
+    for batch_idx in range(batch_size):
+        p_mask = pred_batch == batch_idx
+        t_mask = target_batch == batch_idx
+        if not bool(p_mask.any()) or not bool(t_mask.any()):
+            continue
+        p_keys, p_vals = _aggregate_values(
+            pred_bins[p_mask],
+            pred_values[p_mask],
+        )
+        t_keys, t_vals = _aggregate_values(
+            target_bins[t_mask].clamp(0, num_bins - 1),
+            target_values[t_mask],
+        )
+        out[batch_idx] = _keyed_cosine(
+            p_keys,
+            p_vals,
+            t_keys,
+            t_vals,
+            eps=eps,
+        )
+    return out
+
+
 def sparse_oos_probability(pred: dict[str, Any]) -> torch.Tensor:
     """
     Return the predicted out-of-support probability for each spectrum.
@@ -161,6 +222,16 @@ def sparse_oos_probability(pred: dict[str, Any]) -> torch.Tensor:
     """
     _, oos_log_probs = fragment_oos_log_probs(pred)
     return torch.exp(oos_log_probs)
+
+
+def sparse_decoupled_oos_probability(pred: dict[str, Any]) -> torch.Tensor:
+    """
+    Return sigmoid OOS probabilities for decoupled-OOS losses.
+    """
+    raw_oos_logits = pred.get('oos_logits')
+    if not isinstance(raw_oos_logits, torch.Tensor):
+        raise TypeError("pred['oos_logits'] must be a tensor for decoupled OOS.")
+    return torch.sigmoid(raw_oos_logits)
 
 
 def sparse_prediction_entropy(pred: dict[str, Any]) -> torch.Tensor:
@@ -181,6 +252,22 @@ def sparse_prediction_entropy(pred: dict[str, Any]) -> torch.Tensor:
             frag_entropy = -torch.sum(torch.exp(log_probs) * log_probs)
         oos_log_prob = oos_log_probs[batch_idx]
         out[batch_idx] = frag_entropy - torch.exp(oos_log_prob) * oos_log_prob
+    return out
+
+
+def sparse_fragment_prediction_entropy(pred: dict[str, Any]) -> torch.Tensor:
+    """
+    Compute entropy of fragment-only candidate distributions per spectrum.
+    """
+    fragment_log_probs = _fragment_only_log_probs(pred)
+    pred_batch = pred['batch'].long()
+    batch_size = int(pred['batch_size'])
+    out = fragment_log_probs.new_zeros(batch_size)
+    for batch_idx in range(batch_size):
+        p_mask = pred_batch == batch_idx
+        if bool(p_mask.any()):
+            log_probs = fragment_log_probs[p_mask]
+            out[batch_idx] = -torch.sum(torch.exp(log_probs) * log_probs)
     return out
 
 
@@ -295,6 +382,70 @@ def sparse_binned_kl_divergence(
             t_keys,
             target_probs,
             oos_log_prob=oos_log_probs[batch_idx],
+            eps=eps,
+        )
+    return out
+
+
+def decoupled_sparse_binned_kl_divergence(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    target_power: float = 1.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Train fragment shape and OOS support probability as separate events.
+
+    Fragment logits are normalized only over fragment candidates. Reachable
+    target bins are renormalized to define the fragment-shape KL. Unreachable
+    target mass is trained with a Bernoulli KL against ``sigmoid(oos_logit)``.
+    """
+    logits = pred['logits']
+    pred_bins = pred['bins'].long()
+    pred_batch = pred['batch'].long()
+    target_bins = torch.floor(
+        batch['target_mz'].to(device=logits.device, dtype=logits.dtype)
+        / _bin_width_from_batch(batch)
+    ).long()
+    target_values = batch['target_intensity'].to(
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    target_batch = batch['target_batch'].to(device=logits.device).long()
+    fragment_log_probs = _fragment_only_log_probs(pred)
+    raw_oos_logits = pred.get('oos_logits')
+    if not isinstance(raw_oos_logits, torch.Tensor):
+        raise TypeError("pred['oos_logits'] must be a tensor for decoupled_kl.")
+    oos_logits = raw_oos_logits.to(device=logits.device, dtype=logits.dtype)
+    batch_size = int(pred['batch_size'])
+    num_bins = int(pred['num_bins'])
+    out = logits.sum() * 0.0 + logits.new_zeros(batch_size)
+    for batch_idx in range(batch_size):
+        p_mask = pred_batch == batch_idx
+        t_mask = target_batch == batch_idx
+        if not bool(t_mask.any()):
+            continue
+        t_keys, t_vals = _aggregate_values(
+            target_bins[t_mask].clamp(0, num_bins - 1),
+            target_values[t_mask],
+        )
+        target_probs = _target_probs(t_vals, target_power=target_power, eps=eps)
+        if bool(p_mask.any()):
+            p_keys, p_log_probs = _binned_log_probs_from_log_probs(
+                pred_bins[p_mask].clamp(0, num_bins - 1),
+                fragment_log_probs[p_mask],
+                eps=eps,
+            )
+        else:
+            p_keys = pred_bins.new_empty(0)
+            p_log_probs = logits.new_empty(0)
+        out[batch_idx] = _decoupled_target_bins_loss(
+            p_keys,
+            p_log_probs,
+            t_keys,
+            target_probs,
+            oos_logit=oos_logits[batch_idx],
             eps=eps,
         )
     return out
@@ -744,6 +895,23 @@ def _loss_kl(
     return sparse_binned_kl_divergence(pred, batch, target_power=target_power).mean()
 
 
+def _loss_decoupled_kl(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    target_power: float,
+    **_: Any,
+) -> torch.Tensor:
+    """
+    Loss-registry wrapper for decoupled fragment-shape KL and OOS KL.
+    """
+    return decoupled_sparse_binned_kl_divergence(
+        pred,
+        batch,
+        target_power=target_power,
+    ).mean()
+
+
 def _loss_projected_kl(
     pred: dict[str, Any],
     batch: dict[str, Any],
@@ -917,6 +1085,7 @@ def _loss_tolerance_cosine(
 
 LOSS_REGISTRY: dict[str, LossSpec] = {
     'kl': LossSpec(_loss_kl, 'kl'),
+    'decoupled_kl': LossSpec(_loss_decoupled_kl, 'decoupled_kl'),
     'projected_kl': LossSpec(_loss_projected_kl, 'projected_kl'),
     'soft_projected_kl': LossSpec(_loss_soft_projected_kl, 'soft_projected_kl'),
     'soft_binned_kl': LossSpec(_loss_soft_binned_kl, 'soft_binned_kl'),
@@ -931,6 +1100,26 @@ LOSS_REGISTRY: dict[str, LossSpec] = {
     'tolerance_cosine': LossSpec(_loss_tolerance_cosine, 'tolerance_cosine_loss'),
 }
 LOSS_NAMES = tuple(LOSS_REGISTRY.keys())
+
+
+def _fragment_only_log_probs(pred: dict[str, Any]) -> torch.Tensor:
+    """
+    Normalize fragment logits per spectrum without an OOS softmax bucket.
+    """
+    logits = pred['logits']
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError("pred['logits'] must be a tensor.")
+    batch = pred['batch']
+    if not isinstance(batch, torch.Tensor):
+        raise TypeError("pred['batch'] must be a tensor.")
+    batch = batch.to(device=logits.device).long()
+    batch_size = int(pred['batch_size'])
+    log_probs = logits.new_empty(logits.shape)
+    for batch_idx in range(batch_size):
+        mask = batch == batch_idx
+        if bool(mask.any()):
+            log_probs[mask] = torch.log_softmax(logits[mask], dim=0)
+    return log_probs
 
 
 def _kl_target_bins_with_oos(
@@ -979,6 +1168,72 @@ def _kl_target_bins_with_oos(
             torch.log(torch.clamp(oos_mass, min=eps)) - oos_log_prob
         )
     return loss
+
+
+def _decoupled_target_bins_loss(
+    pred_keys: torch.Tensor,
+    pred_log_probs: torch.Tensor,
+    target_keys: torch.Tensor,
+    target_probs: torch.Tensor,
+    *,
+    oos_logit: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Compute fragment-shape KL plus Bernoulli KL for unreachable target mass.
+    """
+    if pred_keys.numel() == 0:
+        oos_mass = torch.sum(target_probs)
+        return pred_log_probs.sum() * 0.0 + _bernoulli_kl_from_logit(
+            oos_mass,
+            oos_logit,
+            eps=eps,
+        )
+
+    positions = torch.searchsorted(pred_keys, target_keys)
+    in_range = positions < pred_keys.numel()
+    reachable = torch.zeros_like(target_keys, dtype=torch.bool)
+    if bool(in_range.any()):
+        in_range_positions = positions[in_range]
+        reachable[in_range] = pred_keys[in_range_positions] == target_keys[in_range]
+
+    loss = pred_log_probs.sum() * 0.0
+    if bool(reachable.any()):
+        reachable_mass = torch.sum(target_probs[reachable])
+        reachable_targets = target_probs[reachable] / torch.clamp(
+            reachable_mass, min=eps
+        )
+        reachable_log_pred = _lookup_log_probs(
+            pred_keys,
+            pred_log_probs,
+            target_keys[reachable],
+            eps=eps,
+        )
+        shape_kl = torch.sum(
+            reachable_targets
+            * (torch.log(torch.clamp(reachable_targets, min=eps)) - reachable_log_pred)
+        )
+        loss = loss + reachable_mass * shape_kl
+    oos_mass = torch.sum(target_probs[~reachable])
+    return loss + _bernoulli_kl_from_logit(oos_mass, oos_logit, eps=eps)
+
+
+def _bernoulli_kl_from_logit(
+    target_prob: torch.Tensor,
+    logit: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Compute KL(Bernoulli(target_prob) || Bernoulli(sigmoid(logit))).
+    """
+    target_prob = torch.clamp(target_prob, min=0.0, max=1.0)
+    target_not = 1.0 - target_prob
+    log_pred = torch.nn.functional.logsigmoid(logit)
+    log_pred_not = torch.nn.functional.logsigmoid(-logit)
+    return target_prob * (
+        torch.log(torch.clamp(target_prob, min=eps)) - log_pred
+    ) + target_not * (torch.log(torch.clamp(target_not, min=eps)) - log_pred_not)
 
 
 def _target_probs(

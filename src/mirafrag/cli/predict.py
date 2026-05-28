@@ -14,7 +14,7 @@ from mirafrag.data import (
     filter_supported_elements,
     read_table,
 )
-from mirafrag.evaluation import evaluate_model
+from mirafrag.evaluation import evaluate_model, probability_mode_from_checkpoint_payload
 from mirafrag.fragments import fragment_config_from_model_config
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
@@ -68,7 +68,12 @@ def main() -> None:
     args = parse_args()
     quiet_rdkit_logs()
     device = resolve_device(args.device)
-    model, _payload = load_checkpoint(args.model, device=device)
+    model, payload = load_checkpoint(args.model, device=device)
+    probability_mode = probability_mode_from_checkpoint_payload(payload)
+    if probability_mode == 'decoupled':
+        print(
+            'Prediction probability mode: decoupled fragment softmax with sigmoid OOS'
+        )
     validate_checkpoint_bin_config(
         model,
         mz_max=args.mz_max,
@@ -117,6 +122,7 @@ def main() -> None:
         min_intensity=args.min_intensity,
         top_k=args.top_k,
         show_progress=args.progress,
+        probability_mode=probability_mode,
     )
     predictions.to_csv(args.output, index=False)
     print(f'Wrote predictions to {args.output}')

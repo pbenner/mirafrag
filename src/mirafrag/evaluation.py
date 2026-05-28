@@ -12,8 +12,11 @@ from mirafrag.data import move_batch_to_device
 from mirafrag.losses import (
     _aggregate_values,
     _bin_width_from_batch,
+    _fragment_only_log_probs,
     _target_tolerances,
     sparse_binned_cosine_similarity,
+    sparse_decoupled_oos_probability,
+    sparse_fragment_only_binned_cosine_similarity,
     sparse_oos_probability,
 )
 from mirafrag.model import MiraFragModel
@@ -32,12 +35,15 @@ def evaluate_model(
     mass_tolerance: float = 0.01,
     relative_mass_tolerance: bool = False,
     mass_tolerance_min_mz: float = 200.0,
+    probability_mode: str = 'joint',
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """
     Evaluate a MiraFrag model and return predictions plus summary metrics.
 
-    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result.
+    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result. ``probability_mode='decoupled'`` uses fragment-only probabilities and sigmoid OOS semantics for checkpoints trained with ``LOSS=decoupled_kl``.
     """
+    if probability_mode not in {'joint', 'decoupled'}:
+        raise ValueError("probability_mode must be one of: 'joint', 'decoupled'.")
     model.to(device)
     model.eval()
     rows = []
@@ -64,14 +70,24 @@ def evaluate_model(
         probs = model.predict_proba(batch)
         cos = sqrt_cos = diagnostics = None
         if 'target_mz' in batch:
-            cos = sparse_binned_cosine_similarity(probs, batch)
-            sqrt_cos = sparse_binned_cosine_similarity(probs, batch, sqrt=True)
-            cos_no_oos = sparse_binned_cosine_similarity(
-                probs,
-                batch,
-                include_oos=False,
-            )
-            predicted_oos = sparse_oos_probability(probs)
+            if probability_mode == 'decoupled':
+                cos = sparse_fragment_only_binned_cosine_similarity(probs, batch)
+                sqrt_cos = sparse_fragment_only_binned_cosine_similarity(
+                    probs,
+                    batch,
+                    sqrt=True,
+                )
+                cos_no_oos = cos
+                predicted_oos = sparse_decoupled_oos_probability(probs)
+            else:
+                cos = sparse_binned_cosine_similarity(probs, batch)
+                sqrt_cos = sparse_binned_cosine_similarity(probs, batch, sqrt=True)
+                cos_no_oos = sparse_binned_cosine_similarity(
+                    probs,
+                    batch,
+                    include_oos=False,
+                )
+                predicted_oos = sparse_oos_probability(probs)
             diagnostics = support_diagnostics(
                 probs,
                 batch,
@@ -100,6 +116,7 @@ def evaluate_model(
             bin_width=_bin_width_from_batch(batch),
             min_intensity=min_intensity,
             top_k=top_k,
+            probability_mode=probability_mode,
         )
 
         for i, smiles in enumerate(batch['smiles']):
@@ -140,6 +157,25 @@ def evaluate_model(
         'oracle_tolerance_cosine_mean': _mean_or_nan(all_oracle_tolerance),
     }
     return pd.DataFrame(rows), summary
+
+
+def probability_mode_from_checkpoint_payload(payload: dict[str, Any]) -> str:
+    """
+    Select prediction probability semantics from checkpoint training metadata.
+
+    Checkpoints trained with ``LOSS=decoupled_kl`` use a fragment-only softmax
+    plus a sigmoid OOS head. Older and standard-loss checkpoints retain the
+    joint fragment-plus-OOS softmax semantics.
+    """
+    train_config = payload.get('train_config')
+    if not isinstance(train_config, dict):
+        return 'joint'
+    mode = train_config.get('prediction_probability_mode')
+    if mode in {'joint', 'decoupled'}:
+        return str(mode)
+    if train_config.get('loss') == 'decoupled_kl':
+        return 'decoupled'
+    return 'joint'
 
 
 def support_diagnostics(
@@ -258,13 +294,19 @@ def _sparse_prediction_rows(
     bin_width: float,
     min_intensity: float,
     top_k: int,
+    probability_mode: str = 'joint',
 ) -> list[dict[str, list[float]]]:
     """
     Convert sparse fragment probabilities into exported peak lists.
 
-    Candidate probabilities are aggregated by bin, optionally truncated to top-k bins, filtered by minimum intensity, normalized to base peak 100, and converted back to bin-center m/z values.
+    Candidate probabilities are aggregated by bin, optionally truncated to top-k bins, filtered by minimum intensity, normalized to base peak 100, and converted back to bin-center m/z values. ``probability_mode='decoupled'`` applies a fragment-only softmax before filtering.
     """
-    log_probs, _oos_log_probs = fragment_oos_log_probs(pred)
+    if probability_mode == 'decoupled':
+        log_probs = _fragment_only_log_probs(pred)
+    elif probability_mode == 'joint':
+        log_probs, _oos_log_probs = fragment_oos_log_probs(pred)
+    else:
+        raise ValueError("probability_mode must be one of: 'joint', 'decoupled'.")
     values = torch.exp(log_probs).detach()
     bins = pred['bins'].detach().long()
     batch = pred['batch'].long()

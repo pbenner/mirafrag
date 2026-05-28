@@ -175,7 +175,9 @@ def test_train_model_can_checkpoint_by_train_loss(tmp_path):
     )
 
     payload = torch.load(output, map_location='cpu', weights_only=True)
+    assert payload['train_config']['loss'] == 'cosine'
     assert payload['train_config']['checkpoint_metric'] == 'train_loss'
+    assert payload['train_config']['prediction_probability_mode'] == 'joint'
     assert history['train_loss'][1] <= history['train_loss'][0]
 
 

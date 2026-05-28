@@ -27,7 +27,11 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.encoders.mace import repair_mace_cuequivariance_config
-from mirafrag.evaluation import _sparse_prediction_rows, support_diagnostics
+from mirafrag.evaluation import (
+    _sparse_prediction_rows,
+    probability_mode_from_checkpoint_payload,
+    support_diagnostics,
+)
 from mirafrag.fragments import (
     FRAGMENT_EDGE_FEATURE_DIM,
     PROTON_MASS,
@@ -40,6 +44,7 @@ from mirafrag.fragments import (
 )
 from mirafrag.losses import (
     LOSS_NAMES,
+    decoupled_sparse_binned_kl_divergence,
     fragnnet_sparse_cross_entropy,
     projected_sparse_binned_kl_divergence,
     soft_binned_coverage_kl_divergence,
@@ -47,6 +52,8 @@ from mirafrag.losses import (
     soft_projected_sparse_kl_divergence,
     sparse_binned_cosine_similarity,
     sparse_binned_kl_divergence,
+    sparse_decoupled_oos_probability,
+    sparse_fragment_only_binned_cosine_similarity,
     sparse_oos_probability,
     sparse_prediction_entropy,
     spectrum_loss,
@@ -70,6 +77,7 @@ from tests.helpers import (
 
 def test_loss_registry_exposes_cli_choices():
     assert 'kl' in LOSS_NAMES
+    assert 'decoupled_kl' in LOSS_NAMES
     assert 'fragnnet_ce' in LOSS_NAMES
     assert 'cosine' in LOSS_NAMES
 
@@ -183,6 +191,54 @@ def test_reported_cosine_penalizes_oos_probability():
     assert high_oos_cosine.item() < 1e-4
 
 
+def test_probability_mode_from_checkpoint_payload_detects_decoupled_loss():
+    assert (
+        probability_mode_from_checkpoint_payload(
+            {'train_config': {'loss': 'decoupled_kl'}}
+        )
+        == 'decoupled'
+    )
+    assert (
+        probability_mode_from_checkpoint_payload(
+            {'train_config': {'prediction_probability_mode': 'decoupled'}}
+        )
+        == 'decoupled'
+    )
+    assert (
+        probability_mode_from_checkpoint_payload({'train_config': {'loss': 'kl'}})
+        == 'joint'
+    )
+
+
+def test_prediction_rows_decoupled_mode_uses_fragment_softmax_threshold():
+    pred = {
+        'logits': torch.tensor([0.0]),
+        'oos_logits': torch.tensor([20.0]),
+        'bins': torch.tensor([1]),
+        'batch': torch.tensor([0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+
+    joint_rows = _sparse_prediction_rows(
+        pred,
+        bin_width=1.0,
+        min_intensity=0.001,
+        top_k=10,
+        probability_mode='joint',
+    )
+    decoupled_rows = _sparse_prediction_rows(
+        pred,
+        bin_width=1.0,
+        min_intensity=0.001,
+        top_k=10,
+        probability_mode='decoupled',
+    )
+
+    assert joint_rows == [{'mz': [], 'intensity': []}]
+    assert decoupled_rows == [{'mz': [1.5], 'intensity': [100.0]}]
+
+
 def test_prediction_rows_aggregate_duplicate_bins_before_top_k():
     pred = {
         'logits': torch.log(torch.tensor([0.25, 0.35, 0.40])),
@@ -224,6 +280,102 @@ def test_support_diagnostics_report_candidate_oracle_bounds():
     expected_oracle = torch.sqrt(torch.tensor([5.0])) / 3.0
     assert torch.allclose(diagnostics['oracle_binned_cosine'], expected_oracle)
     assert torch.allclose(diagnostics['oracle_tolerance_cosine'], expected_oracle)
+
+
+def test_decoupled_kl_separates_fragment_shape_from_oos_mass():
+    pred = {
+        'logits': torch.log(torch.tensor([0.25, 0.75])),
+        'oos_logits': torch.logit(torch.tensor([0.5])),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 5,
+    }
+    batch = {
+        'target_mz': torch.tensor([1.2, 2.2, 4.2]),
+        'target_intensity': torch.tensor([1.0, 3.0, 4.0]),
+        'target_batch': torch.tensor([0, 0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    loss = decoupled_sparse_binned_kl_divergence(pred, batch)
+
+    assert loss.shape == (1,)
+    assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-6)
+
+
+def test_decoupled_kl_weights_shape_loss_by_reachable_mass():
+    pred = {
+        'logits': torch.tensor([0.0, 0.0]),
+        'oos_logits': torch.logit(torch.tensor([0.75])),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 5,
+    }
+    batch = {
+        'target_mz': torch.tensor([1.2, 4.2]),
+        'target_intensity': torch.tensor([1.0, 3.0]),
+        'target_batch': torch.tensor([0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    loss = decoupled_sparse_binned_kl_divergence(pred, batch)
+
+    expected = torch.tensor([0.25 * math.log(2.0)])
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_decoupled_kl_trains_oos_without_stealing_fragment_mass():
+    logits = torch.tensor([0.0, 0.0], requires_grad=True)
+    oos_logits = torch.tensor([0.0], requires_grad=True)
+    pred = {
+        'logits': logits,
+        'oos_logits': oos_logits,
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 5,
+    }
+    batch = {
+        'target_mz': torch.tensor([4.2]),
+        'target_intensity': torch.tensor([1.0]),
+        'target_batch': torch.tensor([0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    loss = decoupled_sparse_binned_kl_divergence(pred, batch)
+    loss.mean().backward()
+
+    assert torch.isfinite(loss).all()
+    assert logits.grad is not None
+    assert torch.allclose(logits.grad, torch.zeros_like(logits.grad))
+    assert oos_logits.grad is not None
+    assert float(oos_logits.grad[0]) < 0.0
+
+
+def test_decoupled_metrics_use_fragment_softmax_and_sigmoid_oos():
+    batch = {
+        'target_mz': torch.tensor([1.2]),
+        'target_intensity': torch.tensor([1.0]),
+        'target_batch': torch.tensor([0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    pred = {
+        'logits': torch.tensor([0.0]),
+        'oos_logits': torch.tensor([10.0]),
+        'bins': torch.tensor([1]),
+        'batch': torch.tensor([0]),
+        'batch_size': 1,
+        'num_bins': 5,
+    }
+
+    assert torch.allclose(
+        sparse_fragment_only_binned_cosine_similarity(pred, batch),
+        torch.ones(1),
+    )
+    assert sparse_binned_cosine_similarity(pred, batch).item() < 1e-4
+    assert sparse_decoupled_oos_probability(pred).item() > 0.99
 
 
 def test_projected_kl_assigns_unreachable_target_bins_to_oos():

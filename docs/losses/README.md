@@ -79,6 +79,59 @@ KL term.
 If no target bin is reachable for a spectrum, `projected_kl` now trains the OOS
 bucket for that target intensity instead of contributing zero.
 
+## Decoupled KL
+
+`decoupled_kl` tests whether the OOS bucket is making fragment ranking harder.
+The standard KL losses normalize fragment candidates and OOS together, so adding
+more OOS probability necessarily steals probability mass from reachable fragment
+bins. In the MassSpecGym cosine metric, however, OOS is not emitted as a peak.
+It only explains target intensity that the generated candidate support cannot
+represent.
+
+This loss therefore trains two separate predictions:
+
+```text
+p_j = softmax(fragment_logits)_j
+p_i = sum_{j: bin(j) = i} p_j
+p_oos = sigmoid(oos_logit)
+```
+
+Here `j` indexes generated fragment candidates, `i` indexes m/z bins, and `y_i`
+is the normalized target intensity after any optional `TARGET_POWER` sharpening.
+Reachable target bins are renormalized among themselves and used for the
+fragment-shape KL:
+
+```text
+q_i = y_i / sum_{k in S} y_k        for i in S and y_i > 0
+q_reach = sum_{k in S} y_k
+shape_kl = q_reach * sum_i q_i (log q_i - log p_i)
+```
+
+Unreachable target intensity is trained as a separate Bernoulli KL:
+
+```text
+q_oos = sum_{i not in S} y_i
+support_kl = KL(Bernoulli(q_oos) || Bernoulli(p_oos))
+```
+
+The combined objective is:
+
+```text
+decoupled_kl = shape_kl + support_kl
+```
+
+Equivalently, this is the KL of a factored target: first predict whether the
+peak mass is reachable by generated candidates, then predict the conditional
+fragment-bin shape for the reachable part.
+
+For this loss, the optional entropy penalty is applied only to the fragment
+softmax distribution, and training/validation cosine is reported from the
+fragment-only binned prediction. The reported OOS value is `sigmoid(oos_logit)`.
+Existing losses still report the original fragment-plus-OOS cosine and OOS
+softmax probability. Evaluation and prediction detect checkpoints trained with
+`LOSS=decoupled_kl` and use the same fragment-only probabilities for summary
+metrics and exported peak filtering.
+
 ## Difference From `kl`
 
 `kl` compares the target distribution against all measured target bins. With OOS

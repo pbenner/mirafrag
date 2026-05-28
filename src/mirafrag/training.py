@@ -13,6 +13,8 @@ from mirafrag.data import move_batch_to_device
 from mirafrag.losses import (
     LOSS_REGISTRY,
     sparse_binned_cosine_similarity,
+    sparse_decoupled_oos_probability,
+    sparse_fragment_only_binned_cosine_similarity,
     sparse_oos_probability,
     spectrum_loss,
 )
@@ -98,10 +100,14 @@ def run_epoch(
                 scheduler.step()
         with torch.no_grad():
             loss_value = float(loss.detach().cpu())
-            cosine_value = float(
-                sparse_binned_cosine_similarity(pred, batch).mean().cpu()
-            )
-            oos_value = float(sparse_oos_probability(pred).mean().cpu())
+            if loss_name == 'decoupled_kl':
+                cosine = sparse_fragment_only_binned_cosine_similarity(pred, batch)
+                oos_probability = sparse_decoupled_oos_probability(pred)
+            else:
+                cosine = sparse_binned_cosine_similarity(pred, batch)
+                oos_probability = sparse_oos_probability(pred)
+            cosine_value = float(cosine.mean().cpu())
+            oos_value = float(oos_probability.mean().cpu())
             total_examples += batch_size
             loss_sum += loss_value * batch_size
             cosine_sum += cosine_value * batch_size
@@ -195,7 +201,11 @@ def train_model(
         plateau_patience=plateau_patience,
     )
     train_config = dict(train_config or {})
+    train_config['loss'] = loss_name
     train_config['checkpoint_metric'] = checkpoint_metric
+    train_config['prediction_probability_mode'] = _prediction_probability_mode(
+        loss_name
+    )
     history: dict[str, list[float]] = {
         'epoch': [],
         'train_loss': [],
@@ -326,6 +336,13 @@ def train_model(
     with open(history_path, 'w') as fp:
         json.dump(history, fp, indent=2)
     return history
+
+
+def _prediction_probability_mode(loss_name: str) -> str:
+    """
+    Return the prediction probability semantics implied by a training loss.
+    """
+    return 'decoupled' if loss_name == 'decoupled_kl' else 'joint'
 
 
 def _append_history(
