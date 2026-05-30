@@ -140,6 +140,48 @@ def test_train_model_materializes_lazy_head(tmp_path, monkeypatch):
     assert loaded(batch)['logits'].ndim == 1
 
 
+def test_train_model_can_save_swa_checkpoint_by_val_cosine(tmp_path):
+    df = _tiny_training_df()
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    loader = _tiny_loader(df, graph_config, metadata)
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=32,
+            hidden_dim=8,
+            metadata_dim=4,
+            dropout=0.0,
+        ),
+    )
+    output = tmp_path / 'mirafrag_swa.pt'
+
+    history = train_model(
+        model,
+        loader,
+        loader,
+        epochs=1,
+        lr=0.0,
+        weight_decay=0.0,
+        device='cpu',
+        output=output,
+        show_progress=False,
+        scheduler_name='none',
+        checkpoint_metric='val_cosine',
+        swa=True,
+        swa_start_epoch=1,
+    )
+
+    payload = torch.load(output, map_location='cpu', weights_only=True)
+    assert payload['train_config']['checkpoint_metric'] == 'val_cosine'
+    assert payload['train_config']['swa'] is True
+    assert payload['train_config']['swa_checkpoint'] is True
+    assert payload['train_config']['swa_n_averaged'] == 1
+    assert history['swa_n_averaged'] == [1.0]
+    assert not math.isnan(history['swa_val_cosine'][0])
+
+
 def test_train_model_can_checkpoint_by_train_loss(tmp_path):
     df = _tiny_training_df()
     graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)

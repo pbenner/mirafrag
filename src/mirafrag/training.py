@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, default_collate
 from tqdm.auto import tqdm
 
@@ -167,14 +168,26 @@ def train_model(
     target_power: float = 1.0,
     entropy_weight: float = 0.0,
     checkpoint_metric: str = 'val_loss',
+    swa: bool = False,
+    swa_start_epoch: int | None = None,
+    swa_lr: float | None = None,
+    swa_anneal_epochs: int = 1,
 ) -> dict[str, list[float]]:
     """
     Train a MiraFrag model and save the best checkpoint by the selected metric.
 
     The routine materializes lazy head layers, builds optimizer and scheduler, optionally evaluates the initial checkpoint state, runs train/validation epochs, saves improving checkpoints, and writes a history JSON file.
     """
-    if checkpoint_metric not in {'val_loss', 'train_loss'}:
-        raise ValueError('checkpoint_metric must be one of: val_loss, train_loss.')
+    valid_checkpoint_metrics = {
+        'val_loss',
+        'train_loss',
+        'val_cosine',
+        'train_cosine',
+    }
+    if checkpoint_metric not in valid_checkpoint_metrics:
+        raise ValueError(
+            f'checkpoint_metric must be one of: {sorted(valid_checkpoint_metrics)}.'
+        )
     model.to(device)
     _materialize_lazy_modules(model, train_loader, device=device)
     optimizer = torch.optim.AdamW(
@@ -200,12 +213,41 @@ def train_model(
         plateau_factor=plateau_factor,
         plateau_patience=plateau_patience,
     )
+    swa_model: AveragedModel | None = None
+    swa_scheduler: SWALR | None = None
+    resolved_swa_start_epoch: int | None = None
+    if swa:
+        resolved_swa_start_epoch = (
+            int(swa_start_epoch) if swa_start_epoch is not None else max(1, epochs // 2)
+        )
+        if resolved_swa_start_epoch < 1 or resolved_swa_start_epoch > epochs:
+            raise ValueError('swa_start_epoch must be between 1 and epochs.')
+        swa_model = AveragedModel(model, device=device, use_buffers=True)
+        if swa_lr is not None:
+            if swa_lr <= 0:
+                raise ValueError('swa_lr must be positive when set.')
+            swa_scheduler = SWALR(
+                optimizer,
+                swa_lr=float(swa_lr),
+                anneal_epochs=max(1, int(swa_anneal_epochs)),
+            )
+        print(
+            'SWA enabled: '
+            f'start_epoch={resolved_swa_start_epoch} '
+            f'swa_lr={swa_lr if swa_lr is not None else "scheduler"} '
+            f'anneal_epochs={max(1, int(swa_anneal_epochs))}'
+        )
     train_config = dict(train_config or {})
     train_config['loss'] = loss_name
     train_config['checkpoint_metric'] = checkpoint_metric
     train_config['prediction_probability_mode'] = _prediction_probability_mode(
         loss_name
     )
+    train_config['swa'] = bool(swa)
+    if swa:
+        train_config['swa_start_epoch'] = resolved_swa_start_epoch
+        train_config['swa_lr'] = swa_lr
+        train_config['swa_anneal_epochs'] = max(1, int(swa_anneal_epochs))
     history: dict[str, list[float]] = {
         'epoch': [],
         'train_loss': [],
@@ -214,8 +256,12 @@ def train_model(
         'val_loss': [],
         'val_cosine': [],
         'val_oos_probability': [],
+        'swa_val_loss': [],
+        'swa_val_cosine': [],
+        'swa_val_oos_probability': [],
+        'swa_n_averaged': [],
     }
-    best_checkpoint_score = float('inf')
+    best_checkpoint_score = _initial_checkpoint_score(checkpoint_metric)
     checkpoint_metric_name = checkpoint_metric
     objective_name = _objective_display_name(loss_name)
 
@@ -242,7 +288,7 @@ def train_model(
             train_stats=None,
             val_stats=val_stats,
         )
-        best_checkpoint_score = val_stats['loss']
+        _append_swa_history(history, swa_stats=None, n_averaged=0)
         print(
             'epoch=0 '
             f'val_{objective_name}={val_stats["loss"]:.5f} '
@@ -250,19 +296,36 @@ def train_model(
             f'val_oos={val_stats["oos_probability"]:.5f} '
             f'lr={_current_lr(optimizer):.2e}'
         )
-        save_checkpoint(output, model, train_config=train_config)
-        print(
-            f'saved checkpoint to {output} '
-            f'{checkpoint_metric_name}={best_checkpoint_score:.5f}'
-        )
+        if _checkpoint_metric_source(checkpoint_metric) == 'val':
+            best_checkpoint_score = _checkpoint_metric_value(
+                val_stats,
+                checkpoint_metric,
+            )
+            save_checkpoint(
+                output,
+                model,
+                train_config=_checkpoint_train_config(train_config),
+            )
+            print(
+                f'saved checkpoint to {output} '
+                f'{checkpoint_metric_name}={best_checkpoint_score:.5f}'
+            )
 
     for epoch in range(1, epochs + 1):
         epoch_lr = _current_lr(optimizer)
+        in_swa_phase = (
+            swa_model is not None
+            and resolved_swa_start_epoch is not None
+            and epoch >= resolved_swa_start_epoch
+        )
+        batch_scheduler = scheduler if scheduler_name != 'plateau' else None
+        if in_swa_phase and swa_scheduler is not None:
+            batch_scheduler = None
         train_stats = run_epoch(
             model,
             train_loader,
             optimizer=optimizer,
-            scheduler=scheduler if scheduler_name != 'plateau' else None,
+            scheduler=batch_scheduler,
             scheduler_interval=scheduler_interval,
             device=device,
             loss_name=loss_name,
@@ -315,19 +378,93 @@ def train_model(
             f'lr={epoch_lr:.2e}'
         )
 
-        checkpoint_stats = (
-            train_stats if checkpoint_metric == 'train_loss' else val_stats
+        checkpoint_stats = _checkpoint_stats(
+            train_stats=train_stats,
+            val_stats=val_stats,
+            checkpoint_metric=checkpoint_metric,
         )
-        checkpoint_score = checkpoint_stats['loss']
-        if checkpoint_score <= best_checkpoint_score:
+        checkpoint_score = _checkpoint_metric_value(
+            checkpoint_stats,
+            checkpoint_metric,
+        )
+        if _checkpoint_improved(
+            checkpoint_score,
+            best_checkpoint_score,
+            checkpoint_metric,
+        ):
             best_checkpoint_score = checkpoint_score
-            save_checkpoint(output, model, train_config=train_config)
+            save_checkpoint(
+                output,
+                model,
+                train_config=_checkpoint_train_config(train_config),
+            )
             print(
                 f'saved checkpoint to {output} '
                 f'{checkpoint_metric_name}={best_checkpoint_score:.5f}'
             )
 
-        if scheduler_name == 'plateau' and scheduler is not None:
+        swa_stats: dict[str, float] | None = None
+        n_averaged = 0
+        if in_swa_phase and swa_model is not None:
+            swa_model.update_parameters(model)
+            n_averaged = _swa_n_averaged(swa_model)
+            if val_loader is not None:
+                swa_stats = run_epoch(
+                    swa_model,
+                    val_loader,
+                    optimizer=None,
+                    device=device,
+                    loss_name=loss_name,
+                    desc=f'swa val epoch {epoch}/{epochs}',
+                    show_progress=show_progress,
+                    mass_tolerance=mass_tolerance,
+                    relative_mass_tolerance=relative_mass_tolerance,
+                    mass_tolerance_min_mz=mass_tolerance_min_mz,
+                    kl_weight=kl_weight,
+                    coverage_weight=coverage_weight,
+                    target_power=target_power,
+                    entropy_weight=entropy_weight,
+                )
+                print(
+                    f'swa_epoch={epoch} '
+                    f'val_{objective_name}={swa_stats["loss"]:.5f} '
+                    f'val_cosine={swa_stats["cosine"]:.5f} '
+                    f'val_oos={swa_stats["oos_probability"]:.5f} '
+                    f'n_averaged={n_averaged}'
+                )
+                if _checkpoint_metric_source(checkpoint_metric) == 'val':
+                    swa_checkpoint_score = _checkpoint_metric_value(
+                        swa_stats,
+                        checkpoint_metric,
+                    )
+                    if _checkpoint_improved(
+                        swa_checkpoint_score,
+                        best_checkpoint_score,
+                        checkpoint_metric,
+                    ):
+                        best_checkpoint_score = swa_checkpoint_score
+                        save_checkpoint(
+                            output,
+                            swa_model.module,
+                            train_config=_checkpoint_train_config(
+                                train_config,
+                                swa_checkpoint=True,
+                                swa_n_averaged=n_averaged,
+                            ),
+                        )
+                        print(
+                            f'saved SWA checkpoint to {output} '
+                            f'{checkpoint_metric_name}={best_checkpoint_score:.5f}'
+                        )
+        _append_swa_history(
+            history,
+            swa_stats=swa_stats,
+            n_averaged=n_averaged,
+        )
+
+        if in_swa_phase and swa_scheduler is not None:
+            swa_scheduler.step()
+        elif scheduler_name == 'plateau' and scheduler is not None:
             scheduler.step(val_stats['loss'])
         elif scheduler is not None and scheduler_interval == 'epoch':
             scheduler.step()
@@ -336,6 +473,91 @@ def train_model(
     with open(history_path, 'w') as fp:
         json.dump(history, fp, indent=2)
     return history
+
+
+def _checkpoint_metric_source(checkpoint_metric: str) -> str:
+    """
+    Return whether a checkpoint metric reads training or validation statistics.
+    """
+    return checkpoint_metric.split('_', 1)[0]
+
+
+def _checkpoint_metric_key(checkpoint_metric: str) -> str:
+    """
+    Return the statistic key used by a checkpoint metric.
+    """
+    return checkpoint_metric.split('_', 1)[1]
+
+
+def _initial_checkpoint_score(checkpoint_metric: str) -> float:
+    """
+    Return the initial best value for minimizing losses or maximizing cosine.
+    """
+    return (
+        -float('inf')
+        if _checkpoint_metric_key(checkpoint_metric) == 'cosine'
+        else float('inf')
+    )
+
+
+def _checkpoint_improved(
+    value: float,
+    best_value: float,
+    checkpoint_metric: str,
+) -> bool:
+    """
+    Return whether a checkpoint metric value improves on the previous best.
+    """
+    if _checkpoint_metric_key(checkpoint_metric) == 'cosine':
+        return value >= best_value
+    return value <= best_value
+
+
+def _checkpoint_metric_value(
+    stats: dict[str, float],
+    checkpoint_metric: str,
+) -> float:
+    """
+    Extract the loss or cosine value addressed by a checkpoint metric.
+    """
+    return float(stats[_checkpoint_metric_key(checkpoint_metric)])
+
+
+def _checkpoint_stats(
+    *,
+    train_stats: dict[str, float],
+    val_stats: dict[str, float],
+    checkpoint_metric: str,
+) -> dict[str, float]:
+    """
+    Select train or validation statistics for checkpoint comparison.
+    """
+    if _checkpoint_metric_source(checkpoint_metric) == 'train':
+        return train_stats
+    return val_stats
+
+
+def _checkpoint_train_config(
+    train_config: dict[str, Any],
+    *,
+    swa_checkpoint: bool = False,
+    swa_n_averaged: int | None = None,
+) -> dict[str, Any]:
+    """
+    Return checkpoint metadata with explicit live/SWA checkpoint identity.
+    """
+    config = dict(train_config)
+    config['swa_checkpoint'] = bool(swa_checkpoint)
+    if swa_n_averaged is not None:
+        config['swa_n_averaged'] = int(swa_n_averaged)
+    return config
+
+
+def _swa_n_averaged(swa_model: AveragedModel) -> int:
+    """
+    Return the number of models already included in an SWA average.
+    """
+    return int(swa_model.n_averaged.detach().cpu().item())
 
 
 def _prediction_probability_mode(loss_name: str) -> str:
@@ -367,6 +589,26 @@ def _append_history(
     history['val_loss'].append(float(val_stats['loss']))
     history['val_cosine'].append(float(val_stats['cosine']))
     history['val_oos_probability'].append(float(val_stats['oos_probability']))
+
+
+def _append_swa_history(
+    history: dict[str, list[float]],
+    *,
+    swa_stats: dict[str, float] | None,
+    n_averaged: int,
+) -> None:
+    """
+    Append SWA validation statistics or NaNs when no SWA model was evaluated.
+    """
+    if swa_stats is None:
+        history['swa_val_loss'].append(float('nan'))
+        history['swa_val_cosine'].append(float('nan'))
+        history['swa_val_oos_probability'].append(float('nan'))
+    else:
+        history['swa_val_loss'].append(float(swa_stats['loss']))
+        history['swa_val_cosine'].append(float(swa_stats['cosine']))
+        history['swa_val_oos_probability'].append(float(swa_stats['oos_probability']))
+    history['swa_n_averaged'].append(float(n_averaged))
 
 
 def _objective_display_name(loss_name: str) -> str:

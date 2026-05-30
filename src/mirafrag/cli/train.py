@@ -304,9 +304,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--checkpoint-metric',
-        choices=['val_loss', 'train_loss'],
+        choices=['val_loss', 'train_loss', 'val_cosine', 'train_cosine'],
         default='val_loss',
         help='Metric used to decide when to save the best checkpoint.',
+    )
+    parser.add_argument(
+        '--swa',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Enable stochastic weight averaging after --swa-start-epoch.',
+    )
+    parser.add_argument(
+        '--swa-start-epoch',
+        type=int,
+        default=None,
+        help='First epoch included in the SWA average; defaults to epochs // 2.',
+    )
+    parser.add_argument(
+        '--swa-lr',
+        type=float,
+        default=None,
+        help='Optional SWA tail learning rate. If omitted, the main scheduler continues.',
+    )
+    parser.add_argument(
+        '--swa-anneal-epochs',
+        type=int,
+        default=1,
+        help='Epochs used by PyTorch SWALR to anneal to --swa-lr.',
     )
     return parser.parse_args()
 
@@ -559,6 +583,10 @@ def main() -> None:
         target_power=args.target_power,
         entropy_weight=args.entropy_weight,
         checkpoint_metric=args.checkpoint_metric,
+        swa=args.swa,
+        swa_start_epoch=args.swa_start_epoch,
+        swa_lr=args.swa_lr,
+        swa_anneal_epochs=args.swa_anneal_epochs,
     )
 
 
