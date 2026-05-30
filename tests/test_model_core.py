@@ -38,6 +38,7 @@ from mirafrag.fragments import (
     parse_fragment_adduct,
     smiles_to_fragment_candidates,
 )
+from mirafrag.heads.fragment import FragmentSpectrumHead
 from mirafrag.losses import (
     LOSS_NAMES,
     fragnnet_sparse_cross_entropy,
@@ -252,6 +253,168 @@ def test_fragment_head_with_fake_mace():
     assert pred['edge_attr'].shape[1] == FRAGMENT_EDGE_FEATURE_DIM
     assert torch.isfinite(pred['logits']).all()
     assert torch.isfinite(pred['oos_logits']).all()
+
+
+def test_fragment_path_scorer_starts_as_noop_and_can_train_output_layer():
+    torch.manual_seed(11)
+    config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_path_layers=3,
+    )
+    head = FragmentSpectrumHead(config)
+    formula_features = torch.randn(4, 8)
+    context_features = torch.randn(4, 8)
+    collision_features = torch.randn(4, 8)
+    formula_batch = torch.zeros(4, dtype=torch.long)
+    edge_index = torch.tensor([[0, 1, 0], [1, 2, 3]], dtype=torch.long)
+    edge_attr = torch.zeros(3, FRAGMENT_EDGE_FEATURE_DIM)
+    edge_attr[:, 0] = 1.0
+
+    delta = head._fragment_path_delta(
+        formula_features,
+        context_features,
+        collision_features,
+        edge_index,
+        edge_attr,
+        formula_batch,
+        batch_size=1,
+    )
+
+    assert torch.allclose(delta, torch.zeros_like(delta))
+    base_logits = torch.randn_like(delta)
+    loss = (base_logits + delta).square().sum()
+    loss.backward()
+
+    final_layer = head.fragment_path_residual[-1]
+    assert isinstance(final_layer, nn.Linear)
+    assert final_layer.weight.grad is not None
+    assert torch.count_nonzero(final_layer.weight.grad).item() > 0
+
+
+def test_fragment_path_propagation_starts_only_from_retained_roots():
+    head = FragmentSpectrumHead(
+        MiraFragConfig(
+            num_bins=16,
+            hidden_dim=8,
+            metadata_dim=4,
+            dropout=0.0,
+            fragment_path_layers=2,
+        )
+    )
+    root_scores = torch.tensor([0.0, 1.0, 2.0])
+    src = torch.tensor([0, 1], dtype=torch.long)
+    dst = torch.tensor([1, 2], dtype=torch.long)
+    edge_scores = torch.tensor([0.5, 0.7])
+
+    root_frontier = head._fragment_path_root_frontier(root_scores, dst)
+    path_scores = head._propagate_fragment_path_scores(
+        root_frontier,
+        edge_scores,
+        src,
+        dst,
+        num_nodes=3,
+    )
+
+    assert torch.isclose(root_frontier[0], torch.tensor(0.0))
+    assert (root_frontier[1:] < -1.0e8).all()
+    assert torch.allclose(path_scores, torch.tensor([0.0, 0.5, 1.2]))
+
+
+def test_fragment_path_gradients_stay_finite_with_unreachable_frontier_nodes():
+    torch.manual_seed(31)
+    head = FragmentSpectrumHead(
+        MiraFragConfig(
+            num_bins=16,
+            hidden_dim=8,
+            metadata_dim=4,
+            dropout=0.0,
+            fragment_path_layers=3,
+        )
+    )
+    final_layer = head.fragment_path_residual[-1]
+    assert isinstance(final_layer, nn.Linear)
+    with torch.no_grad():
+        final_layer.weight.fill_(0.01)
+        final_layer.bias.zero_()
+
+    formula_features = torch.randn(4, 8)
+    context_features = torch.randn(4, 8)
+    collision_features = torch.randn(4, 8)
+    formula_batch = torch.zeros(4, dtype=torch.long)
+    edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    edge_attr = torch.zeros(3, FRAGMENT_EDGE_FEATURE_DIM)
+    edge_attr[:, 0] = 1.0
+
+    delta = head._fragment_path_delta(
+        formula_features,
+        context_features,
+        collision_features,
+        edge_index,
+        edge_attr,
+        formula_batch,
+        batch_size=1,
+    )
+    delta.square().sum().backward()
+
+    for module in (
+        head.fragment_path_edge_scorer,
+        head.fragment_path_root_scorer,
+        head.fragment_path_score_encoder,
+        head.fragment_path_residual,
+    ):
+        for param in module.parameters():
+            assert param.grad is not None
+            assert torch.isfinite(param.grad).all()
+
+
+def test_fragment_path_branch_preserves_initial_head_predictions():
+    config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_gnn_layers=1,
+    )
+    path_config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_gnn_layers=1,
+        fragment_path_layers=2,
+    )
+    node_feats = torch.randn(3, 5)
+    metadata_features = torch.randn(1, 10)
+    graph_batch = torch.zeros(3, dtype=torch.long)
+    fragments = {
+        'batch': torch.zeros(3, dtype=torch.long),
+        'formula_batch': torch.zeros(3, dtype=torch.long),
+        'atom_index': torch.tensor([0, 1, 2], dtype=torch.long),
+        'atom_ptr': torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        'features': torch.randn(3, 6),
+        'edge_index': torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        'edge_attr': torch.zeros(2, FRAGMENT_EDGE_FEATURE_DIM),
+        'formula_index': torch.tensor([0, 1, 2], dtype=torch.long),
+        'mz': torch.tensor([10.0, 20.0, 30.0]),
+        'bin': torch.tensor([10, 20, 30], dtype=torch.long),
+        'log_prior': torch.zeros(3),
+    }
+    fragments['edge_attr'][:, 0] = 1.0
+
+    torch.manual_seed(23)
+    base_head = FragmentSpectrumHead(config)
+    torch.manual_seed(23)
+    path_head = FragmentSpectrumHead(path_config)
+    torch.manual_seed(29)
+    base_pred = base_head(node_feats, fragments, metadata_features, graph_batch)
+    torch.manual_seed(29)
+    path_pred = path_head(node_feats, fragments, metadata_features, graph_batch)
+
+    assert torch.allclose(path_pred['logits'], base_pred['logits'])
+    assert torch.allclose(path_pred['oos_logits'], base_pred['oos_logits'])
 
 
 def test_predict_proba_returns_oos_aware_probabilities():

@@ -507,7 +507,7 @@ class BinnedSpectrumDataset(Dataset):
         """
         Load or compute the encoder graph for one row.
 
-        Disk cache keys include the SMILES string and graph configuration, so different encoders or embedding settings do not share incompatible graph tensors.
+        Disk cache keys include the SMILES string and graph configuration, and graph files are additionally grouped under a graph-configuration namespace. Different encoders or embedding settings therefore do not share incompatible graph tensors, while fragment caches can still be shared from the same cache root.
         """
         if self.memory_cache and idx in self._graph_cache:
             return self._graph_cache[idx]
@@ -582,7 +582,7 @@ class BinnedSpectrumDataset(Dataset):
         """
         Build the deterministic disk cache path for one feature payload.
 
-        The cache path is a SHA-256 digest over format version, feature kind, SMILES, and settings, which keeps filenames short while preserving invalidation behavior.
+        The filename is a SHA-256 digest over format version, feature kind, SMILES, and settings, which keeps filenames short while preserving invalidation behavior. Graph features are placed below an additional graph-settings namespace so one disk cache root can share fragment files across encoders while keeping MACE/AIMNet graph tensors separate.
         """
         if self.disk_cache_dir is None:
             raise RuntimeError('disk_cache_dir is not configured.')
@@ -594,7 +594,21 @@ class BinnedSpectrumDataset(Dataset):
         }
         text = json.dumps(payload, sort_keys=True, separators=(',', ':'))
         digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
-        return self.disk_cache_dir / kind / f'{digest}.pt'
+        directory = self.disk_cache_dir / kind
+        if kind == 'graphs':
+            namespace_payload = {
+                'version': FEATURE_CACHE_VERSION,
+                'kind': kind,
+                'settings': settings,
+            }
+            namespace_text = json.dumps(
+                namespace_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            )
+            namespace = hashlib.sha256(namespace_text.encode('utf-8')).hexdigest()[:16]
+            directory = directory / f'graph-{namespace}'
+        return directory / f'{digest}.pt'
 
     def _metadata(self, row) -> dict[str, torch.Tensor]:
         """

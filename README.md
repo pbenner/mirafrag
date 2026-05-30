@@ -89,6 +89,7 @@ The fragment head is candidate based:
 - fragment features and precursor metadata/molecule context are encoded separately
 - optional message passing runs over a fragment graph
 - normalized collision energy conditions fragment-graph messages through feature-wise modulation and edge gates
+- optional recursive path scoring adds learned root-to-fragment parent/child evidence from the fragment graph
 - each fragment formula is scored from fragment features, precursor context, collision-energy features, and multiplicative interaction terms
 - isotope/adduct peak priors are added as log priors
 - an out-of-support (OOS) logit models target peaks with no generated candidate
@@ -134,13 +135,17 @@ keeps at most 1 isotope peak per formula by default.
 - `MAX_FRAGMENT_BROKEN_BONDS`: cumulative broken-bond and hydrogen-transfer budget, default `6`
 - `MAX_FRAGMENTS`: maximum retained fragment formulas per molecule, default `2048`
 - `MAX_FRAGMENT_EDGES`: maximum fragment-graph message-passing edges, default `8192`
+- `FRAGMENT_PATH_LAYERS`: recursive path-scoring steps in the head, default `3` in the MassSpecGym Makefile
 - `INCLUDE_FRAGMENT_ISOTOPES`: include isotope peak candidates, default `1`
 - `MAX_FRAGMENT_ISOTOPE_PEAKS`: maximum isotope peaks per formula, default `1`
 
 The fragment graph connects related formulas with directed typed edges:
 parent/child tree edges, same-formula isotope neighbors, same atom-set hydrogen
 transfer neighbors, and local same-bin neighbors. Edge features encode the
-relation type plus normalized mass, hydrogen-shift, and isotope-rank deltas.
+relation type plus normalized mass, hydrogen-shift, and isotope-rank deltas. The
+optional path scorer uses only the parent/child edges to compute learned
+root-to-fragment evidence for each formula; it changes the head but not the
+fragment cache.
 
 Fragment adduct parsing supports bracketed signed adducts such as `[M+H]+`,
 `[M+Na]+`, `[M-H]-`, `[M+2H]2+`, and formula modifiers such as `[M+FA-H]-`.
@@ -171,11 +176,16 @@ prepare-cache` to precompute graph and fragment caches before training or
 evaluation; the MassSpecGym `train`, `eval`, and `predict` targets pass the
 same disk cache directory by default. Disk caching is controlled by
 `DISK_CACHE_DIR` / `--disk-cache-dir`; per-worker in-memory reuse is controlled
-by `MEMORY_CACHE` / `--memory-cache`. When a training disk cache directory is
-configured, the `train` target pre-fills missing train/val cache entries with
-explicit `cache train` and `cache val` tqdm bars before the first epoch. Cache
-filling uses an unordered multiprocessing pool, so each worker receives another
-sample as soon as it finishes instead of waiting for earlier slow samples.
+by `MEMORY_CACHE` / `--memory-cache`. `DISK_CACHE_DIR` is a shared cache root:
+fragment candidates live under `fragments/` and are reused across encoders when
+fragment settings match, while graph tensors live under `graphs/graph-<hash>/`
+where the hash is derived from the graph/encoder configuration. Switching
+between AIMNet and MACE therefore only rebuilds the graph namespace. When a
+training disk cache directory is configured, the `train` target pre-fills
+missing train/val cache entries with explicit `cache train` and `cache val` tqdm
+bars before the first epoch. Cache filling uses an unordered multiprocessing
+pool, so each worker receives another sample as soon as it finishes instead of
+waiting for earlier slow samples.
 `prepare-cache` uses the foundation model and the Makefile fragment settings
 unless you pass `CACHE_SOURCE_MODEL=resources/massspecgym/checkpoints/mirafrag.pt`.
 

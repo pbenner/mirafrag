@@ -25,6 +25,7 @@ class MiraFragConfig:
     fragment_isotope_threshold: float = 0.001
     max_fragment_isotope_peaks: int = 1
     fragment_gnn_layers: int = 2
+    fragment_path_layers: int = 0
     encoder_type: str = 'mace'
     encoder_finetune_strategy: str = 'head'
     foundation_source: str = 'off'

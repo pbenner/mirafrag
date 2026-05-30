@@ -163,6 +163,15 @@ def parse_args() -> argparse.Namespace:
         help='Number of message-passing layers over the fragment graph.',
     )
     parser.add_argument(
+        '--fragment-path-layers',
+        type=int,
+        default=0,
+        help=(
+            'Number of recursive parent-to-child path propagation steps in the '
+            'fragment head; 0 disables the path scorer.'
+        ),
+    )
+    parser.add_argument(
         '--include-fragment-isotopes',
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -436,6 +445,7 @@ def main() -> None:
                 'max_fragment_isotope_peaks',
             ),
             fragment_gnn_layers=args.fragment_gnn_layers,
+            fragment_path_layers=args.fragment_path_layers,
             encoder_type=encoder_type,
             encoder_finetune_strategy=fine_tune_strategy,
             foundation_source=args.foundation_source,

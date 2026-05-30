@@ -1,5 +1,6 @@
 # ruff: noqa: F401
 import math
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pandas as pd
@@ -114,12 +115,70 @@ def test_binned_dataset_disk_cache_reuses_graphs_and_fragments(tmp_path):
     dataset = BinnedSpectrumDataset(_tiny_training_df(), **kwargs)
     first = dataset[0]
 
-    assert list((cache_dir / 'graphs').glob('*.pt'))
+    assert list((cache_dir / 'graphs').glob('graph-*/*.pt'))
     assert list((cache_dir / 'fragments').glob('*.pt'))
 
     reloaded = BinnedSpectrumDataset(_tiny_training_df(), **kwargs)[0]
     assert torch.equal(first['graph']['node_attrs'], reloaded['graph']['node_attrs'])
     assert first['fragments']['bins'] == reloaded['fragments']['bins']
+
+
+def test_graph_cache_is_namespaced_but_fragment_cache_is_shared(tmp_path):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    fragment_config = FragmentConfig(max_tree_depth=2, max_fragments=16)
+    cache_dir = tmp_path / 'features'
+    base_kwargs = {
+        'metadata_config': metadata,
+        'mz_max': 64.0,
+        'bin_width': 1.0,
+        'include_fragments': True,
+        'fragment_config': fragment_config,
+        'disk_cache_dir': cache_dir,
+    }
+    tiny_df = _tiny_training_df()
+    dataset_a = BinnedSpectrumDataset(
+        tiny_df,
+        graph_config=GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7),
+        **base_kwargs,
+    )
+    dataset_b = BinnedSpectrumDataset(
+        tiny_df,
+        graph_config=GraphConfig(atomic_numbers=(1, 6, 8), cutoff=3.0, seed=7),
+        **base_kwargs,
+    )
+    smiles = tiny_df.at[0, 'smiles']
+    graph_path_a = dataset_a._feature_cache_path(
+        'graphs',
+        smiles,
+        {'graph_config': asdict(dataset_a.graph_config)},
+    )
+    graph_path_b = dataset_b._feature_cache_path(
+        'graphs',
+        smiles,
+        {'graph_config': asdict(dataset_b.graph_config)},
+    )
+    fragment_settings = {
+        'fragment_config': asdict(fragment_config),
+        'adduct': '[M+H]+',
+        'mz_max': 64.0,
+        'bin_width': 1.0,
+    }
+    fragment_path_a = dataset_a._feature_cache_path(
+        'fragments',
+        smiles,
+        fragment_settings,
+    )
+    fragment_path_b = dataset_b._feature_cache_path(
+        'fragments',
+        smiles,
+        fragment_settings,
+    )
+
+    assert graph_path_a.parent != graph_path_b.parent
+    assert graph_path_a.parent.parent == cache_dir / 'graphs'
+    assert graph_path_b.parent.parent == cache_dir / 'graphs'
+    assert fragment_path_a == fragment_path_b
+    assert fragment_path_a.parent == cache_dir / 'fragments'
 
 
 def test_filter_supported_elements_drops_unsupported_boron():
