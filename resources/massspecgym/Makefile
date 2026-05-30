@@ -18,11 +18,13 @@ DELTA_INIT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
 DELTA_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_delta.pt
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
+ORACLE_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_oracle.csv
 DISK_CACHE_DIR ?= $(RESOURCE_DIR)/data/cache/mirafrag_features
 CACHE_SOURCE_MODEL ?=
 CACHE_SPLITS ?= train val test
 CACHE_NUM_WORKERS ?= $(shell nproc)
 CACHE_CHUNK_SIZE ?= 1
+ORACLE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
 
 DATASET_REPO ?= roman-bushuiev/MassSpecGym
 DATASET_FILE ?= data/MassSpecGym.tsv
@@ -195,7 +197,7 @@ ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-cache train train-finetune train-delta eval predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-cache train train-finetune train-delta eval oracle predict test lint format clean
 
 help:
 	@printf '%s\n' \
@@ -208,6 +210,7 @@ help:
 		'  make train-finetune      Same as train, with explicit fine-tune target name' \
 		'  make train-delta         Continue DELTA_INIT_MODEL with delta fine-tuning' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
+		'  make oracle              Compute fragment-support oracle diagnostics' \
 		'  make predict             Predict spectra for PREDICT_INPUT' \
 		'  make test                Run smoke tests' \
 		'  make lint                Run ruff check' \
@@ -223,6 +226,7 @@ help:
 		'  CACHE_SPLITS=$(CACHE_SPLITS)' \
 		'  CACHE_NUM_WORKERS=$(CACHE_NUM_WORKERS)' \
 		'  CACHE_CHUNK_SIZE=$(CACHE_CHUNK_SIZE)' \
+		'  ORACLE_CHUNK_SIZE=$(ORACLE_CHUNK_SIZE)' \
 		'  ENCODER=$(ENCODER)' \
 		'  CHECKPOINT_ENCODER=$(CHECKPOINT_ENCODER)' \
 		'  FOUNDATION_SOURCE=$(FOUNDATION_SOURCE)' \
@@ -339,6 +343,19 @@ eval:
 		--model $(MODEL) \
 		--output $(PREDICTIONS) \
 		$(COMMON_ARGS) \
+		$(CACHE_ARGS) \
+		$(EVAL_DIAGNOSTIC_ARGS) \
+		$(ROW_LIMIT_ARGS) \
+		--split $(EVAL_SPLIT) \
+		--split-col $(SPLIT_COL)
+
+oracle:
+	mkdir -p $(dir $(ORACLE_OUTPUT))
+	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.oracle \
+		--input $(INPUT) \
+		--model $(MODEL) \
+		--output $(ORACLE_OUTPUT) \
+		--device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --batch-size $(BATCH_SIZE) --chunk-size $(ORACLE_CHUNK_SIZE) --num-workers $(NUM_WORKERS) $(PROGRESS_ARGS) \
 		$(CACHE_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
 		$(ROW_LIMIT_ARGS) \

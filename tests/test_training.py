@@ -8,14 +8,19 @@ from torch import nn
 from torch.nn import LazyLinear
 from torch.utils.data import DataLoader
 
-from mirafrag.checkpoint import load_checkpoint
+from mirafrag.checkpoint import load_checkpoint, save_checkpoint
 from mirafrag.chem import GraphConfig
 from mirafrag.cli.cache import (
     _apply_fragment_args_to_model_config as _apply_cache_fragment_args_to_model_config,
 )
+from mirafrag.cli.oracle import (
+    _load_oracle_checkpoint_config,
+    compute_oracle_diagnostics,
+)
 from mirafrag.cli.train import (
     _apply_fragment_args_to_model_config as _apply_train_fragment_args_to_model_config,
 )
+from mirafrag.cli.train import _set_head_dropout, _validation_tune_candidates
 from mirafrag.config import MiraFragConfig
 from mirafrag.data import (
     BinnedSpectrumDataset,
@@ -64,6 +69,155 @@ from tests.helpers import (
     _tiny_loader,
     _tiny_training_df,
 )
+
+
+def test_oracle_checkpoint_config_reads_encoder_metadata(tmp_path):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(num_bins=32, hidden_dim=8, metadata_dim=4),
+    )
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    batch = next(iter(_tiny_loader(_tiny_training_df(), graph_config, metadata)))
+    with torch.no_grad():
+        model(batch)
+    output = tmp_path / 'mirafrag.pt'
+    save_checkpoint(output, model)
+
+    config, loaded_metadata, graph_config = _load_oracle_checkpoint_config(
+        str(output),
+        mz_max=32.0,
+        bin_width=1.0,
+    )
+
+    assert config.num_bins == 32
+    assert loaded_metadata.adduct_to_idx == {'[M+H]+': 0}
+    assert graph_config.atomic_numbers == (1, 6, 8)
+    assert graph_config.cutoff == 5.0
+
+
+def test_compute_oracle_diagnostics_uses_fragment_support_without_graph_forward():
+    df = _tiny_training_df()
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    dataset = BinnedSpectrumDataset(
+        df,
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=True,
+        fragment_config=FragmentConfig(max_tree_depth=2, max_fragments=16),
+    )
+
+    rows, summary = compute_oracle_diagnostics(
+        dataset,
+        batch_size=2,
+        mz_max=64.0,
+        bin_width=1.0,
+        mass_tolerance=0.01,
+        relative_mass_tolerance=False,
+        mass_tolerance_min_mz=200.0,
+        show_progress=False,
+    )
+
+    assert len(rows) == 2
+    assert summary['n'] == 2
+    assert 0.0 <= summary['oracle_binned_cosine_mean'] <= 1.0
+    assert 0.0 <= summary['oracle_tolerance_cosine_mean'] <= 1.0
+
+
+def test_parallel_oracle_diagnostics_match_serial():
+    df = _tiny_training_df()
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    dataset = BinnedSpectrumDataset(
+        df,
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=True,
+        fragment_config=FragmentConfig(max_tree_depth=2, max_fragments=16),
+    )
+
+    serial_rows, serial_summary = compute_oracle_diagnostics(
+        dataset,
+        batch_size=2,
+        mz_max=64.0,
+        bin_width=1.0,
+        mass_tolerance=0.01,
+        relative_mass_tolerance=False,
+        mass_tolerance_min_mz=200.0,
+        show_progress=False,
+        num_workers=0,
+    )
+    parallel_rows, parallel_summary = compute_oracle_diagnostics(
+        dataset,
+        batch_size=2,
+        mz_max=64.0,
+        bin_width=1.0,
+        mass_tolerance=0.01,
+        relative_mass_tolerance=False,
+        mass_tolerance_min_mz=200.0,
+        show_progress=False,
+        num_workers=2,
+        chunk_size=1,
+    )
+
+    assert parallel_summary == serial_summary
+    pd.testing.assert_frame_equal(parallel_rows, serial_rows)
+
+
+def test_validation_tune_candidates_are_limited_and_include_baseline():
+    args = SimpleNamespace(
+        learning_rate=3e-5,
+        dropout=0.01,
+        weight_decay=1e-6,
+        swa=False,
+        swa_start_epoch=None,
+        swa_lr=None,
+        swa_anneal_epochs=1,
+        tune_trials=4,
+        tune_epochs=6,
+        tune_lrs='1e-5,3e-5',
+        tune_dropouts='0,0.02',
+        tune_weight_decays='0,1e-6',
+        tune_swa_start_epochs='3,8',
+        tune_swa_lrs='1e-5',
+        tune_seed=11,
+        seed=17,
+    )
+
+    candidates = _validation_tune_candidates(args)
+
+    assert len(candidates) == 4
+    assert candidates[0].lr == 3e-5
+    assert candidates[0].dropout == 0.01
+    assert candidates[0].weight_decay == 1e-6
+    assert all(candidate.swa_start_epoch != 8 for candidate in candidates)
+
+
+def test_set_head_dropout_only_updates_head_dropout_modules():
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=16,
+            hidden_dim=8,
+            metadata_dim=4,
+            dropout=0.1,
+        ),
+    )
+
+    _set_head_dropout(model, 0.25)
+
+    assert model.config.dropout == 0.25
+    assert {
+        module.p for module in model.head.modules() if isinstance(module, nn.Dropout)
+    } == {0.25}
 
 
 def test_repair_mace_cuequivariance_config_restores_product_flags():
