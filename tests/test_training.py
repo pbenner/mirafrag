@@ -242,6 +242,14 @@ def test_set_head_dropout_only_updates_head_dropout_modules():
     _set_head_dropout(model, 0.25)
 
     assert model.config.dropout == 0.25
+    assert model.head.fragment_input_dropout.p == 0.25
+    assert model.head.context_input_dropout.p == 0.25
+    assert model.head.collision_input_dropout.p == 0.25
+    assert {
+        module.p
+        for module in model.head.oos_scorer.modules()
+        if isinstance(module, nn.Dropout)
+    } == {0.25}
     assert {
         module.p for module in model.head.modules() if isinstance(module, nn.Dropout)
     } == {0.25}

@@ -33,6 +33,9 @@ class FragmentSpectrumHead(nn.Module):
                 for _ in range(max(0, int(config.fragment_gnn_layers)))
             ]
         )
+        self.fragment_input_dropout = nn.Dropout(config.dropout)
+        self.context_input_dropout = nn.Dropout(config.dropout)
+        self.collision_input_dropout = nn.Dropout(config.dropout)
         self.fragment_encoder = nn.Sequential(
             nn.LazyLinear(config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
@@ -176,8 +179,10 @@ class FragmentSpectrumHead(nn.Module):
         """
         metadata_feature_dim = 2 + 2 * int(config.metadata_dim)
         return nn.Sequential(
+            nn.Dropout(config.dropout),
             nn.Linear(metadata_feature_dim, config.hidden_dim),
             nn.SiLU(),
+            nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim, 1),
         )
 
@@ -250,10 +255,17 @@ class FragmentSpectrumHead(nn.Module):
             ],
             dim=-1,
         )
-        formula_features = self.fragment_encoder(fragment_inputs)
-        context_features = self.context_encoder(context_inputs)
+        formula_features = self.fragment_encoder(
+            self.fragment_input_dropout(fragment_inputs)
+        )
+        context_features = self.context_encoder(
+            self.context_input_dropout(context_inputs)
+        )
+        collision_inputs = self._collision_energy_feature(metadata_features)[
+            formula_batch
+        ]
         collision_features = self.collision_encoder(
-            self._collision_energy_feature(metadata_features)[formula_batch]
+            self.collision_input_dropout(collision_inputs)
         )
         edge_index = fragments['edge_index'].to(device=node_feats.device)
         edge_attr = fragments['edge_attr'].to(
