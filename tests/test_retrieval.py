@@ -7,6 +7,7 @@ from mirafrag.retrieval import (
     RETRIEVAL_IS_TRUE,
     RETRIEVAL_QUERY_ID,
     build_retrieval_candidate_rows,
+    estimate_retrieval_candidate_count,
     parse_hit_ks,
     resolve_candidate_mode,
     retrieval_candidate_table_from_json,
@@ -79,6 +80,35 @@ def test_massspecgym_json_candidate_rows_group_by_query_smiles():
 
     assert rows['smiles'].tolist() == ['CO', 'CCO']
     assert rows[RETRIEVAL_IS_TRUE].tolist() == [False, True]
+
+
+def test_estimate_explicit_candidate_count_matches_json_rows():
+    queries = _query_df()
+    candidates = retrieval_candidate_table_from_json(
+        {
+            'CCO': ['CO', 'CCO'],
+            'CCN': ['CN', 'CCN', 'N'],
+        }
+    )
+
+    assert (
+        estimate_retrieval_candidate_count(
+            queries,
+            candidates,
+            mode='explicit',
+            max_candidates=8,
+        )
+        == 5
+    )
+    assert (
+        estimate_retrieval_candidate_count(
+            queries,
+            candidates,
+            mode='explicit',
+            max_candidates=2,
+        )
+        == 4
+    )
 
 
 def test_build_explicit_candidate_rows_uses_candidate_smiles_and_label():

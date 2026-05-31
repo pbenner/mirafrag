@@ -28,6 +28,7 @@ from mirafrag.losses import (
 )
 from mirafrag.retrieval import (
     build_retrieval_candidate_rows,
+    estimate_retrieval_candidate_count,
     parse_hit_ks,
     read_retrieval_candidate_table,
     resolve_candidate_mode,
@@ -182,18 +183,24 @@ def main() -> None:
     )
 
     per_query_frames = []
-    query_chunks = range(0, len(query_df), max(1, int(args.query_chunk_size)))
-    chunk_progress = tqdm(
-        query_chunks,
-        desc='retrieval chunks',
-        total=(len(query_df) + max(1, int(args.query_chunk_size)) - 1)
-        // max(1, int(args.query_chunk_size)),
+    query_chunk_size = max(1, int(args.query_chunk_size))
+    query_chunks = range(0, len(query_df), query_chunk_size)
+    candidate_total = estimate_retrieval_candidate_count(
+        query_df,
+        candidate_pool,
+        mode=candidate_mode,
+        max_candidates=args.max_candidates,
+    )
+    candidate_progress = tqdm(
+        total=candidate_total,
+        desc='retrieval candidates',
+        unit='cand',
         dynamic_ncols=True,
         leave=False,
         disable=not args.progress,
     )
-    for chunk_start in chunk_progress:
-        chunk = query_df.iloc[chunk_start : chunk_start + args.query_chunk_size].copy()
+    for chunk_index, chunk_start in enumerate(query_chunks, start=1):
+        chunk = query_df.iloc[chunk_start : chunk_start + query_chunk_size].copy()
         candidate_rows = build_retrieval_candidate_rows(
             chunk,
             candidate_pool,
@@ -204,7 +211,11 @@ def main() -> None:
         )
         if candidate_rows.empty:
             continue
-        chunk_progress.set_postfix(candidates=len(candidate_rows), refresh=False)
+        candidate_progress.set_postfix(
+            chunk=f'{chunk_index}',
+            candidates=len(candidate_rows),
+            refresh=False,
+        )
         candidate_rows, row_filter_stats = filter_supported_elements(
             candidate_rows,
             supported_atomic_numbers=graph_config.atomic_numbers,
@@ -242,6 +253,15 @@ def main() -> None:
             hit_ks=hit_ks,
         )
         per_query_frames.append(per_query)
+        candidate_progress.update(len(candidate_rows))
+
+    if (
+        candidate_progress.total is not None
+        and candidate_progress.n < candidate_progress.total
+    ):
+        candidate_progress.total = candidate_progress.n
+        candidate_progress.refresh()
+    candidate_progress.close()
 
     if not per_query_frames:
         raise SystemExit('No candidate rows could be evaluated.')

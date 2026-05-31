@@ -129,6 +129,96 @@ def build_retrieval_candidate_rows(
     )
 
 
+def estimate_retrieval_candidate_count(
+    queries: pd.DataFrame,
+    candidate_pool: pd.DataFrame,
+    *,
+    mode: str,
+    max_candidates: int = 256,
+    ensure_true_candidate: bool = True,
+) -> int | None:
+    """
+    Estimate retrieval candidate rows without constructing the expanded table.
+
+    The estimate is exact for explicit candidate inputs before downstream element
+    filtering. Diagnostic formula and mass modes return ``None`` because their
+    candidate sets depend on dataframe-wide grouping or numeric tolerances and
+    are cheap enough to monitor by processed count only.
+    """
+    if mode != 'explicit' or queries.empty:
+        return None
+    max_candidates = int(max_candidates)
+    if max_candidates <= 0:
+        raise ValueError('max_candidates must be positive.')
+
+    query_id_col = find_column(queries, IDENTIFIER_ALIASES, required=False)
+    query_smiles_col = find_column(queries, SMILES_ALIASES)
+    query_identity_col = _identity_column(queries)
+    candidate_query_id_col = find_column(
+        candidate_pool,
+        QUERY_IDENTIFIER_ALIASES,
+        required=False,
+    )
+    candidate_query_smiles_col = find_column(
+        candidate_pool,
+        QUERY_SMILES_ALIASES,
+        required=False,
+    )
+    if candidate_query_id_col is None and candidate_query_smiles_col is None:
+        return None
+    candidate_smiles_col = find_column(
+        candidate_pool,
+        ('candidate_smiles', 'smiles', 'SMILES', 'Smiles'),
+    )
+    candidate_identity_col = find_column(
+        candidate_pool,
+        ('candidate_inchikey', 'inchikey', 'candidate_identifier', 'identifier'),
+        required=False,
+    )
+    explicit_true_col = find_column(candidate_pool, TRUE_ALIASES, required=False)
+
+    if candidate_query_smiles_col is not None:
+        group_col = candidate_query_smiles_col
+
+        def query_group_key(query: pd.Series, _query_position: int) -> str:
+            return str(query.get(query_smiles_col))
+
+    else:
+        group_col = candidate_query_id_col
+
+        def query_group_key(query: pd.Series, query_position: int) -> str:
+            return _query_identifier(query, query_position, query_id_col)
+
+    groups = {
+        str(key): group for key, group in candidate_pool.groupby(group_col, sort=False)
+    }
+    total = 0
+    for query_position, (_idx, query) in enumerate(queries.iterrows()):
+        candidates = groups.get(
+            query_group_key(query, query_position),
+            candidate_pool.iloc[0:0],
+        )
+        count = int(len(candidates))
+        if ensure_true_candidate and count > 0:
+            query_identity = str(
+                query.get(query_identity_col, query.get(query_smiles_col))
+            )
+            is_true = _candidate_truth_mask(
+                candidates,
+                query_identity=query_identity,
+                query_smiles=str(query.get(query_smiles_col)),
+                candidate_smiles_col=candidate_smiles_col,
+                candidate_identity_col=candidate_identity_col,
+                explicit_true_col=explicit_true_col,
+            )
+            if not bool(is_true.any()):
+                count += 1
+        elif ensure_true_candidate:
+            count = 1
+        total += min(count, max_candidates)
+    return total
+
+
 def summarize_retrieval_hits(
     candidate_rows: pd.DataFrame,
     scores: list[float],
