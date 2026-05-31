@@ -42,7 +42,7 @@ from mirafrag.spectra import (
     MASS_SPEC_GYM_MZ_MAX,
     num_spectrum_bins,
 )
-from mirafrag.training import train_model
+from mirafrag.training import run_epoch, train_model
 
 
 @dataclass(frozen=True)
@@ -650,7 +650,6 @@ def main() -> None:
         else None
     )
     if args.validation_tune:
-        base_dropout = float(model.config.dropout)
         del model
         if str(device).startswith('cuda'):
             torch.cuda.empty_cache()
@@ -660,7 +659,6 @@ def main() -> None:
             val_loader,
             device=device,
             fine_tune_strategy=fine_tune_strategy,
-            base_dropout=base_dropout,
         )
         return
 
@@ -706,14 +704,14 @@ def _run_validation_tuning(
     *,
     device: str | torch.device,
     fine_tune_strategy: str,
-    base_dropout: float,
 ) -> None:
     """
     Run short validation-driven fine-tuning trials from one checkpoint.
 
-    Each trial reloads ``--init-checkpoint`` so optimizer state, model weights,
-    dropout probability, and SWA settings are independent. The best per-trial
-    checkpoint by ``--tune-metric`` is copied to ``--output``.
+    The initial checkpoint is evaluated once as the reference score. Each trial
+    then reloads ``--init-checkpoint`` so optimizer state, model weights,
+    dropout probability, and SWA settings are independent. The best checkpoint
+    by ``--tune-metric`` is copied to ``--output``.
     """
     if args.init_checkpoint is None:
         raise SystemExit('--validation-tune requires --init-checkpoint.')
@@ -722,20 +720,45 @@ def _run_validation_tuning(
     if args.tune_epochs < 1:
         raise SystemExit('--tune-epochs must be positive.')
 
-    candidates = _validation_tune_candidates(args, base_dropout=base_dropout)
+    candidates = _validation_tune_candidates(args)
     output = Path(args.output)
     trial_dir = _validation_tune_trial_dir(args, output)
     trial_dir.mkdir(parents=True, exist_ok=True)
-    best_score = _initial_tune_score(args.tune_metric)
-    best_trial_output: Path | None = None
-    best_trial_history: Path | None = None
-    best_summary: dict[str, Any] | None = None
     trial_summaries: list[dict[str, Any]] = []
 
     print(
         'validation tuning enabled: '
         f'trials={len(candidates)} metric={args.tune_metric} '
         f'epochs_per_trial={args.tune_epochs} trial_dir={trial_dir}'
+    )
+
+    initial_stats = _evaluate_validation_tune_initial(
+        args,
+        val_loader,
+        device=device,
+        fine_tune_strategy=fine_tune_strategy,
+    )
+    best_score = _tune_score_from_val_stats(initial_stats, args.tune_metric)
+    best_trial_output: Path | None = Path(args.init_checkpoint)
+    initial_history = _history_path(best_trial_output)
+    best_trial_history: Path | None = (
+        initial_history if initial_history.exists() else None
+    )
+    best_summary: dict[str, Any] | None = {
+        'trial': 0,
+        'score': best_score,
+        'metric': args.tune_metric,
+        'checkpoint': str(best_trial_output),
+        'history': str(best_trial_history) if best_trial_history is not None else None,
+        'candidate': None,
+        'initial': True,
+    }
+    print(
+        'validation tuning initial: '
+        f'val_loss={initial_stats["loss"]:.5f} '
+        f'val_cosine={initial_stats["cosine"]:.5f} '
+        f'val_oos={initial_stats["oos_probability"]:.5f} '
+        f'{args.tune_metric}={best_score:.5f}'
     )
 
     for trial_index, candidate in enumerate(candidates, start=1):
@@ -784,7 +807,7 @@ def _run_validation_tuning(
             exponential_gamma=args.exponential_gamma,
             plateau_factor=args.plateau_factor,
             plateau_patience=args.plateau_patience,
-            evaluate_initial=True,
+            evaluate_initial=False,
             mass_tolerance=args.mass_tolerance,
             relative_mass_tolerance=args.relative_mass_tolerance,
             mass_tolerance_min_mz=args.mass_tolerance_min_mz,
@@ -823,9 +846,12 @@ def _run_validation_tuning(
     if best_trial_output is None or best_summary is None:
         raise RuntimeError('Validation tuning did not produce a checkpoint.')
     output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(best_trial_output, output)
+    if best_trial_output.resolve() != output.resolve():
+        shutil.copy2(best_trial_output, output)
     if best_trial_history is not None and best_trial_history.exists():
-        shutil.copy2(best_trial_history, _history_path(output))
+        output_history = _history_path(output)
+        if best_trial_history.resolve() != output_history.resolve():
+            shutil.copy2(best_trial_history, output_history)
     summary_path = _tune_summary_path(output)
     with open(summary_path, 'w') as fp:
         json.dump(
@@ -847,13 +873,52 @@ def _run_validation_tuning(
         _cleanup_validation_tune_trials(trial_summaries, trial_dir)
 
 
+def _evaluate_validation_tune_initial(
+    args: argparse.Namespace,
+    val_loader: DataLoader,
+    *,
+    device: str | torch.device,
+    fine_tune_strategy: str,
+) -> dict[str, float]:
+    """
+    Evaluate the initial validation-tuning checkpoint without training it.
+    """
+    model, _payload = load_checkpoint(args.init_checkpoint, device=device)
+    _validate_loaded_checkpoint_config(
+        model,
+        mz_max=args.mz_max,
+        bin_width=args.bin_width,
+    )
+    set_encoder_finetune_strategy(model, fine_tune_strategy)
+    _apply_fragment_args_to_model_config(model.config, args)
+    model.to(device)
+    stats = run_epoch(
+        model,
+        val_loader,
+        optimizer=None,
+        device=device,
+        loss_name=args.loss,
+        desc=f'val initial/{args.tune_epochs}',
+        show_progress=args.progress,
+        mass_tolerance=args.mass_tolerance,
+        relative_mass_tolerance=args.relative_mass_tolerance,
+        mass_tolerance_min_mz=args.mass_tolerance_min_mz,
+        kl_weight=args.kl_weight,
+        coverage_weight=args.coverage_weight,
+        target_power=args.target_power,
+        entropy_weight=args.entropy_weight,
+    )
+    del model
+    if str(device).startswith('cuda'):
+        torch.cuda.empty_cache()
+    return stats
+
+
 def _validation_tune_candidates(
     args: argparse.Namespace,
-    *,
-    base_dropout: float | None = None,
 ) -> list[_ValidationTuneCandidate]:
     """
-    Build a deterministic, shuffled list of validation-tuning candidates.
+    Build a deterministic, shuffled list of requested validation-tuning candidates.
     """
     if args.tune_trials < 1:
         raise SystemExit('--tune-trials must be positive.')
@@ -875,15 +940,6 @@ def _validation_tune_candidates(
     swa_lrs = _parse_positive_float_list(args.tune_swa_lrs, name='--tune-swa-lrs')
     anneal_epochs = max(1, int(args.swa_anneal_epochs))
 
-    baseline = _ValidationTuneCandidate(
-        lr=float(args.learning_rate),
-        dropout=float(args.dropout if base_dropout is None else base_dropout),
-        weight_decay=float(args.weight_decay),
-        swa=bool(args.swa),
-        swa_start_epoch=int(args.swa_start_epoch) if args.swa_start_epoch else None,
-        swa_lr=float(args.swa_lr) if args.swa_lr is not None else None,
-        swa_anneal_epochs=anneal_epochs,
-    )
     candidates = [
         _ValidationTuneCandidate(
             lr=lr,
@@ -915,11 +971,10 @@ def _validation_tune_candidates(
         )
         if swa_lr <= lr
     )
-    candidates = _deduplicate_candidates([baseline, *candidates])
+    candidates = _deduplicate_candidates(candidates)
     rng = random.Random(args.tune_seed if args.tune_seed is not None else args.seed)
-    baseline, rest = candidates[0], candidates[1:]
-    rng.shuffle(rest)
-    return [baseline, *rest[: max(0, int(args.tune_trials) - 1)]]
+    rng.shuffle(candidates)
+    return candidates[: int(args.tune_trials)]
 
 
 def _deduplicate_candidates(
@@ -1008,6 +1063,17 @@ def _set_head_dropout(model: MiraFragModel, dropout: float) -> None:
             module.p = float(dropout)
 
 
+def _tune_score_from_val_stats(stats: dict[str, float], metric: str) -> float:
+    """
+    Extract the selected validation-tuning metric from one validation result.
+    """
+    if metric == 'val_cosine':
+        return float(stats['cosine'])
+    if metric == 'val_loss':
+        return float(stats['loss'])
+    raise ValueError(f'Unsupported tuning metric: {metric}')
+
+
 def _best_tune_score(history: dict[str, list[float]], metric: str) -> float:
     """
     Return the best live-or-SWA validation score from a trial history.
@@ -1032,13 +1098,6 @@ def _tune_history_keys(metric: str) -> tuple[str, str]:
     if metric == 'val_loss':
         return ('val_loss', 'swa_val_loss')
     raise ValueError(f'Unsupported tuning metric: {metric}')
-
-
-def _initial_tune_score(metric: str) -> float:
-    """
-    Return the initial best score for a tuning metric.
-    """
-    return -float('inf') if _tune_maximizes(metric) else float('inf')
 
 
 def _tune_improved(value: float, best_value: float, metric: str) -> bool:

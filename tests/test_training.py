@@ -170,7 +170,7 @@ def test_parallel_oracle_diagnostics_match_serial():
     pd.testing.assert_frame_equal(parallel_rows, serial_rows)
 
 
-def test_validation_tune_candidates_are_limited_and_include_baseline():
+def test_validation_tune_candidates_are_limited_without_baseline():
     args = SimpleNamespace(
         learning_rate=3e-5,
         dropout=0.01,
@@ -193,9 +193,8 @@ def test_validation_tune_candidates_are_limited_and_include_baseline():
     candidates = _validation_tune_candidates(args)
 
     assert len(candidates) == 4
-    assert candidates[0].lr == 3e-5
-    assert candidates[0].dropout == 0.01
-    assert candidates[0].weight_decay == 1e-6
+    assert all(candidate.dropout in {0.0, 0.02} for candidate in candidates)
+    assert all(candidate.weight_decay in {0.0, 1e-6} for candidate in candidates)
     assert all(candidate.swa_start_epoch != 8 for candidate in candidates)
 
 
