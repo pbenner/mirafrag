@@ -317,7 +317,7 @@ def _score_candidate_rows(
             split_name=f'retrieval {split_name}',
             chunk_size=cache_chunk_size,
             num_workers=cache_num_workers,
-            show_progress=False,
+            show_progress=show_progress,
             print_ready=False,
         )
     loader = DataLoader(
