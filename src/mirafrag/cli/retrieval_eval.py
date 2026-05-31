@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--bin-width', type=float, default=MASS_SPEC_GYM_BIN_WIDTH)
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--num-workers', type=int, default=8)
+    parser.add_argument(
+        '--score-num-workers',
+        type=int,
+        default=None,
+        help='DataLoader workers for candidate scoring; defaults to 0 with disk cache.',
+    )
     parser.add_argument('--cache-chunk-size', type=int, default=1)
     parser.add_argument(
         '--memory-cache',
@@ -166,10 +172,12 @@ def main() -> None:
         ):
             print(f'Retrieval candidate element filter: {candidate_filter_stats}')
 
+    score_num_workers = _resolve_score_num_workers(args)
     print(
         f'retrieval candidate mode={candidate_mode} '
         f'queries={len(query_df)} max_candidates={args.max_candidates} '
-        f'hit_ks={",".join(str(k) for k in hit_ks)} score={args.score}'
+        f'hit_ks={",".join(str(k) for k in hit_ks)} score={args.score} '
+        f'cache_workers={args.num_workers} score_workers={score_num_workers}'
     )
 
     per_query_frames = []
@@ -214,7 +222,8 @@ def main() -> None:
             fragment_config=fragment_config,
             device=device,
             batch_size=args.batch_size,
-            num_workers=args.num_workers,
+            cache_num_workers=args.num_workers,
+            score_num_workers=score_num_workers,
             memory_cache=args.memory_cache,
             disk_cache_dir=args.disk_cache_dir,
             prefill_cache=args.prefill_cache,
@@ -243,6 +252,31 @@ def main() -> None:
         print(f'Wrote retrieval metrics to {args.output}')
 
 
+def _resolve_score_num_workers(args: argparse.Namespace) -> int:
+    """
+    Choose scoring workers separately from cache-fill workers.
+
+    Retrieval evaluation creates many short-lived candidate DataLoaders. With a
+    CUDA checkpoint, multiprocessing uses spawn, and repeatedly starting worker
+    pools can exhaust file descriptors. Disk-cache prefill already parallelizes
+    expensive feature generation, so the safe default is single-process scoring.
+    """
+    if args.score_num_workers is not None:
+        return max(0, int(args.score_num_workers))
+    if args.disk_cache_dir is not None and args.prefill_cache:
+        return 0
+    return max(0, int(args.num_workers))
+
+
+def _retrieval_dataloader_kwargs(*, num_workers: int, device) -> dict:
+    """
+    Return DataLoader kwargs for short-lived retrieval scoring loaders.
+    """
+    kwargs = dataloader_performance_kwargs(num_workers=num_workers, device=device)
+    kwargs.pop('persistent_workers', None)
+    return kwargs
+
+
 def _score_candidate_rows(
     model,
     candidate_rows,
@@ -251,7 +285,8 @@ def _score_candidate_rows(
     fragment_config,
     device,
     batch_size: int,
-    num_workers: int,
+    cache_num_workers: int,
+    score_num_workers: int,
     memory_cache: bool,
     disk_cache_dir: str | None,
     prefill_cache: bool,
@@ -280,7 +315,7 @@ def _score_candidate_rows(
             dataset,
             split_name=f'retrieval {split_name}',
             chunk_size=cache_chunk_size,
-            num_workers=num_workers,
+            num_workers=cache_num_workers,
             show_progress=False,
             print_ready=False,
         )
@@ -288,9 +323,12 @@ def _score_candidate_rows(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=score_num_workers,
         collate_fn=collate_spectrum_batch,
-        **dataloader_performance_kwargs(num_workers=num_workers, device=device),
+        **_retrieval_dataloader_kwargs(
+            num_workers=score_num_workers,
+            device=device,
+        ),
     )
     model.to(device)
     model.eval()
