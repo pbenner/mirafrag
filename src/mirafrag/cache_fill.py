@@ -70,13 +70,15 @@ def prefill_feature_cache(
     chunk_size: int,
     num_workers: int,
     show_progress: bool,
+    print_ready: bool = True,
 ) -> None:
     """
-    Fill missing graph and fragment cache files with a visible progress bar.
+    Fill missing graph and fragment cache files with optional progress output.
 
     Training and evaluation use this before constructing ordered DataLoaders so
     expensive cache misses are handled by the unordered worker pool instead of
-    blocking model batches behind slow samples.
+    blocking model batches behind slow samples. ``print_ready`` can be disabled
+    by nested callers such as retrieval evaluation to keep the outer tqdm clean.
     """
     if len(dataset) == 0:
         return
@@ -87,7 +89,8 @@ def prefill_feature_cache(
         chunk_size=chunk_size,
         show_progress=show_progress,
     )
-    print(f'cache {split_name} ready rows={total}')
+    if print_ready:
+        print(f'cache {split_name} ready rows={total}')
 
 
 def _multiprocessing_start_method() -> str:

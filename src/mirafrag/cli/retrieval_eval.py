@@ -195,6 +195,7 @@ def main() -> None:
         )
         if candidate_rows.empty:
             continue
+        chunk_progress.set_postfix(candidates=len(candidate_rows), refresh=False)
         candidate_rows, row_filter_stats = filter_supported_elements(
             candidate_rows,
             supported_atomic_numbers=graph_config.atomic_numbers,
@@ -280,7 +281,8 @@ def _score_candidate_rows(
             split_name=f'retrieval {split_name}',
             chunk_size=cache_chunk_size,
             num_workers=num_workers,
-            show_progress=show_progress,
+            show_progress=False,
+            print_ready=False,
         )
     loader = DataLoader(
         dataset,
