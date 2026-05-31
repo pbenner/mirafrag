@@ -91,6 +91,8 @@ class FragmentSpectrumHead(nn.Module):
             self.fragment_path_root_scorer = None
             self.fragment_path_score_encoder = None
             self.fragment_path_residual = None
+        self.oos_input_dropout = nn.Dropout(config.dropout)
+        self.oos_hidden_dropout = nn.Dropout(config.dropout)
         self.oos_scorer = self._make_oos_scorer(config)
 
     @staticmethod
@@ -179,12 +181,23 @@ class FragmentSpectrumHead(nn.Module):
         """
         metadata_feature_dim = 2 + 2 * int(config.metadata_dim)
         return nn.Sequential(
-            nn.Dropout(config.dropout),
             nn.Linear(metadata_feature_dim, config.hidden_dim),
             nn.SiLU(),
-            nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim, 1),
         )
+
+    def _oos_logits(self, metadata_features: torch.Tensor) -> torch.Tensor:
+        """
+        Score out-of-support probability with checkpoint-compatible layers.
+
+        The linear layers stay in ``self.oos_scorer`` at the original state-dict
+        keys so checkpoints trained before OOS dropout remain loadable. Dropout
+        is applied around those layers without changing their parameter names.
+        """
+        hidden = self.oos_scorer[0](self.oos_input_dropout(metadata_features))
+        hidden = self.oos_scorer[1](hidden)
+        hidden = self.oos_hidden_dropout(hidden)
+        return self.oos_scorer[2](hidden).squeeze(-1)
 
     def forward(
         self,
@@ -204,7 +217,7 @@ class FragmentSpectrumHead(nn.Module):
             return {
                 'kind': 'sparse',
                 'logits': node_feats.new_empty(0),
-                'oos_logits': self.oos_scorer(metadata_features).squeeze(-1),
+                'oos_logits': self._oos_logits(metadata_features),
                 'mzs': node_feats.new_empty(0),
                 'bins': torch.empty(0, dtype=torch.long, device=node_feats.device),
                 'log_prior': node_feats.new_empty(0),
@@ -318,7 +331,7 @@ class FragmentSpectrumHead(nn.Module):
         return {
             'kind': 'sparse',
             'logits': logits,
-            'oos_logits': self.oos_scorer(metadata_features).squeeze(-1),
+            'oos_logits': self._oos_logits(metadata_features),
             'mzs': peak_mzs,
             'bins': peak_bins,
             'log_prior': log_prior,
