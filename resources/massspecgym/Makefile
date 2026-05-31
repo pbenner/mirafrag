@@ -16,15 +16,26 @@ MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
 INIT_MODEL ?=
 DELTA_INIT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
 DELTA_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_delta.pt
+VALOPT_INIT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_aimnet_path.pt
+VALOPT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_aimnet_valopt.pt
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
 ORACLE_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_oracle.csv
+RETRIEVAL_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_retrieval.csv
+RETRIEVAL_CANDIDATES ?=
 DISK_CACHE_DIR ?= $(RESOURCE_DIR)/data/cache/mirafrag_features
 CACHE_SOURCE_MODEL ?=
 CACHE_SPLITS ?= train val test
 CACHE_NUM_WORKERS ?= $(shell nproc)
 CACHE_CHUNK_SIZE ?= 1
 ORACLE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
+RETRIEVAL_CANDIDATE_MODE ?= auto
+RETRIEVAL_MAX_CANDIDATES ?= 256
+RETRIEVAL_QUERY_CHUNK_SIZE ?= 64
+RETRIEVAL_HIT_KS ?= 1,5,10,20
+RETRIEVAL_SCORE ?= cosine
+RETRIEVAL_MASS_TOLERANCE ?= 0.01
+RETRIEVAL_CACHE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
 
 DATASET_REPO ?= roman-bushuiev/MassSpecGym
 DATASET_FILE ?= data/MassSpecGym.tsv
@@ -50,7 +61,7 @@ PLATEAU_FACTOR ?= 0.5
 PLATEAU_PATIENCE ?= 1
 MZ_MAX ?= 1005
 BIN_WIDTH ?= 0.01
-LOSS ?= kl
+LOSS ?= decoupled_kl
 KL_WEIGHT ?= 0.7
 COVERAGE_WEIGHT ?= 0.1
 TARGET_POWER ?= 1.0
@@ -81,6 +92,25 @@ FRAGMENT_ISOTOPE_THRESHOLD ?= 0.001
 MAX_FRAGMENT_ISOTOPE_PEAKS ?= 1
 FINE_TUNE_STRATEGY ?= full
 OVERRIDE_FRAGMENT_CONFIG ?= 0
+
+TUNE_METRIC ?= val_cosine
+TUNE_TRIALS ?= 12
+TUNE_EPOCHS ?= 12
+TUNE_LRS ?= 1e-5,3e-5,1e-4
+TUNE_DROPOUTS ?= 0,0.02,0.05
+TUNE_WEIGHT_DECAYS ?= 0,1e-6,1e-5
+TUNE_SWA_START_EPOCHS ?= 3,6
+TUNE_SWA_LRS ?= 1e-5,3e-5,1e-4
+TUNE_SEED ?=
+TUNE_OUTPUT_DIR ?=
+TUNE_KEEP_TRIALS ?= 0
+VALOPT_LOSS ?= decoupled_kl
+VALOPT_KL_WEIGHT ?= 0.7
+VALOPT_COVERAGE_WEIGHT ?= 0.1
+VALOPT_TARGET_POWER ?= 1.2
+VALOPT_ENTROPY_WEIGHT ?= 0.0005
+VALOPT_LR ?= 1e-5
+VALOPT_WEIGHT_DECAY ?= 0.0
 
 TRAIN_SPLIT ?= train
 VAL_SPLIT ?= val
@@ -175,11 +205,22 @@ else
 LOSS_ARGS += --no-relative-mass-tolerance
 endif
 LOSS_ARGS += --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
+VALOPT_LOSS_ARGS = --loss $(VALOPT_LOSS) --kl-weight $(VALOPT_KL_WEIGHT) --coverage-weight $(VALOPT_COVERAGE_WEIGHT) --target-power $(VALOPT_TARGET_POWER) --entropy-weight $(VALOPT_ENTROPY_WEIGHT)
+ifeq ($(strip $(RELATIVE_MASS_TOLERANCE)),1)
+VALOPT_LOSS_ARGS += --relative-mass-tolerance
+else
+VALOPT_LOSS_ARGS += --no-relative-mass-tolerance
+endif
+VALOPT_LOSS_ARGS += --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
 EVAL_DIAGNOSTIC_ARGS = --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
 ifeq ($(strip $(RELATIVE_MASS_TOLERANCE)),1)
 EVAL_DIAGNOSTIC_ARGS += --relative-mass-tolerance
 else
 EVAL_DIAGNOSTIC_ARGS += --no-relative-mass-tolerance
+endif
+RETRIEVAL_CANDIDATE_ARGS = --candidate-mode $(RETRIEVAL_CANDIDATE_MODE) --max-candidates $(RETRIEVAL_MAX_CANDIDATES) --query-chunk-size $(RETRIEVAL_QUERY_CHUNK_SIZE) --hit-ks $(RETRIEVAL_HIT_KS) --score $(RETRIEVAL_SCORE) --mass-candidate-tolerance $(RETRIEVAL_MASS_TOLERANCE) --cache-chunk-size $(RETRIEVAL_CACHE_CHUNK_SIZE)
+ifneq ($(strip $(RETRIEVAL_CANDIDATES)),)
+RETRIEVAL_CANDIDATE_ARGS += --candidate-input $(RETRIEVAL_CANDIDATES)
 endif
 SCHEDULER_ARGS = --scheduler $(SCHEDULER) --min-lr-ratio $(MIN_LR_RATIO)
 ifneq ($(filter $(strip $(SCHEDULER)),cosine constant exponential),)
@@ -192,12 +233,24 @@ ifeq ($(strip $(SCHEDULER)),plateau)
 SCHEDULER_ARGS += --plateau-factor $(PLATEAU_FACTOR) --plateau-patience $(PLATEAU_PATIENCE)
 endif
 OPTIM_ARGS = --learning-rate $(LR) --weight-decay $(WEIGHT_DECAY) $(SCHEDULER_ARGS)
+TUNE_ARGS = --validation-tune --tune-metric $(TUNE_METRIC) --tune-trials $(TUNE_TRIALS) --tune-epochs $(TUNE_EPOCHS) --tune-lrs $(TUNE_LRS) --tune-dropouts $(TUNE_DROPOUTS) --tune-weight-decays $(TUNE_WEIGHT_DECAYS) --tune-swa-start-epochs $(TUNE_SWA_START_EPOCHS) --tune-swa-lrs $(TUNE_SWA_LRS)
+ifneq ($(strip $(TUNE_SEED)),)
+TUNE_ARGS += --tune-seed $(TUNE_SEED)
+endif
+ifneq ($(strip $(TUNE_OUTPUT_DIR)),)
+TUNE_ARGS += --tune-output-dir $(TUNE_OUTPUT_DIR)
+endif
+ifeq ($(strip $(TUNE_KEEP_TRIALS)),1)
+TUNE_ARGS += --tune-keep-trials
+else
+TUNE_ARGS += --no-tune-keep-trials
+endif
 ROW_LIMIT_ARGS =
 ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-cache train train-finetune train-delta eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-cache train train-finetune train-delta train-valopt eval retrieval-eval oracle predict test lint format clean
 
 help:
 	@printf '%s\n' \
@@ -209,7 +262,9 @@ help:
 		'  make train INPUT=...     Train spectrum model using FINE_TUNE_STRATEGY' \
 		'  make train-finetune      Same as train, with explicit fine-tune target name' \
 		'  make train-delta         Continue DELTA_INIT_MODEL with delta fine-tuning' \
+		'  make train-valopt        Tune validation hyperparameters from VALOPT_INIT_MODEL' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
+		'  make retrieval-eval     Rank candidate molecules and report Hit@k' \
 		'  make oracle              Compute fragment-support oracle diagnostics' \
 		'  make predict             Predict spectra for PREDICT_INPUT' \
 		'  make test                Run smoke tests' \
@@ -221,12 +276,19 @@ help:
 		'  INIT_MODEL=$(INIT_MODEL)' \
 		'  DELTA_INIT_MODEL=$(DELTA_INIT_MODEL)' \
 		'  DELTA_MODEL=$(DELTA_MODEL)' \
+		'  VALOPT_INIT_MODEL=$(VALOPT_INIT_MODEL)' \
+		'  VALOPT_MODEL=$(VALOPT_MODEL)' \
 		'  DISK_CACHE_DIR=$(DISK_CACHE_DIR)' \
 		'  CACHE_SOURCE_MODEL=$(CACHE_SOURCE_MODEL)' \
 		'  CACHE_SPLITS=$(CACHE_SPLITS)' \
 		'  CACHE_NUM_WORKERS=$(CACHE_NUM_WORKERS)' \
 		'  CACHE_CHUNK_SIZE=$(CACHE_CHUNK_SIZE)' \
 		'  ORACLE_CHUNK_SIZE=$(ORACLE_CHUNK_SIZE)' \
+		'  RETRIEVAL_OUTPUT=$(RETRIEVAL_OUTPUT)' \
+		'  RETRIEVAL_CANDIDATES=$(RETRIEVAL_CANDIDATES)' \
+		'  RETRIEVAL_CANDIDATE_MODE=$(RETRIEVAL_CANDIDATE_MODE)' \
+		'  RETRIEVAL_MAX_CANDIDATES=$(RETRIEVAL_MAX_CANDIDATES)' \
+		'  RETRIEVAL_HIT_KS=$(RETRIEVAL_HIT_KS)' \
 		'  ENCODER=$(ENCODER)' \
 		'  CHECKPOINT_ENCODER=$(CHECKPOINT_ENCODER)' \
 		'  FOUNDATION_SOURCE=$(FOUNDATION_SOURCE)' \
@@ -265,6 +327,14 @@ help:
 		'  OVERRIDE_FRAGMENT_CONFIG=$(OVERRIDE_FRAGMENT_CONFIG)' \
 		'  FINE_TUNE_STRATEGY=$(FINE_TUNE_STRATEGY)' \
 		'  CHECKPOINT_METRIC=$(CHECKPOINT_METRIC)' \
+		'  TUNE_METRIC=$(TUNE_METRIC)' \
+		'  TUNE_TRIALS=$(TUNE_TRIALS)' \
+		'  TUNE_EPOCHS=$(TUNE_EPOCHS)' \
+		'  VALOPT_LOSS=$(VALOPT_LOSS)' \
+		'  VALOPT_TARGET_POWER=$(VALOPT_TARGET_POWER)' \
+		'  VALOPT_ENTROPY_WEIGHT=$(VALOPT_ENTROPY_WEIGHT)' \
+		'  VALOPT_LR=$(VALOPT_LR)' \
+		'  VALOPT_WEIGHT_DECAY=$(VALOPT_WEIGHT_DECAY)' \
 		'  PROGRESS=$(PROGRESS)'
 
 install:
@@ -336,6 +406,29 @@ train-finetune:
 train-delta:
 	$(MAKE) train-finetune MODEL=$(DELTA_MODEL) INIT_MODEL=$(DELTA_INIT_MODEL) FINE_TUNE_STRATEGY=delta
 
+train-valopt: CHECKPOINT_METRIC = $(TUNE_METRIC)
+train-valopt: LR = $(VALOPT_LR)
+train-valopt: WEIGHT_DECAY = $(VALOPT_WEIGHT_DECAY)
+train-valopt:
+	mkdir -p $(dir $(VALOPT_MODEL))
+	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.train \
+		--input $(INPUT) \
+		--output $(VALOPT_MODEL) \
+		--init-checkpoint $(VALOPT_INIT_MODEL) \
+		$(COMMON_ARGS) \
+		$(LOADER_DEBUG_ARGS) \
+		$(CHECKPOINT_HEAD_ARGS) \
+		$(CACHE_ARGS) \
+		$(ROW_LIMIT_ARGS) \
+		--epochs $(EPOCHS) \
+		$(VALOPT_LOSS_ARGS) \
+		$(OPTIM_ARGS) \
+		$(TUNE_ARGS) \
+		--train-split $(TRAIN_SPLIT) \
+		--val-split $(VAL_SPLIT) \
+		--split-col $(SPLIT_COL) \
+		$(FINE_TUNE_ARGS)
+
 eval:
 	mkdir -p $(dir $(PREDICTIONS))
 	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.eval \
@@ -345,6 +438,19 @@ eval:
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
+		$(ROW_LIMIT_ARGS) \
+		--split $(EVAL_SPLIT) \
+		--split-col $(SPLIT_COL)
+
+retrieval-eval:
+	mkdir -p $(dir $(RETRIEVAL_OUTPUT))
+	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.retrieval_eval \
+		--input $(INPUT) \
+		--model $(MODEL) \
+		--output $(RETRIEVAL_OUTPUT) \
+		$(COMMON_ARGS) \
+		$(CACHE_ARGS) \
+		$(RETRIEVAL_CANDIDATE_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)

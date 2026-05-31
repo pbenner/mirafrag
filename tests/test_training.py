@@ -199,6 +199,34 @@ def test_validation_tune_candidates_are_limited_and_include_baseline():
     assert all(candidate.swa_start_epoch != 8 for candidate in candidates)
 
 
+def test_validation_tune_candidates_do_not_increase_lr_for_swa():
+    args = SimpleNamespace(
+        learning_rate=1e-5,
+        dropout=0.0,
+        weight_decay=0.0,
+        swa=False,
+        swa_start_epoch=None,
+        swa_lr=None,
+        swa_anneal_epochs=1,
+        tune_trials=20,
+        tune_epochs=4,
+        tune_lrs='1e-5,3e-5',
+        tune_dropouts='0',
+        tune_weight_decays='0',
+        tune_swa_start_epochs='2',
+        tune_swa_lrs='1e-5,1e-4',
+        tune_seed=3,
+        seed=17,
+    )
+
+    candidates = _validation_tune_candidates(args)
+
+    assert all(
+        (not candidate.swa) or candidate.swa_lr <= candidate.lr
+        for candidate in candidates
+    )
+
+
 def test_set_head_dropout_only_updates_head_dropout_modules():
     metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
     model = MiraFragModel(
@@ -292,6 +320,83 @@ def test_train_model_materializes_lazy_head(tmp_path, monkeypatch):
     assert payload['mirafrag_config']['encoder_finetune_strategy'] == 'head'
     batch = next(iter(loader))
     assert loaded(batch)['logits'].ndim == 1
+
+
+def test_train_model_can_print_verbose_epoch_config(tmp_path, capsys):
+    df = _tiny_training_df()
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    loader = _tiny_loader(df, graph_config, metadata)
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=32,
+            hidden_dim=8,
+            metadata_dim=4,
+            dropout=0.02,
+            encoder_finetune_strategy='full',
+        ),
+    )
+
+    train_model(
+        model,
+        loader,
+        None,
+        epochs=1,
+        lr=1e-3,
+        weight_decay=1e-6,
+        device='cpu',
+        output=tmp_path / 'mirafrag_verbose.pt',
+        show_progress=False,
+        verbose_epoch_config=True,
+        swa=True,
+        swa_start_epoch=1,
+        swa_lr=3e-5,
+    )
+
+    output = capsys.readouterr().out
+    assert 'epoch_config epoch=1/1' in output
+    assert 'dropout=0.02' in output
+    assert 'weight_decay=head=0.00e+00,encoder=1.00e-06' in output
+    assert 'swa=True' in output
+    assert 'swa_active=True' in output
+    assert 'swa_lr=3e-05' in output
+
+
+def test_train_model_swa_handles_integer_encoder_buffers(tmp_path):
+    df = _tiny_training_df()
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    loader = _tiny_loader(df, graph_config, metadata)
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=32,
+            hidden_dim=8,
+            metadata_dim=4,
+            dropout=0.0,
+        ),
+    )
+
+    history = train_model(
+        model,
+        loader,
+        loader,
+        epochs=2,
+        lr=0.0,
+        weight_decay=0.0,
+        device='cpu',
+        output=tmp_path / 'mirafrag_swa_integer_buffers.pt',
+        show_progress=False,
+        scheduler_name='none',
+        checkpoint_metric='val_cosine',
+        swa=True,
+        swa_start_epoch=1,
+    )
+
+    assert history['swa_n_averaged'] == [1.0, 2.0]
 
 
 def test_train_model_can_save_swa_checkpoint_by_val_cosine(tmp_path):

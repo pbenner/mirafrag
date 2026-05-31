@@ -227,7 +227,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--loss',
         choices=LOSS_NAMES,
-        default='kl',
+        default='decoupled_kl',
     )
     parser.add_argument(
         '--kl-weight',
@@ -691,6 +691,7 @@ def main() -> None:
         target_power=args.target_power,
         entropy_weight=args.entropy_weight,
         checkpoint_metric=args.checkpoint_metric,
+        verbose_epoch_config=False,
         swa=args.swa,
         swa_start_epoch=args.swa_start_epoch,
         swa_lr=args.swa_lr,
@@ -792,6 +793,7 @@ def _run_validation_tuning(
             target_power=args.target_power,
             entropy_weight=args.entropy_weight,
             checkpoint_metric=args.tune_metric,
+            verbose_epoch_config=True,
             swa=candidate.swa,
             swa_start_epoch=candidate.swa_start_epoch,
             swa_lr=candidate.swa_lr,
@@ -911,6 +913,7 @@ def _validation_tune_candidates(
             swa_start_epochs,
             swa_lrs,
         )
+        if swa_lr <= lr
     )
     candidates = _deduplicate_candidates([baseline, *candidates])
     rng = random.Random(args.tune_seed if args.tune_seed is not None else args.seed)

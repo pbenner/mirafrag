@@ -217,7 +217,7 @@ mirafrag-train \
   --foundation-source off \
   --foundation-model medium \
   --fine-tune-strategy full \
-  --loss kl \
+  --loss decoupled_kl \
   --epochs 20 \
   --batch-size 8
 ```

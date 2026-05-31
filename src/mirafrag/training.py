@@ -168,6 +168,7 @@ def train_model(
     target_power: float = 1.0,
     entropy_weight: float = 0.0,
     checkpoint_metric: str = 'val_loss',
+    verbose_epoch_config: bool = False,
     swa: bool = False,
     swa_start_epoch: int | None = None,
     swa_lr: float | None = None,
@@ -222,7 +223,9 @@ def train_model(
         )
         if resolved_swa_start_epoch < 1 or resolved_swa_start_epoch > epochs:
             raise ValueError('swa_start_epoch must be between 1 and epochs.')
-        swa_model = AveragedModel(model, device=device, use_buffers=True)
+        # Only average parameters: encoder metadata buffers include integer tensors
+        # such as atomic numbers, which PyTorch SWA cannot average.
+        swa_model = AveragedModel(model, device=device, use_buffers=False)
         if swa_lr is not None:
             if swa_lr <= 0:
                 raise ValueError('swa_lr must be positive when set.')
@@ -321,6 +324,22 @@ def train_model(
         batch_scheduler = scheduler if scheduler_name != 'plateau' else None
         if in_swa_phase and swa_scheduler is not None:
             batch_scheduler = None
+        if verbose_epoch_config:
+            _print_epoch_config(
+                epoch=epoch,
+                epochs=epochs,
+                lr=epoch_lr,
+                weight_decay=_optimizer_weight_decay_summary(optimizer),
+                dropout=_model_dropout(model),
+                swa=bool(swa),
+                in_swa_phase=in_swa_phase,
+                swa_start_epoch=resolved_swa_start_epoch,
+                swa_lr=swa_lr,
+                swa_anneal_epochs=max(1, int(swa_anneal_epochs)),
+                swa_n_averaged=_swa_n_averaged(swa_model)
+                if swa_model is not None
+                else 0,
+            )
         train_stats = run_epoch(
             model,
             train_loader,
@@ -551,6 +570,62 @@ def _checkpoint_train_config(
     if swa_n_averaged is not None:
         config['swa_n_averaged'] = int(swa_n_averaged)
     return config
+
+
+def _print_epoch_config(
+    *,
+    epoch: int,
+    epochs: int,
+    lr: float,
+    weight_decay: str,
+    dropout: float,
+    swa: bool,
+    in_swa_phase: bool,
+    swa_start_epoch: int | None,
+    swa_lr: float | None,
+    swa_anneal_epochs: int,
+    swa_n_averaged: int,
+) -> None:
+    """
+    Print per-epoch hyperparameter context for validation tuning runs.
+    """
+    print(
+        f'epoch_config epoch={epoch}/{epochs} '
+        f'lr={lr:.2e} '
+        f'weight_decay={weight_decay} '
+        f'dropout={dropout:g} '
+        f'swa={swa} '
+        f'swa_active={in_swa_phase} '
+        f'swa_start={swa_start_epoch if swa_start_epoch is not None else "n/a"} '
+        f'swa_lr={swa_lr if swa_lr is not None else "scheduler"} '
+        f'swa_anneal_epochs={swa_anneal_epochs} '
+        f'swa_n_averaged={swa_n_averaged}'
+    )
+
+
+def _optimizer_weight_decay_summary(optimizer: torch.optim.Optimizer) -> str:
+    """
+    Return a compact per-parameter-group weight-decay summary.
+    """
+    parts = []
+    for index, group in enumerate(optimizer.param_groups):
+        name = str(group.get('name', f'group{index}'))
+        weight_decay = float(group.get('weight_decay', 0.0))
+        parts.append(f'{name}={weight_decay:.2e}')
+    return ','.join(parts)
+
+
+def _model_dropout(model: torch.nn.Module) -> float:
+    """
+    Return the configured MiraFrag head dropout value for epoch logging.
+    """
+    config = getattr(model, 'config', None)
+    if config is not None and hasattr(config, 'dropout'):
+        return float(config.dropout)
+    dropouts = [
+        module.p for module in model.modules() if isinstance(module, torch.nn.Dropout)
+    ]
+    return float(dropouts[0]) if dropouts else 0.0
 
 
 def _swa_n_averaged(swa_model: AveragedModel) -> int:
