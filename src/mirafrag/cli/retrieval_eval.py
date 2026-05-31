@@ -311,15 +311,44 @@ def _score_candidate_rows(
         include_fragments=True,
         fragment_config=fragment_config,
     )
+    num_candidate_rows = len(candidate_rows)
+    score_positions = list(range(num_candidate_rows))
     if disk_cache_dir is not None and prefill_cache:
-        prefill_feature_cache(
+        failures = prefill_feature_cache(
             dataset,
             split_name=f'retrieval {split_name}',
             chunk_size=cache_chunk_size,
             num_workers=cache_num_workers,
             show_progress=show_progress,
             print_ready=False,
+            ignore_errors=True,
         )
+        if failures:
+            failed_positions = {idx for idx, _error in failures}
+            tqdm.write(
+                f'retrieval {split_name}: assigning -inf to '
+                f'{len(failures)}/{len(candidate_rows)} unscoreable candidates'
+            )
+            for idx, error in failures[:3]:
+                tqdm.write(f'  example idx={idx}: {_shorten_error(error)}')
+            score_positions = [
+                idx for idx in score_positions if idx not in failed_positions
+            ]
+            if not score_positions:
+                return [float('-inf')] * num_candidate_rows
+            candidate_rows = candidate_rows.iloc[score_positions].reset_index(drop=True)
+            dataset = BinnedSpectrumDataset(
+                candidate_rows,
+                graph_config=graph_config,
+                metadata_config=model.metadata_config,
+                mz_max=mz_max,
+                bin_width=bin_width,
+                require_spectrum=True,
+                memory_cache=memory_cache,
+                disk_cache_dir=disk_cache_dir,
+                include_fragments=True,
+                fragment_config=fragment_config,
+            )
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -333,7 +362,7 @@ def _score_candidate_rows(
     )
     model.to(device)
     model.eval()
-    scores: list[float] = []
+    scored_values: list[float] = []
     progress = tqdm(
         loader,
         desc='retrieval score',
@@ -351,8 +380,23 @@ def _score_candidate_rows(
             probability_mode=probability_mode,
             score=score,
         )
-        scores.extend(float(value) for value in values.detach().cpu())
+        scored_values.extend(float(value) for value in values.detach().cpu())
+    scores = [float('-inf')] * num_candidate_rows
+    if len(scored_values) != len(score_positions):
+        raise RuntimeError('Retrieval scoring produced an unexpected number of scores.')
+    for position, value in zip(score_positions, scored_values, strict=True):
+        scores[position] = value
     return scores
+
+
+def _shorten_error(error: str, *, max_length: int = 180) -> str:
+    """
+    Return a one-line, tqdm-friendly error summary.
+    """
+    text = ' '.join(str(error).split())
+    if len(text) <= max_length:
+        return text
+    return f'{text[: max_length - 3]}...'
 
 
 def _retrieval_score(
