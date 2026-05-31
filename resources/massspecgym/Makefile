@@ -22,14 +22,18 @@ PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
 ORACLE_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_oracle.csv
 RETRIEVAL_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_retrieval.csv
-RETRIEVAL_CANDIDATES ?=
+RETRIEVAL_CANDIDATE_KIND ?= formula
+RETRIEVAL_FORMULA_CANDIDATES ?= $(RESOURCE_DIR)/data/molecules/MassSpecGym_retrieval_candidates_formula.json
+RETRIEVAL_MASS_CANDIDATES ?= $(RESOURCE_DIR)/data/molecules/MassSpecGym_retrieval_candidates_mass.json
+RETRIEVAL_OFFICIAL_CANDIDATES ?= $(RESOURCE_DIR)/data/molecules/MassSpecGym_retrieval_candidates_$(RETRIEVAL_CANDIDATE_KIND).json
+RETRIEVAL_CANDIDATES ?= $(RETRIEVAL_OFFICIAL_CANDIDATES)
 DISK_CACHE_DIR ?= $(RESOURCE_DIR)/data/cache/mirafrag_features
 CACHE_SOURCE_MODEL ?=
 CACHE_SPLITS ?= train val test
 CACHE_NUM_WORKERS ?= $(shell nproc)
 CACHE_CHUNK_SIZE ?= 1
 ORACLE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
-RETRIEVAL_CANDIDATE_MODE ?= auto
+RETRIEVAL_CANDIDATE_MODE ?= explicit
 RETRIEVAL_MAX_CANDIDATES ?= 256
 RETRIEVAL_QUERY_CHUNK_SIZE ?= 64
 RETRIEVAL_HIT_KS ?= 1,5,10,20
@@ -219,10 +223,7 @@ EVAL_DIAGNOSTIC_ARGS += --relative-mass-tolerance
 else
 EVAL_DIAGNOSTIC_ARGS += --no-relative-mass-tolerance
 endif
-RETRIEVAL_CANDIDATE_ARGS = --candidate-mode $(RETRIEVAL_CANDIDATE_MODE) --max-candidates $(RETRIEVAL_MAX_CANDIDATES) --query-chunk-size $(RETRIEVAL_QUERY_CHUNK_SIZE) --hit-ks $(RETRIEVAL_HIT_KS) --score $(RETRIEVAL_SCORE) --mass-candidate-tolerance $(RETRIEVAL_MASS_TOLERANCE) --cache-chunk-size $(RETRIEVAL_CACHE_CHUNK_SIZE) --score-num-workers $(RETRIEVAL_SCORE_NUM_WORKERS)
-ifneq ($(strip $(RETRIEVAL_CANDIDATES)),)
-RETRIEVAL_CANDIDATE_ARGS += --candidate-input $(RETRIEVAL_CANDIDATES)
-endif
+RETRIEVAL_CANDIDATE_ARGS = --candidate-mode $(RETRIEVAL_CANDIDATE_MODE) --max-candidates $(RETRIEVAL_MAX_CANDIDATES) --query-chunk-size $(RETRIEVAL_QUERY_CHUNK_SIZE) --hit-ks $(RETRIEVAL_HIT_KS) --score $(RETRIEVAL_SCORE) --mass-candidate-tolerance $(RETRIEVAL_MASS_TOLERANCE) --cache-chunk-size $(RETRIEVAL_CACHE_CHUNK_SIZE) --score-num-workers $(RETRIEVAL_SCORE_NUM_WORKERS) $(if $(strip $(RETRIEVAL_CANDIDATES)),--candidate-input $(RETRIEVAL_CANDIDATES),)
 SCHEDULER_ARGS = --scheduler $(SCHEDULER) --min-lr-ratio $(MIN_LR_RATIO)
 ifneq ($(filter $(strip $(SCHEDULER)),cosine constant exponential),)
 SCHEDULER_ARGS += --scheduler-interval $(SCHEDULER_INTERVAL)
@@ -251,7 +252,7 @@ ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-cache train train-finetune train-delta train-valopt eval retrieval-eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-finetune train-delta train-valopt eval retrieval-eval oracle predict test lint format clean
 
 help:
 	@printf '%s\n' \
@@ -259,13 +260,14 @@ help:
 		'  make install             Sync the default uv environment' \
 		'  make install-dev         Sync uv environment with dev tools' \
 		'  make prepare-data        Download MassSpecGym TSV from Hugging Face' \
+		'  make prepare-retrieval-candidates Download official retrieval candidates' \
 		'  make prepare-cache       Precompute graph/fragment feature cache' \
 		'  make train INPUT=...     Train spectrum model using FINE_TUNE_STRATEGY' \
 		'  make train-finetune      Same as train, with explicit fine-tune target name' \
 		'  make train-delta         Continue DELTA_INIT_MODEL with delta fine-tuning' \
 		'  make train-valopt        Tune validation hyperparameters from VALOPT_INIT_MODEL' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
-		'  make retrieval-eval     Rank candidate molecules and report Hit@k' \
+		'  make retrieval-eval     Rank official MassSpecGym candidates and report Hit@k' \
 		'  make oracle              Compute fragment-support oracle diagnostics' \
 		'  make predict             Predict spectra for PREDICT_INPUT' \
 		'  make test                Run smoke tests' \
@@ -287,6 +289,8 @@ help:
 		'  ORACLE_CHUNK_SIZE=$(ORACLE_CHUNK_SIZE)' \
 		'  RETRIEVAL_OUTPUT=$(RETRIEVAL_OUTPUT)' \
 		'  RETRIEVAL_CANDIDATES=$(RETRIEVAL_CANDIDATES)' \
+		'  RETRIEVAL_CANDIDATE_KIND=$(RETRIEVAL_CANDIDATE_KIND)' \
+		'  RETRIEVAL_OFFICIAL_CANDIDATES=$(RETRIEVAL_OFFICIAL_CANDIDATES)' \
 		'  RETRIEVAL_CANDIDATE_MODE=$(RETRIEVAL_CANDIDATE_MODE)' \
 		'  RETRIEVAL_MAX_CANDIDATES=$(RETRIEVAL_MAX_CANDIDATES)' \
 		'  RETRIEVAL_HIT_KS=$(RETRIEVAL_HIT_KS)' \
@@ -351,6 +355,12 @@ install-data-deps:
 prepare-data: install-data-deps
 	mkdir -p $(DATASET_LOCAL_DIR)/$(dir $(DATASET_FILE))
 	$(UV) run --no-project --with huggingface_hub --with hf_xet python -c "from huggingface_hub import hf_hub_download; path = hf_hub_download(repo_id='$(DATASET_REPO)', filename='$(DATASET_FILE)', repo_type='dataset', revision='$(DATASET_REVISION)', local_dir='$(DATASET_LOCAL_DIR)'); print(path)"
+
+$(RESOURCE_DIR)/data/molecules/MassSpecGym_retrieval_candidates_%.json: install-data-deps
+	mkdir -p $(dir $@)
+	$(UV) run --no-project --with huggingface_hub --with hf_xet python -c "from huggingface_hub import hf_hub_download; path = hf_hub_download(repo_id='$(DATASET_REPO)', filename='data/molecules/MassSpecGym_retrieval_candidates_$*.json', repo_type='dataset', revision='$(DATASET_REVISION)', local_dir='$(DATASET_LOCAL_DIR)'); print(path)"
+
+prepare-retrieval-candidates: $(RETRIEVAL_FORMULA_CANDIDATES) $(RETRIEVAL_MASS_CANDIDATES)
 
 prepare-cache:
 	mkdir -p $(DISK_CACHE_DIR)
@@ -444,7 +454,7 @@ eval:
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
 
-retrieval-eval:
+retrieval-eval: $(RETRIEVAL_CANDIDATES)
 	mkdir -p $(dir $(RETRIEVAL_OUTPUT))
 	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.retrieval_eval \
 		--input $(INPUT) \

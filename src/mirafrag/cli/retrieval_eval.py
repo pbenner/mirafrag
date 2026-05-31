@@ -29,6 +29,7 @@ from mirafrag.losses import (
 from mirafrag.retrieval import (
     build_retrieval_candidate_rows,
     parse_hit_ks,
+    read_retrieval_candidate_table,
     resolve_candidate_mode,
     summarize_retrieval_hits,
 )
@@ -49,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--candidate-input',
         default=None,
-        help='Optional explicit candidate table with query_identifier and SMILES.',
+        help='Optional explicit candidate table or MassSpecGym retrieval JSON.',
     )
     parser.add_argument(
         '--candidate-mode',
@@ -158,7 +159,7 @@ def main() -> None:
         raise SystemExit('No query rows left after encoder element filtering.')
 
     if args.candidate_input:
-        candidate_pool = read_table(args.candidate_input)
+        candidate_pool = read_retrieval_candidate_table(args.candidate_input)
     else:
         candidate_pool = full_df
     if candidate_mode != 'explicit':

@@ -9,6 +9,7 @@ from mirafrag.retrieval import (
     build_retrieval_candidate_rows,
     parse_hit_ks,
     resolve_candidate_mode,
+    retrieval_candidate_table_from_json,
     summarize_retrieval_hits,
 )
 
@@ -63,6 +64,21 @@ def test_build_formula_candidate_rows_marks_true_candidate():
     assert set(rows[RETRIEVAL_QUERY_ID]) == {'q1'}
     assert rows[RETRIEVAL_IS_TRUE].sum() == 1
     assert rows.loc[rows[RETRIEVAL_IS_TRUE], 'smiles'].iloc[0] == 'CCO'
+
+
+def test_massspecgym_json_candidate_rows_group_by_query_smiles():
+    queries = _query_df().iloc[:1]
+    candidates = retrieval_candidate_table_from_json({'CCO': ['CO', 'CCO']})
+
+    rows = build_retrieval_candidate_rows(
+        queries,
+        candidates,
+        mode='explicit',
+        max_candidates=8,
+    )
+
+    assert rows['smiles'].tolist() == ['CO', 'CCO']
+    assert rows[RETRIEVAL_IS_TRUE].tolist() == [False, True]
 
 
 def test_build_explicit_candidate_rows_uses_candidate_smiles_and_label():

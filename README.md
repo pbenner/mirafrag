@@ -172,9 +172,12 @@ data, checkpoints, predictions, and feature cache under `resources/massspecgym/`
 
 Use `make -C resources/massspecgym prepare-data` to download the MassSpecGym TSV
 into `resources/massspecgym/data/`. Use `make -C resources/massspecgym
-prepare-cache` to precompute graph and fragment caches before training or
-evaluation; the MassSpecGym `train`, `eval`, and `predict` targets pass the
-same disk cache directory by default. Disk caching is controlled by
+prepare-retrieval-candidates` to download the official MassSpecGym formula and
+mass retrieval candidate JSON files into `resources/massspecgym/data/molecules/`.
+Use `make -C resources/massspecgym prepare-cache` to precompute graph and
+fragment caches before training or evaluation; the MassSpecGym `train`, `eval`,
+and `predict` targets pass the same disk cache directory by default. Disk
+caching is controlled by
 `DISK_CACHE_DIR` / `--disk-cache-dir`; per-worker in-memory reuse is controlled
 by `MEMORY_CACHE` / `--memory-cache`. `DISK_CACHE_DIR` is a shared cache root:
 fragment candidates live under `fragments/` and are reused across encoders when
@@ -233,6 +236,22 @@ mirafrag-eval \
   --model resources/massspecgym/checkpoints/mirafrag.pt \
   --split test \
   --output resources/massspecgym/predictions/massspecgym_test_predictions.csv
+```
+
+## Retrieval
+
+The MassSpecGym resource workflow evaluates retrieval against the official
+MassSpecGym candidate JSON files. By default `retrieval-eval` uses the formula
+candidate set; pass `RETRIEVAL_CANDIDATE_KIND=mass` to use the mass candidate
+set instead. The target downloads the selected candidate file automatically if
+it is missing.
+
+```bash
+make -C resources/massspecgym retrieval-eval \
+  MODEL=checkpoints/mirafrag_aimnet_path.pt
+make -C resources/massspecgym retrieval-eval \
+  MODEL=checkpoints/mirafrag_aimnet_path.pt \
+  RETRIEVAL_CANDIDATE_KIND=mass
 ```
 
 ## Predict

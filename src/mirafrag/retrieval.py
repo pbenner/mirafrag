@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -13,6 +15,11 @@ INCHIKEY_ALIASES = ('inchikey', 'InChIKey', 'INCHIKEY')
 FORMULA_ALIASES = ('formula', 'molecular_formula', 'Formula')
 MASS_ALIASES = ('parent_mass', 'exact_mass', 'monoisotopic_mass')
 QUERY_IDENTIFIER_ALIASES = ('query_identifier', 'query_id', 'spectrum_identifier')
+QUERY_SMILES_ALIASES = (
+    'query_smiles',
+    'query_SMILES',
+    'query_molecule_smiles',
+)
 TRUE_ALIASES = ('is_true', 'is_correct', 'label')
 
 RETRIEVAL_QUERY_ID = '_retrieval_query_identifier'
@@ -20,6 +27,47 @@ RETRIEVAL_CANDIDATE_ID = '_retrieval_candidate_identifier'
 RETRIEVAL_CANDIDATE_INDEX = '_retrieval_candidate_index'
 RETRIEVAL_IS_TRUE = '_retrieval_is_true'
 RETRIEVAL_SCORE = 'score'
+
+
+def read_retrieval_candidate_table(path: str | Path) -> pd.DataFrame:
+    """
+    Read an explicit retrieval candidate table.
+
+    MassSpecGym distributes official retrieval candidates as JSON mappings from
+    query SMILES to candidate SMILES lists. Tabular TSV/CSV/JSONL inputs are
+    still accepted through the project table reader.
+    """
+    path = Path(path)
+    if path.suffix.lower() == '.json':
+        with path.open() as handle:
+            return retrieval_candidate_table_from_json(json.load(handle))
+
+    from mirafrag.data import read_table
+
+    return read_table(path)
+
+
+def retrieval_candidate_table_from_json(payload: Any) -> pd.DataFrame:
+    """
+    Convert MassSpecGym-style retrieval candidate JSON into an explicit table.
+
+    Supported layouts include ``{query_smiles: [candidate_smiles, ...]}``,
+    ``{query_smiles: [{'smiles': ...}, ...]}``, and record lists containing
+    query/candidate columns. The returned dataframe has ``query_smiles`` and
+    ``candidate_smiles`` columns so it can be consumed by explicit retrieval.
+    """
+    rows: list[dict[str, Any]] = []
+    if isinstance(payload, dict):
+        for query_smiles, candidates in payload.items():
+            rows.extend(_json_candidate_rows(str(query_smiles), candidates))
+    elif isinstance(payload, list):
+        for entry in payload:
+            rows.extend(_json_record_rows(entry))
+    else:
+        raise ValueError('Retrieval candidate JSON must contain an object or a list.')
+    if not rows:
+        raise ValueError('Retrieval candidate JSON did not contain any candidates.')
+    return pd.DataFrame(rows)
 
 
 def parse_hit_ks(value: str | list[int] | tuple[int, ...]) -> tuple[int, ...]:
@@ -236,7 +284,22 @@ def _build_explicit_candidate_rows(
     query_id_col = find_column(queries, IDENTIFIER_ALIASES, required=False)
     query_smiles_col = find_column(queries, SMILES_ALIASES)
     query_identity_col = _identity_column(queries)
-    candidate_query_col = find_column(candidate_pool, QUERY_IDENTIFIER_ALIASES)
+    candidate_query_id_col = find_column(
+        candidate_pool,
+        QUERY_IDENTIFIER_ALIASES,
+        required=False,
+    )
+    candidate_query_smiles_col = find_column(
+        candidate_pool,
+        QUERY_SMILES_ALIASES,
+        required=False,
+    )
+    if candidate_query_id_col is None and candidate_query_smiles_col is None:
+        raise ValueError(
+            'Explicit retrieval candidates need either a query identifier column '
+            f'{QUERY_IDENTIFIER_ALIASES} or a query SMILES column '
+            f'{QUERY_SMILES_ALIASES}.'
+        )
     candidate_smiles_col = find_column(
         candidate_pool,
         ('candidate_smiles', 'smiles', 'SMILES', 'Smiles'),
@@ -247,11 +310,27 @@ def _build_explicit_candidate_rows(
         required=False,
     )
     explicit_true_col = find_column(candidate_pool, TRUE_ALIASES, required=False)
-    groups = dict(tuple(candidate_pool.groupby(candidate_query_col, sort=False)))
+    if candidate_query_smiles_col is not None:
+        group_col = candidate_query_smiles_col
+
+        def query_group_key(query: pd.Series, _query_position: int) -> str:
+            return str(query.get(query_smiles_col))
+
+    else:
+        group_col = candidate_query_id_col
+
+        def query_group_key(query: pd.Series, query_position: int) -> str:
+            return _query_identifier(query, query_position, query_id_col)
+
+    groups = {
+        str(key): group for key, group in candidate_pool.groupby(group_col, sort=False)
+    }
     rows: list[dict[str, Any]] = []
     for query_position, (_idx, query) in enumerate(queries.iterrows()):
-        query_id = _query_identifier(query, query_position, query_id_col)
-        candidates = groups.get(query_id, candidate_pool.iloc[0:0])
+        candidates = groups.get(
+            query_group_key(query, query_position),
+            candidate_pool.iloc[0:0],
+        )
         rows.extend(
             _candidate_rows_for_query(
                 query,
@@ -269,6 +348,83 @@ def _build_explicit_candidate_rows(
             )
         )
     return pd.DataFrame(rows)
+
+
+def _json_candidate_rows(query_smiles: str, candidates: Any) -> list[dict[str, Any]]:
+    if isinstance(candidates, dict):
+        candidates = _first_present(
+            candidates,
+            ('candidates', 'candidate_smiles', 'smiles', 'molecules'),
+        )
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    if not isinstance(candidates, list):
+        raise ValueError(
+            'Each retrieval candidate JSON entry must map to a candidate list.'
+        )
+    rows = []
+    for candidate in candidates:
+        rows.append(_json_candidate_row(query_smiles, candidate))
+    return rows
+
+
+def _json_record_rows(entry: Any) -> list[dict[str, Any]]:
+    if not isinstance(entry, dict):
+        raise ValueError('Retrieval candidate JSON list entries must be objects.')
+    query_smiles = _first_present(entry, QUERY_SMILES_ALIASES)
+    candidates = _first_present(
+        entry,
+        ('candidates', 'candidate_smiles', 'smiles', 'molecules'),
+    )
+    if query_smiles is not None and isinstance(candidates, list):
+        return _json_candidate_rows(str(query_smiles), candidates)
+    candidate_smiles = _candidate_smiles_from_json(entry)
+    if query_smiles is None or candidate_smiles is None:
+        raise ValueError(
+            'Retrieval candidate JSON records need query_smiles and candidate_smiles.'
+        )
+    row = {
+        'query_smiles': str(query_smiles),
+        'candidate_smiles': str(candidate_smiles),
+    }
+    if 'is_true' in entry:
+        row['is_true'] = entry['is_true']
+    return [row]
+
+
+def _json_candidate_row(query_smiles: str, candidate: Any) -> dict[str, Any]:
+    candidate_smiles = _candidate_smiles_from_json(candidate)
+    if candidate_smiles is None:
+        raise ValueError('Candidate JSON records need a SMILES value.')
+    row = {'query_smiles': query_smiles, 'candidate_smiles': str(candidate_smiles)}
+    if isinstance(candidate, dict):
+        candidate_id = _first_present(
+            candidate,
+            ('candidate_identifier', 'identifier', 'inchikey', 'InChIKey'),
+        )
+        if candidate_id is not None:
+            row['candidate_identifier'] = candidate_id
+        if 'is_true' in candidate:
+            row['is_true'] = candidate['is_true']
+    return row
+
+
+def _candidate_smiles_from_json(value: Any) -> Any:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return _first_present(
+            value,
+            ('candidate_smiles', 'smiles', 'SMILES', 'Smiles'),
+        )
+    return None
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
 
 
 def _candidate_rows_for_query(
