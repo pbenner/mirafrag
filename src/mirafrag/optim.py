@@ -4,6 +4,7 @@ import math
 from typing import Any
 
 import torch
+from torch import nn
 from torch.nn.parameter import UninitializedParameter
 
 from mirafrag.model import MiraFragModel
@@ -12,23 +13,39 @@ from mirafrag.model import MiraFragModel
 def _optimizer_param_groups(
     model: MiraFragModel,
     *,
-    lr: float,
-    weight_decay: float,
+    lr: float | None = None,
+    weight_decay: float | None = None,
+    head_lr: float | None = None,
+    encoder_lr: float | None = None,
+    head_weight_decay: float = 0.0,
+    encoder_weight_decay: float | None = None,
 ) -> list[dict[str, Any]]:
     """
     Build AdamW parameter groups for head and trainable encoder parameters.
 
-    The spectrum head always has zero weight decay. Encoder or delta parameters use the configured weight decay, and uninitialized lazy parameters are skipped until materialized.
+    Learning rates and weight decays can be controlled separately for head and
+    encoder parameters. Weight decay is applied only to decayable weight matrices;
+    biases, normalization parameters, and embeddings stay in no-decay groups.
     """
-    encoder_params = [
-        param
-        for param in model.encoder.parameters()
+    if lr is None and (head_lr is None or encoder_lr is None):
+        raise ValueError('lr is required unless both head_lr and encoder_lr are set.')
+    if head_lr is None:
+        head_lr = float(lr)
+    if encoder_lr is None:
+        encoder_lr = float(lr)
+    if encoder_weight_decay is None:
+        encoder_weight_decay = 0.0 if weight_decay is None else float(weight_decay)
+
+    modules = dict(model.named_modules())
+    encoder_named_params = [
+        (f'encoder.{name}', param)
+        for name, param in model.encoder.named_parameters()
         if param.requires_grad and not _is_uninitialized_parameter(param)
     ]
-    encoder_param_ids = {id(param) for param in encoder_params}
-    head_params = [
-        param
-        for param in model.parameters()
+    encoder_param_ids = {id(param) for _, param in encoder_named_params}
+    head_named_params = [
+        (name, param)
+        for name, param in model.named_parameters()
         if (
             param.requires_grad
             and id(param) not in encoder_param_ids
@@ -37,27 +54,102 @@ def _optimizer_param_groups(
     ]
 
     groups: list[dict[str, Any]] = []
-    if head_params:
-        groups.append(
-            {
-                'params': head_params,
-                'lr': float(lr),
-                'weight_decay': 0.0,
-                'name': 'head',
-            }
-        )
-    if encoder_params:
-        groups.append(
-            {
-                'params': encoder_params,
-                'lr': float(lr),
-                'weight_decay': float(weight_decay),
-                'name': 'encoder',
-            }
-        )
+    _append_decay_split_groups(
+        groups,
+        name='head',
+        named_params=head_named_params,
+        modules=modules,
+        lr=float(head_lr),
+        weight_decay=float(head_weight_decay),
+    )
+    _append_decay_split_groups(
+        groups,
+        name='encoder',
+        named_params=encoder_named_params,
+        modules=modules,
+        lr=float(encoder_lr),
+        weight_decay=float(encoder_weight_decay),
+    )
     if not groups:
         raise ValueError('No trainable parameters found.')
     return groups
+
+
+def _append_decay_split_groups(
+    groups: list[dict[str, Any]],
+    *,
+    name: str,
+    named_params: list[tuple[str, torch.nn.Parameter]],
+    modules: dict[str, nn.Module],
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """
+    Append optimizer groups split into decay and no-decay parameters.
+    """
+    if not named_params:
+        return
+    if lr <= 0.0:
+        raise ValueError(f'{name} learning rate must be positive.')
+    if weight_decay < 0.0:
+        raise ValueError(f'{name} weight_decay must be non-negative.')
+
+    if weight_decay == 0.0:
+        groups.append(
+            {
+                'params': [param for _, param in named_params],
+                'lr': float(lr),
+                'weight_decay': 0.0,
+                'name': name,
+            }
+        )
+        return
+
+    decay_params = [
+        param
+        for param_name, param in named_params
+        if _uses_weight_decay(param_name, param, modules)
+    ]
+    no_decay_params = [
+        param
+        for param_name, param in named_params
+        if not _uses_weight_decay(param_name, param, modules)
+    ]
+    if decay_params:
+        groups.append(
+            {
+                'params': decay_params,
+                'lr': float(lr),
+                'weight_decay': float(weight_decay),
+                'name': f'{name}_decay',
+            }
+        )
+    if no_decay_params:
+        groups.append(
+            {
+                'params': no_decay_params,
+                'lr': float(lr),
+                'weight_decay': 0.0,
+                'name': f'{name}_no_decay',
+            }
+        )
+
+
+def _uses_weight_decay(
+    param_name: str,
+    param: torch.nn.Parameter,
+    modules: dict[str, nn.Module],
+) -> bool:
+    """
+    Return whether AdamW weight decay should apply to a parameter.
+    """
+    if param.ndim < 2 or param_name.endswith('.bias'):
+        return False
+    module_name = param_name.rsplit('.', 1)[0] if '.' in param_name else ''
+    module = modules.get(module_name)
+    if isinstance(module, (nn.Embedding, nn.LayerNorm)):
+        return False
+    return True
 
 
 def _print_optimizer_groups(optimizer: torch.optim.Optimizer) -> None:

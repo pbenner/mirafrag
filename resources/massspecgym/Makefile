@@ -57,7 +57,11 @@ DEVICE ?= auto
 EPOCHS ?= 200
 BATCH_SIZE ?= 48
 LR ?= 1e-3
+HEAD_LR ?=
+ENCODER_LR ?=
 WEIGHT_DECAY ?= 0.0
+HEAD_WEIGHT_DECAY ?= 0.0
+ENCODER_WEIGHT_DECAY ?=
 SCHEDULER ?= exponential
 SCHEDULER_INTERVAL ?= epoch
 MIN_LR_RATIO ?= 0.0001
@@ -102,8 +106,12 @@ TUNE_METRIC ?= val_cosine
 TUNE_TRIALS ?= 12
 TUNE_EPOCHS ?= 12
 TUNE_LRS ?= 1e-5,3e-5,1e-4
+TUNE_HEAD_LRS ?=
+TUNE_ENCODER_LRS ?=
 TUNE_DROPOUTS ?= 0,0.02,0.05
 TUNE_WEIGHT_DECAYS ?= 0,1e-6,1e-5
+TUNE_HEAD_WEIGHT_DECAYS ?= 0
+TUNE_ENCODER_WEIGHT_DECAYS ?=
 TUNE_SWA_START_EPOCHS ?= 3,6
 TUNE_SWA_LRS ?= 1e-5,3e-5,1e-4
 TUNE_SEED ?=
@@ -234,8 +242,26 @@ endif
 ifeq ($(strip $(SCHEDULER)),plateau)
 SCHEDULER_ARGS += --plateau-factor $(PLATEAU_FACTOR) --plateau-patience $(PLATEAU_PATIENCE)
 endif
-OPTIM_ARGS = --learning-rate $(LR) --weight-decay $(WEIGHT_DECAY) $(SCHEDULER_ARGS)
-TUNE_ARGS = --validation-tune --tune-metric $(TUNE_METRIC) --tune-trials $(TUNE_TRIALS) --tune-epochs $(TUNE_EPOCHS) --tune-lrs $(TUNE_LRS) --tune-dropouts $(TUNE_DROPOUTS) --tune-weight-decays $(TUNE_WEIGHT_DECAYS) --tune-swa-start-epochs $(TUNE_SWA_START_EPOCHS) --tune-swa-lrs $(TUNE_SWA_LRS)
+OPTIM_ARGS = --learning-rate $(LR) --weight-decay $(WEIGHT_DECAY) --head-weight-decay $(HEAD_WEIGHT_DECAY) $(SCHEDULER_ARGS)
+ifneq ($(strip $(HEAD_LR)),)
+OPTIM_ARGS += --head-learning-rate $(HEAD_LR)
+endif
+ifneq ($(strip $(ENCODER_LR)),)
+OPTIM_ARGS += --encoder-learning-rate $(ENCODER_LR)
+endif
+ifneq ($(strip $(ENCODER_WEIGHT_DECAY)),)
+OPTIM_ARGS += --encoder-weight-decay $(ENCODER_WEIGHT_DECAY)
+endif
+TUNE_ARGS = --validation-tune --tune-metric $(TUNE_METRIC) --tune-trials $(TUNE_TRIALS) --tune-epochs $(TUNE_EPOCHS) --tune-lrs $(TUNE_LRS) --tune-dropouts $(TUNE_DROPOUTS) --tune-weight-decays $(TUNE_WEIGHT_DECAYS) --tune-head-weight-decays $(TUNE_HEAD_WEIGHT_DECAYS) --tune-swa-start-epochs $(TUNE_SWA_START_EPOCHS) --tune-swa-lrs $(TUNE_SWA_LRS)
+ifneq ($(strip $(TUNE_HEAD_LRS)),)
+TUNE_ARGS += --tune-head-lrs $(TUNE_HEAD_LRS)
+endif
+ifneq ($(strip $(TUNE_ENCODER_LRS)),)
+TUNE_ARGS += --tune-encoder-lrs $(TUNE_ENCODER_LRS)
+endif
+ifneq ($(strip $(TUNE_ENCODER_WEIGHT_DECAYS)),)
+TUNE_ARGS += --tune-encoder-weight-decays $(TUNE_ENCODER_WEIGHT_DECAYS)
+endif
 ifneq ($(strip $(TUNE_SEED)),)
 TUNE_ARGS += --tune-seed $(TUNE_SEED)
 endif
@@ -304,6 +330,11 @@ help:
 		'  EPOCHS=$(EPOCHS)' \
 		'  BATCH_SIZE=$(BATCH_SIZE)' \
 		'  LR=$(LR)' \
+		'  HEAD_LR=$(HEAD_LR)' \
+		'  ENCODER_LR=$(ENCODER_LR)' \
+		'  WEIGHT_DECAY=$(WEIGHT_DECAY)' \
+		'  HEAD_WEIGHT_DECAY=$(HEAD_WEIGHT_DECAY)' \
+		'  ENCODER_WEIGHT_DECAY=$(ENCODER_WEIGHT_DECAY)' \
 		'  SCHEDULER=$(SCHEDULER)' \
 		'  LOSS=$(LOSS)' \
 		'  KL_WEIGHT=$(KL_WEIGHT)' \
@@ -336,6 +367,13 @@ help:
 		'  TUNE_METRIC=$(TUNE_METRIC)' \
 		'  TUNE_TRIALS=$(TUNE_TRIALS)' \
 		'  TUNE_EPOCHS=$(TUNE_EPOCHS)' \
+		'  TUNE_LRS=$(TUNE_LRS)' \
+		'  TUNE_HEAD_LRS=$(TUNE_HEAD_LRS)' \
+		'  TUNE_ENCODER_LRS=$(TUNE_ENCODER_LRS)' \
+		'  TUNE_DROPOUTS=$(TUNE_DROPOUTS)' \
+		'  TUNE_WEIGHT_DECAYS=$(TUNE_WEIGHT_DECAYS)' \
+		'  TUNE_HEAD_WEIGHT_DECAYS=$(TUNE_HEAD_WEIGHT_DECAYS)' \
+		'  TUNE_ENCODER_WEIGHT_DECAYS=$(TUNE_ENCODER_WEIGHT_DECAYS)' \
 		'  VALOPT_LOSS=$(VALOPT_LOSS)' \
 		'  VALOPT_TARGET_POWER=$(VALOPT_TARGET_POWER)' \
 		'  VALOPT_ENTROPY_WEIGHT=$(VALOPT_ENTROPY_WEIGHT)' \

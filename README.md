@@ -23,8 +23,11 @@ instrument-specific collision-energy scaling used when enough train examples are
 available for an instrument.
 
 Training uses AdamW with separate parameter groups for the MiraFrag spectrum head
-and trainable encoder parameters. Both groups use `LR`; weight decay is applied
-only to trainable encoder parameters. Set `SCHEDULER=none` to keep a fixed
+and trainable encoder parameters. `LR` sets both learning rates by default; use
+`HEAD_LR` and `ENCODER_LR` to override them separately. `WEIGHT_DECAY` remains
+the default encoder weight decay, while `HEAD_WEIGHT_DECAY` can regularize the
+head's decayable weight matrices. Biases, normalization parameters, and
+embeddings are excluded from weight decay. Set `SCHEDULER=none` to keep a fixed
 learning rate.
 
 Additional documentation is collected in [docs/README.md](docs/README.md).
@@ -103,9 +106,10 @@ Encoder adaptation is controlled by `FINE_TUNE_STRATEGY`:
 - `delta`: freeze encoder base weights and train additive delta weights
 - `full`: train all encoder weights and the spectrum head
 
-The optimizer uses AdamW with separate parameter groups. The spectrum head uses
-no weight decay; weight decay applies only to trainable encoder or delta
-parameters.
+The optimizer uses AdamW with separate parameter groups for the spectrum head
+and trainable encoder or delta parameters. Learning rates and weight decays can
+be controlled separately; weight decay is applied only to decayable weight
+matrices and not to biases, normalization parameters, or embeddings.
 
 ## Fragmentation
 
@@ -195,17 +199,24 @@ unless you pass `CACHE_SOURCE_MODEL=resources/massspecgym/checkpoints/mirafrag.p
 ## Train
 
 The recommended training entry point is the Makefile. It uses the MassSpecGym
-simulation-challenge filter, `LOSS=kl`, the configured feature cache, and full
-encoder fine-tuning by default:
+simulation-challenge filter, `LOSS=decoupled_kl`, the configured feature cache,
+and full encoder fine-tuning by default:
 
 ```bash
-make -C resources/massspecgym train LOSS=kl LR=1e-5
+make -C resources/massspecgym train ENCODER=aimnet LOSS=decoupled_kl LR=1e-3
 ```
 
-To train with AIMNet instead of MACE:
+To use separate optimizer settings for validation-oriented fine-tuning:
 
 ```bash
-make -C resources/massspecgym train ENCODER=aimnet LOSS=kl LR=1e-5
+make -C resources/massspecgym train \
+  ENCODER=aimnet \
+  LOSS=decoupled_kl \
+  HEAD_LR=1e-3 \
+  ENCODER_LR=1e-4 \
+  HEAD_WEIGHT_DECAY=1e-4 \
+  WEIGHT_DECAY=1e-2 \
+  CHECKPOINT_METRIC=val_cosine
 ```
 
 Direct CLI use is also supported. The direct CLI default is conservative

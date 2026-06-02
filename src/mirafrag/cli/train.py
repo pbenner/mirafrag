@@ -51,9 +51,11 @@ class _ValidationTuneCandidate:
     One validation-tuning trial configuration.
     """
 
-    lr: float
+    head_lr: float
+    encoder_lr: float
     dropout: float
-    weight_decay: float
+    head_weight_decay: float
+    encoder_weight_decay: float
     swa: bool
     swa_start_epoch: int | None
     swa_lr: float | None
@@ -105,13 +107,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument(
+        '--head-learning-rate',
+        type=float,
+        default=None,
+        help='Optional spectrum-head learning rate; defaults to --learning-rate.',
+    )
+    parser.add_argument(
+        '--encoder-learning-rate',
+        type=float,
+        default=None,
+        help='Optional trainable-encoder learning rate; defaults to --learning-rate.',
+    )
+    parser.add_argument(
         '--weight-decay',
         type=float,
         default=1e-5,
         help=(
-            'Weight decay for trainable encoder parameters. In delta mode this '
-            'regularizes only the delta weights; the spectrum head uses no decay.'
+            'Legacy trainable-encoder weight decay. Use --encoder-weight-decay '
+            'to set it explicitly; the spectrum head is controlled separately '
+            'with --head-weight-decay.'
         ),
+    )
+    parser.add_argument(
+        '--head-weight-decay',
+        type=float,
+        default=0.0,
+        help='AdamW weight decay for decayable spectrum-head weight matrices.',
+    )
+    parser.add_argument(
+        '--encoder-weight-decay',
+        type=float,
+        default=None,
+        help='AdamW weight decay for decayable trainable-encoder weight matrices.',
     )
     parser.add_argument(
         '--scheduler',
@@ -386,7 +413,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--tune-lrs',
         default='1e-5,3e-5,1e-4',
-        help='Comma-separated learning rates sampled by --validation-tune.',
+        help=(
+            'Comma-separated learning rates sampled by --validation-tune. Used '
+            'for head and encoder unless their specific tune lists are set.'
+        ),
+    )
+    parser.add_argument(
+        '--tune-head-lrs',
+        default=None,
+        help='Comma-separated head learning rates sampled by --validation-tune.',
+    )
+    parser.add_argument(
+        '--tune-encoder-lrs',
+        default=None,
+        help='Comma-separated encoder learning rates sampled by --validation-tune.',
     )
     parser.add_argument(
         '--tune-dropouts',
@@ -396,7 +436,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--tune-weight-decays',
         default='0,1e-6,1e-5',
-        help='Comma-separated weight decay values sampled by --validation-tune.',
+        help=(
+            'Comma-separated encoder weight decay values sampled by '
+            '--validation-tune unless --tune-encoder-weight-decays is set.'
+        ),
+    )
+    parser.add_argument(
+        '--tune-head-weight-decays',
+        default=None,
+        help='Comma-separated head weight decays sampled by --validation-tune.',
+    )
+    parser.add_argument(
+        '--tune-encoder-weight-decays',
+        default=None,
+        help='Comma-separated encoder weight decays sampled by --validation-tune.',
     )
     parser.add_argument(
         '--tune-swa-start-epochs',
@@ -670,6 +723,10 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         device=device,
+        head_lr=args.head_learning_rate,
+        encoder_lr=args.encoder_learning_rate,
+        head_weight_decay=args.head_weight_decay,
+        encoder_weight_decay=args.encoder_weight_decay,
         output=args.output,
         loss_name=args.loss,
         train_config=_train_config(args, fine_tune_strategy=fine_tune_strategy),
@@ -766,8 +823,11 @@ def _run_validation_tuning(
         print(
             'validation tuning trial '
             f'{trial_index}/{len(candidates)} '
-            f'lr={candidate.lr:.2e} dropout={candidate.dropout:g} '
-            f'weight_decay={candidate.weight_decay:.2e} '
+            f'head_lr={candidate.head_lr:.2e} '
+            f'encoder_lr={candidate.encoder_lr:.2e} '
+            f'dropout={candidate.dropout:g} '
+            f'head_weight_decay={candidate.head_weight_decay:.2e} '
+            f'encoder_weight_decay={candidate.encoder_weight_decay:.2e} '
             f'swa={candidate.swa} '
             f'swa_start={candidate.swa_start_epoch} '
             f'swa_lr={candidate.swa_lr}'
@@ -794,9 +854,13 @@ def _run_validation_tuning(
             train_loader,
             val_loader,
             epochs=args.tune_epochs,
-            lr=candidate.lr,
-            weight_decay=candidate.weight_decay,
+            lr=candidate.head_lr,
+            weight_decay=candidate.encoder_weight_decay,
             device=device,
+            head_lr=candidate.head_lr,
+            encoder_lr=candidate.encoder_lr,
+            head_weight_decay=candidate.head_weight_decay,
+            encoder_weight_decay=candidate.encoder_weight_decay,
             output=trial_output,
             loss_name=args.loss,
             train_config=trial_train_config,
@@ -923,11 +987,26 @@ def _validation_tune_candidates(
     if args.tune_trials < 1:
         raise SystemExit('--tune-trials must be positive.')
     tune_epochs = int(args.tune_epochs)
-    lrs = _parse_positive_float_list(args.tune_lrs, name='--tune-lrs')
+    head_lrs = _parse_positive_float_list(
+        args.tune_head_lrs or args.tune_lrs,
+        name='--tune-head-lrs' if args.tune_head_lrs else '--tune-lrs',
+    )
+    encoder_lrs = _parse_positive_float_list(
+        args.tune_encoder_lrs or args.tune_lrs,
+        name='--tune-encoder-lrs' if args.tune_encoder_lrs else '--tune-lrs',
+    )
     dropouts = _parse_dropout_list(args.tune_dropouts)
-    weight_decays = _parse_nonnegative_float_list(
-        args.tune_weight_decays,
-        name='--tune-weight-decays',
+    head_weight_decays = _parse_nonnegative_float_list(
+        args.tune_head_weight_decays or '0',
+        name='--tune-head-weight-decays',
+    )
+    encoder_weight_decays = _parse_nonnegative_float_list(
+        args.tune_encoder_weight_decays or args.tune_weight_decays,
+        name=(
+            '--tune-encoder-weight-decays'
+            if args.tune_encoder_weight_decays
+            else '--tune-weight-decays'
+        ),
     )
     swa_start_epochs = [
         epoch
@@ -940,36 +1019,63 @@ def _validation_tune_candidates(
     swa_lrs = _parse_positive_float_list(args.tune_swa_lrs, name='--tune-swa-lrs')
     anneal_epochs = max(1, int(args.swa_anneal_epochs))
 
+    base_products = itertools.product(
+        head_lrs,
+        encoder_lrs,
+        dropouts,
+        head_weight_decays,
+        encoder_weight_decays,
+    )
     candidates = [
         _ValidationTuneCandidate(
-            lr=lr,
+            head_lr=head_lr,
+            encoder_lr=encoder_lr,
             dropout=dropout,
-            weight_decay=weight_decay,
+            head_weight_decay=head_weight_decay,
+            encoder_weight_decay=encoder_weight_decay,
             swa=False,
             swa_start_epoch=None,
             swa_lr=None,
             swa_anneal_epochs=anneal_epochs,
         )
-        for lr, dropout, weight_decay in itertools.product(lrs, dropouts, weight_decays)
+        for (
+            head_lr,
+            encoder_lr,
+            dropout,
+            head_weight_decay,
+            encoder_weight_decay,
+        ) in base_products
     ]
     candidates.extend(
         _ValidationTuneCandidate(
-            lr=lr,
+            head_lr=head_lr,
+            encoder_lr=encoder_lr,
             dropout=dropout,
-            weight_decay=weight_decay,
+            head_weight_decay=head_weight_decay,
+            encoder_weight_decay=encoder_weight_decay,
             swa=True,
             swa_start_epoch=swa_start_epoch,
             swa_lr=swa_lr,
             swa_anneal_epochs=anneal_epochs,
         )
-        for lr, dropout, weight_decay, swa_start_epoch, swa_lr in itertools.product(
-            lrs,
+        for (
+            head_lr,
+            encoder_lr,
+            dropout,
+            head_weight_decay,
+            encoder_weight_decay,
+            swa_start_epoch,
+            swa_lr,
+        ) in itertools.product(
+            head_lrs,
+            encoder_lrs,
             dropouts,
-            weight_decays,
+            head_weight_decays,
+            encoder_weight_decays,
             swa_start_epochs,
             swa_lrs,
         )
-        if swa_lr <= lr
+        if swa_lr <= min(head_lr, encoder_lr)
     )
     candidates = _deduplicate_candidates(candidates)
     rng = random.Random(args.tune_seed if args.tune_seed is not None else args.seed)

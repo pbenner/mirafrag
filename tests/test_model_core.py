@@ -120,6 +120,42 @@ def test_mirafrag_derives_encoder_charge_from_adduct():
     assert torch.equal(raw_charge.cpu(), torch.tensor([1.0]))
 
 
+def test_optimizer_splits_head_and_encoder_decay_groups():
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=16,
+            hidden_dim=8,
+            metadata_dim=4,
+            encoder_finetune_strategy='full',
+        ),
+    )
+
+    groups = _optimizer_param_groups(
+        model,
+        head_lr=1e-3,
+        encoder_lr=1e-4,
+        head_weight_decay=1e-4,
+        encoder_weight_decay=1e-2,
+    )
+    group_by_name = {group['name']: group for group in groups}
+
+    assert group_by_name['head_decay']['lr'] == 1e-3
+    assert group_by_name['head_decay']['weight_decay'] == 1e-4
+    assert group_by_name['head_no_decay']['weight_decay'] == 0.0
+    assert group_by_name['encoder_decay']['lr'] == 1e-4
+    assert group_by_name['encoder_decay']['weight_decay'] == 1e-2
+
+    head_no_decay_ids = {
+        id(param) for param in group_by_name['head_no_decay']['params']
+    }
+    assert id(model.adduct_embedding.weight) in head_no_decay_ids
+    assert id(model.instrument_embedding.weight) in head_no_decay_ids
+    assert id(model.head.scorer[0].bias) in head_no_decay_ids
+
+
 def test_mirafrag_passes_charge_only_to_charge_aware_encoder():
     graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
     metadata = MetadataConfig(adduct_to_idx={'[M-H]-': 0}, instrument_to_idx={'HCD': 0})

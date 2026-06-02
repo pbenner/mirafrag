@@ -149,6 +149,10 @@ def train_model(
     lr: float,
     weight_decay: float,
     device: str | torch.device,
+    head_lr: float | None = None,
+    encoder_lr: float | None = None,
+    head_weight_decay: float = 0.0,
+    encoder_weight_decay: float | None = None,
     output: str | Path,
     loss_name: str = 'cosine',
     train_config: dict[str, Any] | None = None,
@@ -191,14 +195,23 @@ def train_model(
         )
     model.to(device)
     _materialize_lazy_modules(model, train_loader, device=device)
+    resolved_head_lr = float(lr if head_lr is None else head_lr)
+    resolved_encoder_lr = float(lr if encoder_lr is None else encoder_lr)
+    resolved_encoder_weight_decay = float(
+        weight_decay if encoder_weight_decay is None else encoder_weight_decay
+    )
     optimizer = torch.optim.AdamW(
         _optimizer_param_groups(
             model,
             lr=lr,
             weight_decay=weight_decay,
+            head_lr=resolved_head_lr,
+            encoder_lr=resolved_encoder_lr,
+            head_weight_decay=head_weight_decay,
+            encoder_weight_decay=resolved_encoder_weight_decay,
         ),
         lr=lr,
-        weight_decay=weight_decay,
+        weight_decay=0.0,
     )
     _print_optimizer_groups(optimizer)
     scheduler = _build_scheduler(
@@ -242,6 +255,10 @@ def train_model(
         )
     train_config = dict(train_config or {})
     train_config['loss'] = loss_name
+    train_config['head_lr'] = resolved_head_lr
+    train_config['encoder_lr'] = resolved_encoder_lr
+    train_config['head_weight_decay'] = float(head_weight_decay)
+    train_config['encoder_weight_decay'] = resolved_encoder_weight_decay
     train_config['checkpoint_metric'] = checkpoint_metric
     train_config['prediction_probability_mode'] = _prediction_probability_mode(
         loss_name
