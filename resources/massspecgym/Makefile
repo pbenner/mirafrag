@@ -19,6 +19,7 @@ DELTA_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_delta.pt
 VALOPT_INIT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_aimnet_path.pt
 VALOPT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_aimnet_valopt.pt
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
+STRATIFIED_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_stratified_eval.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
 ORACLE_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_oracle.csv
 RETRIEVAL_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_retrieval.csv
@@ -41,6 +42,8 @@ RETRIEVAL_SCORE ?= cosine
 RETRIEVAL_MASS_TOLERANCE ?= 0.01
 RETRIEVAL_CACHE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
 RETRIEVAL_SCORE_NUM_WORKERS ?= 0
+CE_BINS ?= 4
+STRATIFY_MIN_COUNT ?= 25
 
 DATASET_REPO ?= roman-bushuiev/MassSpecGym
 DATASET_FILE ?= data/MassSpecGym.tsv
@@ -231,6 +234,7 @@ EVAL_DIAGNOSTIC_ARGS += --relative-mass-tolerance
 else
 EVAL_DIAGNOSTIC_ARGS += --no-relative-mass-tolerance
 endif
+EVAL_STRATIFY_ARGS = --stratify-metadata --stratify-output $(STRATIFIED_OUTPUT) --ce-bins $(CE_BINS) --stratify-min-count $(STRATIFY_MIN_COUNT)
 RETRIEVAL_CANDIDATE_ARGS = --candidate-mode $(RETRIEVAL_CANDIDATE_MODE) --max-candidates $(RETRIEVAL_MAX_CANDIDATES) --query-chunk-size $(RETRIEVAL_QUERY_CHUNK_SIZE) --hit-ks $(RETRIEVAL_HIT_KS) --score $(RETRIEVAL_SCORE) --mass-candidate-tolerance $(RETRIEVAL_MASS_TOLERANCE) --cache-chunk-size $(RETRIEVAL_CACHE_CHUNK_SIZE) --score-num-workers $(RETRIEVAL_SCORE_NUM_WORKERS) $(if $(strip $(RETRIEVAL_CANDIDATES)),--candidate-input $(RETRIEVAL_CANDIDATES),)
 SCHEDULER_ARGS = --scheduler $(SCHEDULER) --min-lr-ratio $(MIN_LR_RATIO)
 ifneq ($(filter $(strip $(SCHEDULER)),cosine constant exponential),)
@@ -273,12 +277,13 @@ TUNE_ARGS += --tune-keep-trials
 else
 TUNE_ARGS += --no-tune-keep-trials
 endif
+
 ROW_LIMIT_ARGS =
 ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-finetune train-delta train-valopt eval retrieval-eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-finetune train-delta train-valopt eval eval-stratified retrieval-eval oracle predict test lint format clean
 
 help:
 	@printf '%s\n' \
@@ -293,6 +298,7 @@ help:
 		'  make train-delta         Continue DELTA_INIT_MODEL with delta fine-tuning' \
 		'  make train-valopt        Tune validation hyperparameters from VALOPT_INIT_MODEL' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
+		'  make eval-stratified    Evaluate checkpoint and group metrics by metadata' \
 		'  make retrieval-eval     Rank official MassSpecGym candidates and report Hit@k' \
 		'  make oracle              Compute fragment-support oracle diagnostics' \
 		'  make predict             Predict spectra for PREDICT_INPUT' \
@@ -314,6 +320,7 @@ help:
 		'  CACHE_CHUNK_SIZE=$(CACHE_CHUNK_SIZE)' \
 		'  ORACLE_CHUNK_SIZE=$(ORACLE_CHUNK_SIZE)' \
 		'  RETRIEVAL_OUTPUT=$(RETRIEVAL_OUTPUT)' \
+		'  STRATIFIED_OUTPUT=$(STRATIFIED_OUTPUT)' \
 		'  RETRIEVAL_CANDIDATES=$(RETRIEVAL_CANDIDATES)' \
 		'  RETRIEVAL_CANDIDATE_KIND=$(RETRIEVAL_CANDIDATE_KIND)' \
 		'  RETRIEVAL_OFFICIAL_CANDIDATES=$(RETRIEVAL_OFFICIAL_CANDIDATES)' \
@@ -343,6 +350,8 @@ help:
 		'  MASS_TOLERANCE=$(MASS_TOLERANCE)' \
 		'  RELATIVE_MASS_TOLERANCE=$(RELATIVE_MASS_TOLERANCE)' \
 		'  MASS_TOLERANCE_MIN_MZ=$(MASS_TOLERANCE_MIN_MZ)' \
+		'  CE_BINS=$(CE_BINS)' \
+		'  STRATIFY_MIN_COUNT=$(STRATIFY_MIN_COUNT)' \
 		'  SCHEDULER_INTERVAL=$(SCHEDULER_INTERVAL)' \
 		'  MIN_LR_RATIO=$(MIN_LR_RATIO)' \
 		'  EXPONENTIAL_GAMMA=$(EXPONENTIAL_GAMMA)' \
@@ -488,6 +497,20 @@ eval:
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
+		$(ROW_LIMIT_ARGS) \
+		--split $(EVAL_SPLIT) \
+		--split-col $(SPLIT_COL)
+
+eval-stratified:
+	mkdir -p $(dir $(PREDICTIONS)) $(dir $(STRATIFIED_OUTPUT))
+	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.eval \
+		--input $(INPUT) \
+		--model $(MODEL) \
+		--output $(PREDICTIONS) \
+		$(COMMON_ARGS) \
+		$(CACHE_ARGS) \
+		$(EVAL_DIAGNOSTIC_ARGS) \
+		$(EVAL_STRATIFY_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
