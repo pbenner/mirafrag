@@ -8,7 +8,8 @@ from torch import nn
 from torch.nn import LazyLinear
 from torch.utils.data import DataLoader
 
-from mirafrag.checkpoint import load_checkpoint, save_checkpoint
+import mirafrag.cli.oracle as oracle_cli
+from mirafrag.checkpoint import CHECKPOINT_FORMAT, load_checkpoint, save_checkpoint
 from mirafrag.chem import GraphConfig
 from mirafrag.cli.cache import (
     _apply_fragment_args_to_model_config as _apply_cache_fragment_args_to_model_config,
@@ -31,6 +32,7 @@ from mirafrag.data import (
     filter_supported_elements,
     select_split,
 )
+from mirafrag.encoders.aimnet import AIMNET2_ATOMIC_NUMBERS, AIMNET2_R_MAX
 from mirafrag.encoders.mace import repair_mace_cuequivariance_config
 from mirafrag.evaluation import _sparse_prediction_rows
 from mirafrag.fragments import (
@@ -69,6 +71,122 @@ from tests.helpers import (
     _tiny_loader,
     _tiny_training_df,
 )
+
+
+class NonPersistentFakeMace(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            'atomic_numbers', torch.tensor([1, 6, 8]), persistent=False
+        )
+        self.register_buffer('r_max', torch.tensor(5.0), persistent=False)
+        self.proj = nn.Linear(3, 3, bias=False)
+
+    def forward(self, graph, **kwargs):
+        return {'node_feats': self.proj(graph['node_attrs'].float())}
+
+
+def test_oracle_checkpoint_config_reads_saved_graph_config_for_nonpersistent_encoder(
+    tmp_path,
+):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    model = MiraFragModel(
+        NonPersistentFakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(num_bins=32, hidden_dim=8, metadata_dim=4),
+    )
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    batch = next(iter(_tiny_loader(_tiny_training_df(), graph_config, metadata)))
+    with torch.no_grad():
+        model(batch)
+    output = tmp_path / 'mirafrag.pt'
+    save_checkpoint(output, model)
+    payload = torch.load(output, map_location='cpu', weights_only=True)
+
+    assert payload['graph_config']['atomic_numbers'] == (1, 6, 8)
+    assert not any(
+        key.endswith('atomic_numbers') for key in payload['model_state_dict']
+    )
+
+    _config, _loaded_metadata, graph_config = _load_oracle_checkpoint_config(
+        str(output),
+        mz_max=32.0,
+        bin_width=1.0,
+    )
+
+    assert graph_config.atomic_numbers == (1, 6, 8)
+    assert graph_config.cutoff == 5.0
+
+
+def test_oracle_checkpoint_config_uses_static_aimnet2_graph_config(
+    tmp_path, monkeypatch
+):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    config = MiraFragConfig(
+        num_bins=32,
+        hidden_dim=8,
+        metadata_dim=4,
+        encoder_type='aimnet',
+        aimnet_model='aimnet2',
+        aimnet_path=None,
+    )
+    output = tmp_path / 'old-aimnet-mirafrag.pt'
+    torch.save(
+        {
+            'checkpoint_format': CHECKPOINT_FORMAT,
+            'model_state_dict': {},
+            'mirafrag_config': config.__dict__,
+            'metadata_config': metadata.to_dict(),
+            'train_config': {},
+        },
+        output,
+    )
+    monkeypatch.setattr(
+        oracle_cli,
+        'load_foundation_encoder',
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError('should not load encoder')
+        ),
+    )
+
+    _config, _loaded_metadata, graph_config = _load_oracle_checkpoint_config(
+        str(output),
+        mz_max=32.0,
+        bin_width=1.0,
+    )
+
+    assert graph_config.atomic_numbers == tuple(AIMNET2_ATOMIC_NUMBERS)
+    assert graph_config.cutoff == AIMNET2_R_MAX
+
+
+def test_oracle_checkpoint_config_falls_back_to_encoder_for_old_payload(
+    tmp_path, monkeypatch
+):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    config = MiraFragConfig(num_bins=32, hidden_dim=8, metadata_dim=4)
+    output = tmp_path / 'old-mirafrag.pt'
+    torch.save(
+        {
+            'checkpoint_format': CHECKPOINT_FORMAT,
+            'model_state_dict': {},
+            'mirafrag_config': config.__dict__,
+            'metadata_config': metadata.to_dict(),
+            'train_config': {},
+        },
+        output,
+    )
+    monkeypatch.setattr(
+        oracle_cli, 'load_foundation_encoder', lambda **_kwargs: FakeMace()
+    )
+
+    _config, _loaded_metadata, graph_config = _load_oracle_checkpoint_config(
+        str(output),
+        mz_max=32.0,
+        bin_width=1.0,
+    )
+
+    assert graph_config.atomic_numbers == (1, 6, 8)
+    assert graph_config.cutoff == 5.0
 
 
 def test_oracle_checkpoint_config_reads_encoder_metadata(tmp_path):
@@ -194,7 +312,9 @@ def test_validation_tune_candidates_are_limited_without_baseline():
 
     assert len(candidates) == 4
     assert all(candidate.dropout in {0.0, 0.02} for candidate in candidates)
-    assert all(candidate.weight_decay in {0.0, 1e-6} for candidate in candidates)
+    assert all(
+        candidate.encoder_weight_decay in {0.0, 1e-6} for candidate in candidates
+    )
     assert all(candidate.swa_start_epoch != 8 for candidate in candidates)
 
 
@@ -221,7 +341,8 @@ def test_validation_tune_candidates_do_not_increase_lr_for_swa():
     candidates = _validation_tune_candidates(args)
 
     assert all(
-        (not candidate.swa) or candidate.swa_lr <= candidate.lr
+        (not candidate.swa)
+        or candidate.swa_lr <= min(candidate.head_lr, candidate.encoder_lr)
         for candidate in candidates
     )
 
@@ -362,7 +483,7 @@ def test_train_model_can_print_verbose_epoch_config(tmp_path, capsys):
     output = capsys.readouterr().out
     assert 'epoch_config epoch=1/1' in output
     assert 'dropout=0.02' in output
-    assert 'weight_decay=head=0.00e+00,encoder=1.00e-06' in output
+    assert 'weight_decay=head=0.00e+00,encoder_decay=1.00e-06' in output
     assert 'swa=True' in output
     assert 'swa_active=True' in output
     assert 'swa_lr=3e-05' in output
@@ -389,7 +510,7 @@ def test_train_model_swa_handles_integer_encoder_buffers(tmp_path):
         loader,
         loader,
         epochs=2,
-        lr=0.0,
+        lr=1e-3,
         weight_decay=0.0,
         device='cpu',
         output=tmp_path / 'mirafrag_swa_integer_buffers.pt',
@@ -425,7 +546,7 @@ def test_train_model_can_save_swa_checkpoint_by_val_cosine(tmp_path):
         loader,
         loader,
         epochs=1,
-        lr=0.0,
+        lr=1e-3,
         weight_decay=0.0,
         device='cpu',
         output=output,
@@ -470,7 +591,7 @@ def test_train_model_can_checkpoint_by_train_loss(tmp_path):
         train_loader,
         val_loader,
         epochs=2,
-        lr=0.0,
+        lr=1e-3,
         weight_decay=0.0,
         device='cpu',
         output=output,
@@ -506,7 +627,7 @@ def test_train_model_records_initial_validation_for_checkpoint_resume(tmp_path):
         loader,
         loader,
         epochs=1,
-        lr=0.0,
+        lr=1e-3,
         weight_decay=0.0,
         device='cpu',
         output=tmp_path / 'mirafrag_resume.pt',
@@ -585,13 +706,13 @@ def test_optimizer_param_groups_use_single_lr():
         lr=1e-4,
         weight_decay=1e-8,
     )
-    assert {group['name'] for group in groups} == {'head', 'encoder'}
+    assert {group['name'] for group in groups} == {'head', 'encoder_decay'}
     lr_by_name = {group['name']: group['lr'] for group in groups}
     wd_by_name = {group['name']: group['weight_decay'] for group in groups}
     assert lr_by_name['head'] == 1e-4
-    assert lr_by_name['encoder'] == 1e-4
+    assert lr_by_name['encoder_decay'] == 1e-4
     assert wd_by_name['head'] == 0.0
-    assert wd_by_name['encoder'] == 1e-8
+    assert wd_by_name['encoder_decay'] == 1e-8
 
 
 def test_optimizer_param_groups_skip_unused_lazy_parameters():

@@ -194,7 +194,7 @@ def _fill_feature_cache_serial_allow_failures(
     for idx in progress:
         processed += 1
         try:
-            dataset[int(idx)]
+            _materialize_dataset_features(dataset, int(idx))
         except Exception as exc:  # noqa: BLE001
             failures.append((int(idx), f'{type(exc).__name__}: {exc}'))
     return processed, failures
@@ -222,7 +222,7 @@ def _fill_feature_cache_serial(
     )
     processed = 0
     for idx in progress:
-        dataset[int(idx)]
+        _materialize_dataset_features(dataset, int(idx))
         processed += 1
     return processed
 
@@ -243,8 +243,19 @@ def _cache_dataset_index(idx: int) -> tuple[int, float]:
     if dataset is None:
         raise RuntimeError('Cache worker dataset was not initialized.')
     start = time.perf_counter()
-    dataset[int(idx)]
+    _materialize_dataset_features(dataset, int(idx))
     return int(idx), time.perf_counter() - start
+
+
+def _materialize_dataset_features(dataset, idx: int) -> None:
+    """
+    Compute cacheable features without constructing training targets when possible.
+    """
+    materialize = getattr(dataset, 'materialize_feature_cache', None)
+    if callable(materialize):
+        materialize(int(idx))
+    else:
+        dataset[int(idx)]
 
 
 def _cache_dataset_index_allow_failure(idx: int) -> tuple[int, float, str | None]:

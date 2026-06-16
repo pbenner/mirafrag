@@ -10,7 +10,12 @@ from tqdm.auto import tqdm
 from mirafrag.cache_fill import prefill_feature_cache
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
-from mirafrag.cli.common import resolve_device, validate_checkpoint_bin_config
+from mirafrag.cli.common import (
+    add_high_ce_fragment_support_args,
+    apply_fragment_args_to_model_config,
+    resolve_device,
+    validate_checkpoint_bin_config,
+)
 from mirafrag.data import (
     BinnedSpectrumDataset,
     collate_spectrum_batch,
@@ -21,7 +26,7 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.evaluation import probability_mode_from_checkpoint_payload
-from mirafrag.fragments import fragment_config_from_model_config
+from mirafrag.fragments import fragment_support_profile_from_model_config
 from mirafrag.losses import (
     sparse_binned_cosine_similarity,
     sparse_fragment_only_binned_cosine_similarity,
@@ -105,6 +110,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help='Show tqdm progress bars during retrieval evaluation.',
     )
+    add_high_ce_fragment_support_args(parser)
     parser.add_argument(
         '--massspecgym-filter',
         action=argparse.BooleanOptionalAction,
@@ -131,8 +137,9 @@ def main() -> None:
         mz_max=args.mz_max,
         bin_width=args.bin_width,
     )
+    apply_fragment_args_to_model_config(model.config, args)
     graph_config = infer_graph_config(model.encoder)
-    fragment_config = fragment_config_from_model_config(model.config)
+    fragment_support_profile = fragment_support_profile_from_model_config(model.config)
 
     full_df = read_table(args.input)
     if args.massspecgym_filter:
@@ -231,7 +238,7 @@ def main() -> None:
             model,
             candidate_rows,
             graph_config=graph_config,
-            fragment_config=fragment_config,
+            fragment_support_profile=fragment_support_profile,
             device=device,
             batch_size=args.batch_size,
             cache_num_workers=args.num_workers,
@@ -303,7 +310,7 @@ def _score_candidate_rows(
     candidate_rows,
     *,
     graph_config,
-    fragment_config,
+    fragment_support_profile,
     device,
     batch_size: int,
     cache_num_workers: int,
@@ -329,7 +336,7 @@ def _score_candidate_rows(
         memory_cache=memory_cache,
         disk_cache_dir=disk_cache_dir,
         include_fragments=True,
-        fragment_config=fragment_config,
+        fragment_support_profile=fragment_support_profile,
     )
     num_candidate_rows = len(candidate_rows)
     score_positions = list(range(num_candidate_rows))
@@ -367,7 +374,7 @@ def _score_candidate_rows(
                 memory_cache=memory_cache,
                 disk_cache_dir=disk_cache_dir,
                 include_fragments=True,
-                fragment_config=fragment_config,
+                fragment_support_profile=fragment_support_profile,
             )
     loader = DataLoader(
         dataset,

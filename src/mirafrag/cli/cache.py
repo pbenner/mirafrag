@@ -6,13 +6,16 @@ from mirafrag.cache_fill import fill_feature_cache_unordered
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
+    add_high_ce_fragment_support_args,
     apply_fragment_args_to_model_config,
+    high_ce_fragment_config_from_args,
     resolve_device,
     value_or_default,
 )
 from mirafrag.config import MiraFragConfig
 from mirafrag.data import (
     ADDUCT_ALIASES,
+    CE_ALIASES,
     SMILES_ALIASES,
     BinnedSpectrumDataset,
     MetadataConfig,
@@ -23,7 +26,11 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.encoders import load_foundation_encoder
-from mirafrag.fragments import FragmentConfig, fragment_config_from_model_config
+from mirafrag.fragments import (
+    FragmentConfig,
+    FragmentSupportProfile,
+    fragment_support_profile_from_model_config,
+)
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
@@ -77,6 +84,7 @@ def parse_args() -> argparse.Namespace:
         default=['train', 'val', 'test'],
         help="Splits to precompute, or 'all' to precompute the filtered table once.",
     )
+    add_high_ce_fragment_support_args(parser)
     parser.add_argument('--split-col', default='auto')
     parser.add_argument(
         '--massspecgym-filter',
@@ -131,7 +139,9 @@ def main() -> None:
         model, _payload = load_checkpoint(args.init_checkpoint, device=device)
         _apply_fragment_args_to_model_config(model.config, args)
         graph_source = model.encoder
-        fragment_config = fragment_config_from_model_config(model.config)
+        fragment_support_profile = fragment_support_profile_from_model_config(
+            model.config
+        )
     else:
         encoder = load_foundation_encoder(
             encoder_type=args.encoder,
@@ -144,6 +154,11 @@ def main() -> None:
         )
         graph_source = encoder
         fragment_config = _fragment_config_from_args(args)
+        fragment_support_profile = FragmentSupportProfile(
+            base=fragment_config,
+            high_ce_threshold=args.high_ce_fragment_threshold,
+            high_ce=high_ce_fragment_config_from_args(fragment_config, args),
+        )
 
     graph_config = infer_graph_config(graph_source, seed=args.seed)
     df = read_table(args.input)
@@ -158,7 +173,7 @@ def main() -> None:
             df,
             split_name='all',
             graph_config=graph_config,
-            fragment_config=fragment_config,
+            fragment_support_profile=fragment_support_profile,
             args=args,
         )
     else:
@@ -175,7 +190,7 @@ def main() -> None:
                 split_df,
                 split_name=split,
                 graph_config=graph_config,
-                fragment_config=fragment_config,
+                fragment_support_profile=fragment_support_profile,
                 args=args,
             )
 
@@ -185,7 +200,7 @@ def _precompute_frame(
     *,
     split_name: str,
     graph_config,
-    fragment_config: FragmentConfig,
+    fragment_support_profile: FragmentSupportProfile,
     args: argparse.Namespace,
 ) -> None:
     """
@@ -208,7 +223,7 @@ def _precompute_frame(
         )
         return
     input_rows = int(len(df))
-    df = _deduplicate_cache_rows(df)
+    df = _deduplicate_cache_rows(df, fragment_support_profile)
     if len(df) != input_rows:
         print(
             f'{split_name} cache rows deduplicated: '
@@ -230,7 +245,7 @@ def _precompute_frame(
         memory_cache=False,
         disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
-        fragment_config=fragment_config,
+        fragment_support_profile=fragment_support_profile,
         slow_sample_seconds=args.slow_sample_seconds,
         trace_samples=args.trace_samples,
     )
@@ -247,18 +262,42 @@ def _precompute_frame(
     )
 
 
-def _deduplicate_cache_rows(df):
+def _deduplicate_cache_rows(df, fragment_support_profile: FragmentSupportProfile):
     """
     Drop repeated rows that map to the same cache entries.
 
-    Graph caches depend on SMILES and fragment caches depend on SMILES plus adduct, so repeated spectra with identical keys do not need to be recomputed.
+    Graph caches depend on SMILES. Fragment caches depend on SMILES, adduct,
+    and, when enabled, whether the row uses base or high-CE support.
     """
     smiles_col = find_column(df, SMILES_ALIASES)
     adduct_col = find_column(df, ADDUCT_ALIASES, required=False)
     subset = [smiles_col]
     if adduct_col is not None:
         subset.append(adduct_col)
-    return df.drop_duplicates(subset=subset).reset_index(drop=True)
+    work = df
+    profile_col = None
+    ce_col = find_column(df, CE_ALIASES, required=False)
+    if fragment_support_profile.is_enabled() and ce_col is not None:
+        profile_col = '_mirafrag_fragment_support_profile'
+        work = df.copy()
+        work[profile_col] = [
+            _support_profile_label(fragment_support_profile, value)
+            for value in work[ce_col]
+        ]
+        subset.append(profile_col)
+    out = work.drop_duplicates(subset=subset).reset_index(drop=True)
+    if profile_col is not None:
+        out = out.drop(columns=[profile_col])
+    return out
+
+
+def _support_profile_label(
+    fragment_support_profile: FragmentSupportProfile,
+    collision_energy,
+) -> str:
+    """Return the cache-dedup label for one support profile decision."""
+    config = fragment_support_profile.config_for_collision_energy(collision_energy)
+    return 'high_ce' if config is fragment_support_profile.high_ce else 'base'
 
 
 def _apply_fragment_args_to_model_config(

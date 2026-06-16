@@ -23,6 +23,14 @@ STRATIFIED_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_stratified_eval.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
 ORACLE_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_oracle.csv
 RETRIEVAL_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_retrieval.csv
+GAP_DIAGNOSTIC_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_gap_diagnostics.csv
+GAP_DIAGNOSTIC_SUMMARY ?= $(RESOURCE_DIR)/predictions/massspecgym_gap_summary.csv
+GAP_DIAGNOSTIC_PREDICTIONS ?= $(PREDICTIONS)
+ENSEMBLE_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_ensemble.csv
+ENSEMBLE_SUMMARY ?= $(RESOURCE_DIR)/predictions/massspecgym_ensemble_summary.csv
+ENSEMBLE_PREDICTIONS ?=
+ENSEMBLE_NAMES ?=
+ENSEMBLE_WEIGHTS_GRID ?= auto
 RETRIEVAL_CANDIDATE_KIND ?= formula
 RETRIEVAL_FORMULA_CANDIDATES ?= $(RESOURCE_DIR)/data/molecules/MassSpecGym_retrieval_candidates_formula.json
 RETRIEVAL_MASS_CANDIDATES ?= $(RESOURCE_DIR)/data/molecules/MassSpecGym_retrieval_candidates_mass.json
@@ -33,7 +41,7 @@ CACHE_SOURCE_MODEL ?=
 CACHE_SPLITS ?= train val test
 CACHE_NUM_WORKERS ?= $(shell nproc)
 CACHE_CHUNK_SIZE ?= 1
-ORACLE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
+ORACLE_CHUNK_SIZE ?= $(BATCH_SIZE)
 RETRIEVAL_CANDIDATE_MODE ?= explicit
 RETRIEVAL_MAX_CANDIDATES ?= 256
 RETRIEVAL_QUERY_CHUNK_SIZE ?= 64
@@ -44,6 +52,10 @@ RETRIEVAL_CACHE_CHUNK_SIZE ?= $(CACHE_CHUNK_SIZE)
 RETRIEVAL_SCORE_NUM_WORKERS ?= 0
 CE_BINS ?= 4
 STRATIFY_MIN_COUNT ?= 25
+EVAL_TOP_K ?= 100
+EVAL_MIN_INTENSITY ?= 0.001
+GAP_DIAGNOSTIC_MIN_COUNT ?= 25
+GAP_DIAGNOSTIC_SIMILARITY_BINS ?= 0,0.3,0.5,0.7,0.85,0.95,1.0
 
 DATASET_REPO ?= roman-bushuiev/MassSpecGym
 DATASET_FILE ?= data/MassSpecGym.tsv
@@ -97,9 +109,15 @@ MAX_FRAGMENT_TREE_DEPTH ?= 3
 MAX_FRAGMENT_BROKEN_BONDS ?= 6
 MAX_FRAGMENTS ?= 2048
 MAX_FRAGMENT_EDGES ?= 8192
+HIGH_CE_FRAGMENT_THRESHOLD ?=
+HIGH_CE_MAX_FRAGMENT_TREE_DEPTH ?= 4
+HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS ?= 8
+HIGH_CE_MAX_FRAGMENTS ?= 4096
+HIGH_CE_MAX_FRAGMENT_EDGES ?= 16384
 FRAGMENT_GNN_LAYERS ?= 2
 FRAGMENT_PATH_LAYERS ?= 3
 INCLUDE_FRAGMENT_ISOTOPES ?= 1
+
 FRAGMENT_ISOTOPE_THRESHOLD ?= 0.001
 MAX_FRAGMENT_ISOTOPE_PEAKS ?= 1
 FINE_TUNE_STRATEGY ?= full
@@ -195,11 +213,16 @@ SAMPLE_DEBUG_ARGS += --no-trace-samples
 endif
 LOADER_DEBUG_ARGS = $(SAMPLE_DEBUG_ARGS) --dataloader-timeout $(DATALOADER_TIMEOUT)
 ARCH_ARGS = --hidden-dim $(HIDDEN_DIM) --num-layers $(NUM_LAYERS) --dropout $(DROPOUT) --metadata-dim $(METADATA_DIM) --fragment-gnn-layers $(FRAGMENT_GNN_LAYERS) --fragment-path-layers $(FRAGMENT_PATH_LAYERS)
-FRAGMENT_ARGS = --max-fragment-tree-depth $(MAX_FRAGMENT_TREE_DEPTH) --max-fragment-broken-bonds $(MAX_FRAGMENT_BROKEN_BONDS) --max-fragments $(MAX_FRAGMENTS) --max-fragment-edges $(MAX_FRAGMENT_EDGES) $(ISOTOPE_FRAGMENT_ARGS) --fragment-isotope-threshold $(FRAGMENT_ISOTOPE_THRESHOLD) --max-fragment-isotope-peaks $(MAX_FRAGMENT_ISOTOPE_PEAKS)
+HIGH_CE_FRAGMENT_ARGS =
+ifneq ($(strip $(HIGH_CE_FRAGMENT_THRESHOLD)),)
+HIGH_CE_FRAGMENT_ARGS += --high-ce-fragment-threshold $(HIGH_CE_FRAGMENT_THRESHOLD) --high-ce-max-fragment-tree-depth $(HIGH_CE_MAX_FRAGMENT_TREE_DEPTH) --high-ce-max-fragment-broken-bonds $(HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS) --high-ce-max-fragments $(HIGH_CE_MAX_FRAGMENTS) --high-ce-max-fragment-edges $(HIGH_CE_MAX_FRAGMENT_EDGES)
+endif
+BASE_FRAGMENT_ARGS = --max-fragment-tree-depth $(MAX_FRAGMENT_TREE_DEPTH) --max-fragment-broken-bonds $(MAX_FRAGMENT_BROKEN_BONDS) --max-fragments $(MAX_FRAGMENTS) --max-fragment-edges $(MAX_FRAGMENT_EDGES) $(ISOTOPE_FRAGMENT_ARGS) --fragment-isotope-threshold $(FRAGMENT_ISOTOPE_THRESHOLD) --max-fragment-isotope-peaks $(MAX_FRAGMENT_ISOTOPE_PEAKS)
+FRAGMENT_ARGS = $(BASE_FRAGMENT_ARGS) $(HIGH_CE_FRAGMENT_ARGS)
 HEAD_ARGS = $(ARCH_ARGS) $(FRAGMENT_ARGS)
-CHECKPOINT_HEAD_ARGS =
+CHECKPOINT_HEAD_ARGS = $(HIGH_CE_FRAGMENT_ARGS)
 ifeq ($(strip $(OVERRIDE_FRAGMENT_CONFIG)),1)
-CHECKPOINT_HEAD_ARGS += $(FRAGMENT_ARGS)
+CHECKPOINT_HEAD_ARGS = $(FRAGMENT_ARGS)
 endif
 TRAIN_HEAD_ARGS = $(HEAD_ARGS)
 ifneq ($(strip $(INIT_MODEL)),)
@@ -228,6 +251,7 @@ else
 VALOPT_LOSS_ARGS += --no-relative-mass-tolerance
 endif
 VALOPT_LOSS_ARGS += --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
+EVAL_EXPORT_ARGS = --top-k $(EVAL_TOP_K) --min-intensity $(EVAL_MIN_INTENSITY)
 EVAL_DIAGNOSTIC_ARGS = --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
 ifeq ($(strip $(RELATIVE_MASS_TOLERANCE)),1)
 EVAL_DIAGNOSTIC_ARGS += --relative-mass-tolerance
@@ -235,6 +259,10 @@ else
 EVAL_DIAGNOSTIC_ARGS += --no-relative-mass-tolerance
 endif
 EVAL_STRATIFY_ARGS = --stratify-metadata --stratify-output $(STRATIFIED_OUTPUT) --ce-bins $(CE_BINS) --stratify-min-count $(STRATIFY_MIN_COUNT)
+ENSEMBLE_ARGS = --weights-grid $(ENSEMBLE_WEIGHTS_GRID)
+ifneq ($(strip $(ENSEMBLE_NAMES)),)
+ENSEMBLE_ARGS += --prediction-names $(ENSEMBLE_NAMES)
+endif
 RETRIEVAL_CANDIDATE_ARGS = --candidate-mode $(RETRIEVAL_CANDIDATE_MODE) --max-candidates $(RETRIEVAL_MAX_CANDIDATES) --query-chunk-size $(RETRIEVAL_QUERY_CHUNK_SIZE) --hit-ks $(RETRIEVAL_HIT_KS) --score $(RETRIEVAL_SCORE) --mass-candidate-tolerance $(RETRIEVAL_MASS_TOLERANCE) --cache-chunk-size $(RETRIEVAL_CACHE_CHUNK_SIZE) --score-num-workers $(RETRIEVAL_SCORE_NUM_WORKERS) $(if $(strip $(RETRIEVAL_CANDIDATES)),--candidate-input $(RETRIEVAL_CANDIDATES),)
 SCHEDULER_ARGS = --scheduler $(SCHEDULER) --min-lr-ratio $(MIN_LR_RATIO)
 ifneq ($(filter $(strip $(SCHEDULER)),cosine constant exponential),)
@@ -283,7 +311,7 @@ ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-finetune train-delta train-valopt eval eval-stratified retrieval-eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-finetune train-delta train-valopt eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
 
 help:
 	@printf '%s\n' \
@@ -299,6 +327,8 @@ help:
 		'  make train-valopt        Tune validation hyperparameters from VALOPT_INIT_MODEL' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
 		'  make eval-stratified    Evaluate checkpoint and group metrics by metadata' \
+		'  make gap-diagnostics    Analyze validation/test gap by train-nearest chemistry' \
+		'  make ensemble-eval      Blend exported prediction CSVs and score spectra' \
 		'  make retrieval-eval     Rank official MassSpecGym candidates and report Hit@k' \
 		'  make oracle              Compute fragment-support oracle diagnostics' \
 		'  make predict             Predict spectra for PREDICT_INPUT' \
@@ -321,6 +351,8 @@ help:
 		'  ORACLE_CHUNK_SIZE=$(ORACLE_CHUNK_SIZE)' \
 		'  RETRIEVAL_OUTPUT=$(RETRIEVAL_OUTPUT)' \
 		'  STRATIFIED_OUTPUT=$(STRATIFIED_OUTPUT)' \
+		'  GAP_DIAGNOSTIC_OUTPUT=$(GAP_DIAGNOSTIC_OUTPUT)' \
+		'  GAP_DIAGNOSTIC_SUMMARY=$(GAP_DIAGNOSTIC_SUMMARY)' \
 		'  RETRIEVAL_CANDIDATES=$(RETRIEVAL_CANDIDATES)' \
 		'  RETRIEVAL_CANDIDATE_KIND=$(RETRIEVAL_CANDIDATE_KIND)' \
 		'  RETRIEVAL_OFFICIAL_CANDIDATES=$(RETRIEVAL_OFFICIAL_CANDIDATES)' \
@@ -369,6 +401,11 @@ help:
 		'  FRAGMENT_PATH_LAYERS=$(FRAGMENT_PATH_LAYERS)' \
 		'  MAX_FRAGMENT_TREE_DEPTH=$(MAX_FRAGMENT_TREE_DEPTH)' \
 		'  MAX_FRAGMENT_BROKEN_BONDS=$(MAX_FRAGMENT_BROKEN_BONDS)' \
+		'  HIGH_CE_FRAGMENT_THRESHOLD=$(HIGH_CE_FRAGMENT_THRESHOLD)' \
+		'  HIGH_CE_MAX_FRAGMENT_TREE_DEPTH=$(HIGH_CE_MAX_FRAGMENT_TREE_DEPTH)' \
+		'  HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS=$(HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS)' \
+		'  HIGH_CE_MAX_FRAGMENTS=$(HIGH_CE_MAX_FRAGMENTS)' \
+		'  HIGH_CE_MAX_FRAGMENT_EDGES=$(HIGH_CE_MAX_FRAGMENT_EDGES)' \
 		'  MAX_FRAGMENTS=$(MAX_FRAGMENTS)' \
 		'  OVERRIDE_FRAGMENT_CONFIG=$(OVERRIDE_FRAGMENT_CONFIG)' \
 		'  FINE_TUNE_STRATEGY=$(FINE_TUNE_STRATEGY)' \
@@ -496,7 +533,9 @@ eval:
 		--output $(PREDICTIONS) \
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
+		$(EVAL_EXPORT_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
+		$(HIGH_CE_FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
@@ -509,11 +548,42 @@ eval-stratified:
 		--output $(PREDICTIONS) \
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
+		$(EVAL_EXPORT_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
 		$(EVAL_STRATIFY_ARGS) \
+		$(HIGH_CE_FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
+
+gap-diagnostics:
+	mkdir -p $(dir $(GAP_DIAGNOSTIC_OUTPUT)) $(dir $(GAP_DIAGNOSTIC_SUMMARY))
+	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.gap_diagnostics \
+		--input $(INPUT) \
+		--predictions $(GAP_DIAGNOSTIC_PREDICTIONS) \
+		--output $(GAP_DIAGNOSTIC_OUTPUT) \
+		--summary-output $(GAP_DIAGNOSTIC_SUMMARY) \
+		--train-split $(TRAIN_SPLIT) \
+		--eval-split $(EVAL_SPLIT) \
+		--split-col $(SPLIT_COL) \
+		--similarity-bins $(GAP_DIAGNOSTIC_SIMILARITY_BINS) \
+		--min-count $(GAP_DIAGNOSTIC_MIN_COUNT) \
+		$(PROGRESS_ARGS) \
+		$(ROW_LIMIT_ARGS)
+
+ensemble-eval:
+	mkdir -p $(dir $(ENSEMBLE_OUTPUT)) $(dir $(ENSEMBLE_SUMMARY))
+	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.ensemble_eval \
+		--input $(INPUT) \
+		--predictions $(ENSEMBLE_PREDICTIONS) \
+		--output $(ENSEMBLE_OUTPUT) \
+		--summary-output $(ENSEMBLE_SUMMARY) \
+		--mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) \
+		--split $(EVAL_SPLIT) \
+		--split-col $(SPLIT_COL) \
+		$(ENSEMBLE_ARGS) \
+		$(PROGRESS_ARGS) \
+		$(ROW_LIMIT_ARGS)
 
 retrieval-eval: $(RETRIEVAL_CANDIDATES)
 	mkdir -p $(dir $(RETRIEVAL_OUTPUT))
@@ -524,6 +594,7 @@ retrieval-eval: $(RETRIEVAL_CANDIDATES)
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
 		$(RETRIEVAL_CANDIDATE_ARGS) \
+		$(HIGH_CE_FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
@@ -537,6 +608,7 @@ oracle:
 		--device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --batch-size $(BATCH_SIZE) --chunk-size $(ORACLE_CHUNK_SIZE) --num-workers $(NUM_WORKERS) $(PROGRESS_ARGS) \
 		$(CACHE_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
+		$(HIGH_CE_FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
@@ -548,7 +620,8 @@ predict:
 		--model $(MODEL) \
 		--output $(PREDICT_OUTPUT) \
 		$(COMMON_ARGS) \
-		$(CACHE_ARGS)
+		$(CACHE_ARGS) \
+		$(HIGH_CE_FRAGMENT_ARGS)
 
 test:
 	PYTHONPATH=$(PYTHONPATH) $(PYTEST) -q $(ROOT)/tests

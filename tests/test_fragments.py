@@ -16,7 +16,7 @@ from mirafrag.cli.cache import (
 from mirafrag.cli.train import (
     _apply_fragment_args_to_model_config as _apply_train_fragment_args_to_model_config,
 )
-from mirafrag.config import MiraFragConfig
+from mirafrag.config import MiraFragConfig, mirafrag_config_from_dict
 from mirafrag.data import (
     BinnedSpectrumDataset,
     MetadataConfig,
@@ -35,6 +35,7 @@ from mirafrag.fragments import (
     FragmentConfig,
     collate_fragment_candidates,
     fragment_config_from_model_config,
+    fragment_support_profile_from_model_config,
     parse_fragment_adduct,
     smiles_to_fragment_candidates,
 )
@@ -409,6 +410,45 @@ def test_fragment_config_from_model_config_preserves_candidate_support_settings(
     assert fragment_config.include_isotopes is False
     assert fragment_config.isotope_threshold == 0.01
     assert fragment_config.max_isotope_peaks == 3
+
+
+def test_fragment_support_profile_from_model_config_expands_high_ce_defaults():
+    config = MiraFragConfig(num_bins=16, high_ce_fragment_threshold=60.0)
+
+    profile = fragment_support_profile_from_model_config(config)
+
+    assert profile.base == fragment_config_from_model_config(config)
+    assert profile.high_ce_threshold == 60.0
+    assert profile.high_ce is not None
+    assert profile.high_ce.max_tree_depth == 4
+    assert profile.high_ce.max_broken_bonds == 8
+    assert profile.high_ce.max_fragments == 4096
+    assert profile.high_ce.max_edges == 16384
+
+
+def test_fragment_support_profile_ignores_nonnumeric_collision_energy():
+    config = MiraFragConfig(num_bins=16, high_ce_fragment_threshold=60.0)
+    profile = fragment_support_profile_from_model_config(config)
+
+    assert profile.config_for_collision_energy('not-a-number') == profile.base
+    assert profile.config_for_collision_energy(float('nan')) == profile.base
+
+
+def test_mirafrag_config_from_dict_defaults_missing_high_ce_fields():
+    config = MiraFragConfig(num_bins=16)
+    payload = {
+        key: value
+        for key, value in config.__dict__.items()
+        if not key.startswith('high_ce_')
+    }
+
+    loaded = mirafrag_config_from_dict(payload)
+
+    assert loaded.high_ce_fragment_threshold is None
+    assert loaded.high_ce_max_fragment_tree_depth is None
+    assert loaded.high_ce_max_fragment_broken_bonds is None
+    assert loaded.high_ce_max_fragments is None
+    assert loaded.high_ce_max_fragment_edges is None
 
 
 def test_default_fragment_config_matches_model_config():

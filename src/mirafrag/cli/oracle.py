@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,11 @@ import torch
 from tqdm.auto import tqdm
 
 from mirafrag.checkpoint import CHECKPOINT_FORMAT
-from mirafrag.chem import GraphConfig, quiet_rdkit_logs
+from mirafrag.chem import GraphConfig, infer_graph_config, quiet_rdkit_logs
+from mirafrag.cli.common import (
+    add_high_ce_fragment_support_args,
+    apply_fragment_args_to_model_config,
+)
 from mirafrag.config import MiraFragConfig, mirafrag_config_from_dict
 from mirafrag.data import (
     BinnedSpectrumDataset,
@@ -20,10 +25,12 @@ from mirafrag.data import (
     read_table,
     select_split,
 )
+from mirafrag.encoders import load_foundation_encoder
+from mirafrag.encoders.aimnet import AIMNET2_ATOMIC_NUMBERS, AIMNET2_R_MAX
 from mirafrag.evaluation import support_diagnostics
 from mirafrag.fragments import (
     collate_fragment_candidates,
-    fragment_config_from_model_config,
+    fragment_support_profile_from_model_config,
 )
 from mirafrag.spectra import (
     MASS_SPEC_GYM_BIN_WIDTH,
@@ -106,6 +113,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help='Show tqdm progress while computing diagnostics.',
     )
+    add_high_ce_fragment_support_args(parser)
     parser.add_argument(
         '--massspecgym-filter',
         action=argparse.BooleanOptionalAction,
@@ -127,7 +135,8 @@ def main() -> None:
         mz_max=args.mz_max,
         bin_width=args.bin_width,
     )
-    fragment_config = fragment_config_from_model_config(config)
+    apply_fragment_args_to_model_config(config, args)
+    fragment_support_profile = fragment_support_profile_from_model_config(config)
 
     df = read_table(args.input)
     if args.massspecgym_filter:
@@ -165,7 +174,7 @@ def main() -> None:
         memory_cache=args.memory_cache,
         disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
-        fragment_config=fragment_config,
+        fragment_support_profile=fragment_support_profile,
     )
 
     rows, summary = compute_oracle_diagnostics(
@@ -219,8 +228,83 @@ def _load_oracle_checkpoint_config(
             f'imply {expected_bins} bins.'
         )
     metadata_config = MetadataConfig.from_dict(payload['metadata_config'])
-    graph_config = _graph_config_from_state_dict(payload['model_state_dict'])
+    graph_config = _graph_config_from_payload(payload, config)
     return config, metadata_config, graph_config
+
+
+def _graph_config_from_payload(
+    payload: dict[str, Any],
+    config: MiraFragConfig,
+) -> GraphConfig:
+    """
+    Reconstruct graph settings from checkpoint metadata or encoder config.
+    """
+    if payload.get('graph_config') is not None:
+        return _graph_config_from_dict(payload['graph_config'])
+    try:
+        return _graph_config_from_state_dict(payload['model_state_dict'])
+    except ValueError:
+        static_graph_config = _graph_config_from_static_encoder_config(config)
+        if static_graph_config is not None:
+            return static_graph_config
+        try:
+            return _graph_config_from_encoder_config(config)
+        except Exception as fallback_exc:
+            raise ValueError(
+                'Checkpoint does not store graph_config or persistent encoder '
+                'atomic_numbers/r_max buffers, and the encoder fallback failed.'
+            ) from fallback_exc
+
+
+def _graph_config_from_dict(data: dict[str, Any]) -> GraphConfig:
+    """
+    Reconstruct GraphConfig from checkpoint metadata.
+    """
+    values: dict[str, Any] = {}
+    for field in fields(GraphConfig):
+        if field.name in data:
+            values[field.name] = data[field.name]
+        elif field.default is not MISSING:
+            values[field.name] = field.default
+        else:
+            raise ValueError(f'Checkpoint graph_config is missing {field.name!r}.')
+    values['atomic_numbers'] = tuple(int(value) for value in values['atomic_numbers'])
+    values['cutoff'] = float(values['cutoff'])
+    return GraphConfig(**values)
+
+
+def _graph_config_from_static_encoder_config(
+    config: MiraFragConfig,
+) -> GraphConfig | None:
+    """
+    Return graph settings for known nonpersistent encoder metadata.
+    """
+    if (
+        config.encoder_type == 'aimnet'
+        and config.aimnet_path is None
+        and (config.aimnet_model is None or config.aimnet_model == 'aimnet2')
+    ):
+        return GraphConfig(
+            atomic_numbers=tuple(AIMNET2_ATOMIC_NUMBERS),
+            cutoff=float(AIMNET2_R_MAX),
+        )
+    return None
+
+
+def _graph_config_from_encoder_config(config: MiraFragConfig) -> GraphConfig:
+    """
+    Load the configured foundation encoder to recover graph settings.
+    """
+    encoder = load_foundation_encoder(
+        encoder_type=config.encoder_type,
+        foundation_source=config.foundation_source,
+        foundation_model=config.foundation_model,
+        foundation_path=config.foundation_path,
+        aimnet_model=config.aimnet_model,
+        aimnet_path=config.aimnet_path,
+        device='cpu',
+    )
+    return infer_graph_config(encoder)
 
 
 def _graph_config_from_state_dict(state_dict: dict[str, torch.Tensor]) -> GraphConfig:

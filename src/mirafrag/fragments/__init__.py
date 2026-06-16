@@ -19,7 +19,13 @@ from mirafrag.adducts import (
 )
 from mirafrag.fragments.candidates import smiles_to_fragment_candidates
 from mirafrag.fragments.collate import collate_fragment_candidates
-from mirafrag.fragments.config import FragmentConfig, fragment_config_from_model_config
+from mirafrag.fragments.config import (
+    FragmentConfig,
+    FragmentSupportProfile,
+    fragment_config_from_model_config,
+    fragment_support_profile_from_model_config,
+    high_ce_fragment_config_from_model_config,
+)
 from mirafrag.fragments.constants import FRAGMENT_EDGE_FEATURE_DIM, FRAGMENT_FEATURE_DIM
 
 __all__ = [
@@ -31,8 +37,11 @@ __all__ = [
     'SODIUM_ADDUCT_MASS',
     'FragmentAdduct',
     'FragmentConfig',
+    'FragmentSupportProfile',
     'fragment_adduct_mass',
     'fragment_config_from_model_config',
+    'fragment_support_profile_from_model_config',
+    'high_ce_fragment_config_from_model_config',
     'parse_fragment_adduct',
     'smiles_to_fragment_candidates',
     'collate_fragment_candidates',

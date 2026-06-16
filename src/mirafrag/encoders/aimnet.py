@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 AIMNET2_ATOMIC_NUMBERS = (1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53)
+AIMNET2_R_MAX = 5.0
 
 
 def load_aimnet_encoder(

@@ -6,7 +6,12 @@ from torch.utils.data import DataLoader
 
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
-from mirafrag.cli.common import resolve_device, validate_checkpoint_bin_config
+from mirafrag.cli.common import (
+    add_high_ce_fragment_support_args,
+    apply_fragment_args_to_model_config,
+    resolve_device,
+    validate_checkpoint_bin_config,
+)
 from mirafrag.data import (
     BinnedSpectrumDataset,
     collate_spectrum_batch,
@@ -15,7 +20,7 @@ from mirafrag.data import (
     read_table,
 )
 from mirafrag.evaluation import evaluate_model, probability_mode_from_checkpoint_payload
-from mirafrag.fragments import fragment_config_from_model_config
+from mirafrag.fragments import fragment_support_profile_from_model_config
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
@@ -50,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--min-intensity', type=float, default=0.001)
     parser.add_argument('--top-k', type=int, default=100)
+    add_high_ce_fragment_support_args(parser)
     parser.add_argument(
         '--progress',
         action=argparse.BooleanOptionalAction,
@@ -79,6 +85,7 @@ def main() -> None:
         mz_max=args.mz_max,
         bin_width=args.bin_width,
     )
+    apply_fragment_args_to_model_config(model.config, args)
     df = read_table(args.input)
     graph_config = infer_graph_config(model.encoder)
     df, element_stats = filter_supported_elements(
@@ -102,7 +109,9 @@ def main() -> None:
         memory_cache=args.memory_cache,
         disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
-        fragment_config=fragment_config_from_model_config(model.config),
+        fragment_support_profile=fragment_support_profile_from_model_config(
+            model.config
+        ),
     )
     loader = DataLoader(
         ds,

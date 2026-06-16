@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from mirafrag.chem import infer_graph_config
 from mirafrag.config import mirafrag_config_from_dict
 from mirafrag.data import MetadataConfig
 from mirafrag.encoders import load_foundation_encoder
@@ -33,6 +34,7 @@ def save_checkpoint(
         'model_state_dict': model.state_dict(),
         'mirafrag_config': asdict(model.config),
         'metadata_config': model.metadata_config.to_dict(),
+        'graph_config': asdict(infer_graph_config(model.encoder)),
         'train_config': train_config or {},
     }
     torch.save(payload, path)

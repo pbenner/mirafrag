@@ -18,6 +18,7 @@ from mirafrag.cache_fill import prefill_feature_cache
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
 from mirafrag.cli.common import (
+    add_high_ce_fragment_support_args,
     apply_fragment_args_to_model_config,
     resolve_device,
     validate_checkpoint_bin_config,
@@ -34,7 +35,7 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.encoders import load_foundation_encoder
-from mirafrag.fragments import fragment_config_from_model_config
+from mirafrag.fragments import fragment_support_profile_from_model_config
 from mirafrag.losses import LOSS_NAMES
 from mirafrag.model import MiraFragModel, set_encoder_finetune_strategy
 from mirafrag.spectra import (
@@ -240,6 +241,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Maximum isotope peaks retained per fragment formula.',
     )
+    add_high_ce_fragment_support_args(parser)
     parser.add_argument(
         '--fine-tune-strategy',
         choices=['head', 'delta', 'full'],
@@ -602,6 +604,11 @@ def main() -> None:
                 args.max_fragment_edges,
                 'max_fragment_edges',
             ),
+            high_ce_fragment_threshold=args.high_ce_fragment_threshold,
+            high_ce_max_fragment_tree_depth=args.high_ce_max_fragment_tree_depth,
+            high_ce_max_fragment_broken_bonds=args.high_ce_max_fragment_broken_bonds,
+            high_ce_max_fragments=args.high_ce_max_fragments,
+            high_ce_max_fragment_edges=args.high_ce_max_fragment_edges,
             include_fragment_isotopes=_mirafrag_config_value(
                 args.include_fragment_isotopes,
                 'include_fragment_isotopes',
@@ -625,7 +632,7 @@ def main() -> None:
             aimnet_path=args.aimnet_path,
         )
         model = MiraFragModel(encoder, metadata_config=metadata_config, config=config)
-    fragment_config = fragment_config_from_model_config(model.config)
+    fragment_support_profile = fragment_support_profile_from_model_config(model.config)
 
     train_ds = BinnedSpectrumDataset(
         train_df,
@@ -636,7 +643,7 @@ def main() -> None:
         memory_cache=args.memory_cache,
         disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
-        fragment_config=fragment_config,
+        fragment_support_profile=fragment_support_profile,
         slow_sample_seconds=args.slow_sample_seconds,
         trace_samples=args.trace_samples,
     )
@@ -650,7 +657,7 @@ def main() -> None:
             memory_cache=args.memory_cache,
             disk_cache_dir=args.disk_cache_dir,
             include_fragments=True,
-            fragment_config=fragment_config,
+            fragment_support_profile=fragment_support_profile,
             slow_sample_seconds=args.slow_sample_seconds,
             trace_samples=args.trace_samples,
         )
@@ -987,24 +994,28 @@ def _validation_tune_candidates(
     if args.tune_trials < 1:
         raise SystemExit('--tune-trials must be positive.')
     tune_epochs = int(args.tune_epochs)
+    tune_head_lrs = getattr(args, 'tune_head_lrs', None)
+    tune_encoder_lrs = getattr(args, 'tune_encoder_lrs', None)
+    tune_head_weight_decays = getattr(args, 'tune_head_weight_decays', None)
+    tune_encoder_weight_decays = getattr(args, 'tune_encoder_weight_decays', None)
     head_lrs = _parse_positive_float_list(
-        args.tune_head_lrs or args.tune_lrs,
-        name='--tune-head-lrs' if args.tune_head_lrs else '--tune-lrs',
+        tune_head_lrs or args.tune_lrs,
+        name='--tune-head-lrs' if tune_head_lrs else '--tune-lrs',
     )
     encoder_lrs = _parse_positive_float_list(
-        args.tune_encoder_lrs or args.tune_lrs,
-        name='--tune-encoder-lrs' if args.tune_encoder_lrs else '--tune-lrs',
+        tune_encoder_lrs or args.tune_lrs,
+        name='--tune-encoder-lrs' if tune_encoder_lrs else '--tune-lrs',
     )
     dropouts = _parse_dropout_list(args.tune_dropouts)
     head_weight_decays = _parse_nonnegative_float_list(
-        args.tune_head_weight_decays or '0',
+        tune_head_weight_decays or '0',
         name='--tune-head-weight-decays',
     )
     encoder_weight_decays = _parse_nonnegative_float_list(
-        args.tune_encoder_weight_decays or args.tune_weight_decays,
+        tune_encoder_weight_decays or args.tune_weight_decays,
         name=(
             '--tune-encoder-weight-decays'
-            if args.tune_encoder_weight_decays
+            if tune_encoder_weight_decays
             else '--tune-weight-decays'
         ),
     )

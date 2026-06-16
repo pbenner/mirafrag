@@ -24,6 +24,7 @@ from mirafrag.chem import (
 )
 from mirafrag.fragments import (
     FragmentConfig,
+    FragmentSupportProfile,
     collate_fragment_candidates,
     smiles_to_fragment_candidates,
 )
@@ -468,6 +469,7 @@ class BinnedSpectrumDataset(Dataset):
         disk_cache_dir: str | Path | None = None,
         include_fragments: bool = False,
         fragment_config: FragmentConfig | None = None,
+        fragment_support_profile: FragmentSupportProfile | None = None,
         slow_sample_seconds: float = 0.0,
         trace_samples: bool = False,
     ) -> None:
@@ -485,7 +487,15 @@ class BinnedSpectrumDataset(Dataset):
         self.memory_cache = memory_cache
         self.disk_cache_dir = Path(disk_cache_dir) if disk_cache_dir else None
         self.include_fragments = include_fragments
-        self.fragment_config = fragment_config or FragmentConfig()
+        self.fragment_config = (
+            fragment_config
+            or (fragment_support_profile.base if fragment_support_profile else None)
+            or FragmentConfig()
+        )
+        self.fragment_support_profile = (
+            fragment_support_profile
+            or FragmentSupportProfile(base=self.fragment_config)
+        )
         self.slow_sample_seconds = float(slow_sample_seconds)
         self.trace_samples = bool(trace_samples)
         self._graph_cache: dict[int, dict[str, torch.Tensor]] = {}
@@ -532,6 +542,19 @@ class BinnedSpectrumDataset(Dataset):
             self._graph_cache[idx] = graph
         return graph
 
+    def _fragment_config_for_row(self, idx: int) -> FragmentConfig:
+        """
+        Return base or high-collision-energy fragment support for one row.
+        """
+        collision_energy = (
+            _coerce_optional_float(self.df.at[idx, self.ce_col])
+            if self.ce_col is not None
+            else None
+        )
+        return self.fragment_support_profile.config_for_collision_energy(
+            collision_energy
+        )
+
     def _fragments(self, idx: int) -> dict[str, Any]:
         """
         Load or compute fragment candidates for one row.
@@ -544,12 +567,13 @@ class BinnedSpectrumDataset(Dataset):
         adduct = (
             _coerce_string(self.df.at[idx, self.adduct_col]) if self.adduct_col else ''
         )
+        fragment_config = self._fragment_config_for_row(idx)
         if self.disk_cache_dir is not None:
             path = self._feature_cache_path(
                 'fragments',
                 smiles,
                 {
-                    'fragment_config': asdict(self.fragment_config),
+                    'fragment_config': asdict(fragment_config),
                     'adduct': adduct,
                     'mz_max': self.mz_max,
                     'bin_width': self.bin_width,
@@ -565,13 +589,48 @@ class BinnedSpectrumDataset(Dataset):
             mz_max=self.mz_max,
             bin_width=self.bin_width,
             adduct=adduct,
-            config=self.fragment_config,
+            config=fragment_config,
         )
         if self.disk_cache_dir is not None:
             _save_feature_cache(path, fragments)
         if self.memory_cache:
             self._fragment_cache[idx] = fragments
         return fragments
+
+    def materialize_feature_cache(self, idx: int) -> None:
+        """
+        Compute graph and fragment features for one row without building targets.
+        """
+        start = time.perf_counter()
+        row = self.df.iloc[idx]
+        smiles = str(row[self.smiles_col])
+        identifier = str(row.get('identifier', idx))
+        if self.trace_samples:
+            print(
+                f'start MiraFrag cache idx={idx} identifier={identifier!r} '
+                f'smiles={smiles!r}',
+                file=sys.stderr,
+                flush=True,
+            )
+        graph_start = start
+        self._graph(idx)
+        graph_seconds = time.perf_counter() - graph_start
+        fragment_seconds = 0.0
+        if self.include_fragments:
+            fragment_start = time.perf_counter()
+            self._fragments(idx)
+            fragment_seconds = time.perf_counter() - fragment_start
+        elapsed = time.perf_counter() - start
+        if self.slow_sample_seconds > 0 and elapsed >= self.slow_sample_seconds:
+            print(
+                'slow MiraFrag cache sample '
+                f'idx={idx} identifier={identifier!r} '
+                f'elapsed={elapsed:.2f}s graph={graph_seconds:.2f}s '
+                f'fragments={fragment_seconds:.2f}s '
+                f'smiles={smiles!r}',
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _feature_cache_path(
         self,

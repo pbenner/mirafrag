@@ -34,6 +34,7 @@ from mirafrag.fragments import (
     PROTON_MASS,
     SODIUM_ADDUCT_MASS,
     FragmentConfig,
+    FragmentSupportProfile,
     collate_fragment_candidates,
     fragment_config_from_model_config,
     parse_fragment_adduct,
@@ -179,6 +180,63 @@ def test_graph_cache_is_namespaced_but_fragment_cache_is_shared(tmp_path):
     assert graph_path_b.parent.parent == cache_dir / 'graphs'
     assert fragment_path_a == fragment_path_b
     assert fragment_path_a.parent == cache_dir / 'fragments'
+
+
+def test_high_ce_fragment_support_selects_row_specific_cache_config(tmp_path):
+    df = _tiny_training_df()
+    df.loc[1, 'collision_energy'] = 70.0
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    base = FragmentConfig(
+        max_tree_depth=1,
+        max_broken_bonds=2,
+        max_fragments=16,
+        max_edges=32,
+    )
+    high_ce = FragmentConfig(
+        max_tree_depth=4,
+        max_broken_bonds=8,
+        max_fragments=64,
+        max_edges=128,
+    )
+    dataset = BinnedSpectrumDataset(
+        df,
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=True,
+        disk_cache_dir=tmp_path / 'features',
+        fragment_support_profile=FragmentSupportProfile(
+            base=base,
+            high_ce_threshold=60.0,
+            high_ce=high_ce,
+        ),
+    )
+
+    assert dataset._fragment_config_for_row(0) == base
+    assert dataset._fragment_config_for_row(1) == high_ce
+    low_path = dataset._feature_cache_path(
+        'fragments',
+        df.at[0, 'smiles'],
+        {
+            'fragment_config': asdict(base),
+            'adduct': '[M+H]+',
+            'mz_max': 64.0,
+            'bin_width': 1.0,
+        },
+    )
+    high_path = dataset._feature_cache_path(
+        'fragments',
+        df.at[1, 'smiles'],
+        {
+            'fragment_config': asdict(high_ce),
+            'adduct': '[M+H]+',
+            'mz_max': 64.0,
+            'bin_width': 1.0,
+        },
+    )
+    assert low_path != high_path
 
 
 def test_filter_supported_elements_drops_unsupported_boron():

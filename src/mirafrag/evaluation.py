@@ -144,8 +144,28 @@ def evaluate_model(
                 row['oracle_tolerance_cosine'] = float(
                     diagnostics['oracle_tolerance_cosine'][i].detach().cpu()
                 )
+                row['support_gap'] = 1.0 - row['oracle_binned_cosine']
+                row['scorer_gap'] = row['oracle_binned_cosine'] - row['cosine']
+                row['tolerance_scorer_gap'] = (
+                    row['oracle_tolerance_cosine'] - row['cosine']
+                )
+                row['oos_calibration_error'] = (
+                    row['predicted_oos_probability'] - row['oos_target_mass']
+                )
+                row['oos_calibration_abs_error'] = abs(row['oos_calibration_error'])
             rows.append(row)
 
+    support_gaps = [1.0 - value for value in all_oracle_binned]
+    scorer_gaps = [
+        oracle - cosine for oracle, cosine in zip(all_oracle_binned, all_cos)
+    ]
+    tolerance_scorer_gaps = [
+        oracle - cosine for oracle, cosine in zip(all_oracle_tolerance, all_cos)
+    ]
+    oos_errors = [
+        predicted - target
+        for predicted, target in zip(all_predicted_oos, all_oos_target_mass)
+    ]
     summary = {
         'cosine_mean': _mean_or_nan(all_cos),
         'sqrt_cosine_mean': _mean_or_nan(all_sqrt),
@@ -155,6 +175,13 @@ def evaluate_model(
         'oos_target_mass_mean': _mean_or_nan(all_oos_target_mass),
         'oracle_binned_cosine_mean': _mean_or_nan(all_oracle_binned),
         'oracle_tolerance_cosine_mean': _mean_or_nan(all_oracle_tolerance),
+        'support_gap_mean': _mean_or_nan(support_gaps),
+        'scorer_gap_mean': _mean_or_nan(scorer_gaps),
+        'tolerance_scorer_gap_mean': _mean_or_nan(tolerance_scorer_gaps),
+        'oos_calibration_error_mean': _mean_or_nan(oos_errors),
+        'oos_calibration_abs_error_mean': _mean_or_nan(
+            [abs(value) for value in oos_errors]
+        ),
     }
     return pd.DataFrame(rows), summary
 

@@ -8,7 +8,12 @@ from torch.utils.data import DataLoader
 from mirafrag.cache_fill import prefill_feature_cache
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import infer_graph_config, quiet_rdkit_logs
-from mirafrag.cli.common import resolve_device, validate_checkpoint_bin_config
+from mirafrag.cli.common import (
+    add_high_ce_fragment_support_args,
+    apply_fragment_args_to_model_config,
+    resolve_device,
+    validate_checkpoint_bin_config,
+)
 from mirafrag.data import (
     ADDUCT_ALIASES,
     CE_ALIASES,
@@ -24,7 +29,7 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.evaluation import evaluate_model, probability_mode_from_checkpoint_payload
-from mirafrag.fragments import fragment_config_from_model_config
+from mirafrag.fragments import fragment_support_profile_from_model_config
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
 
 
@@ -120,6 +125,7 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help='Number of global quantile bins for collision-energy stratification.',
     )
+    add_high_ce_fragment_support_args(parser)
     return parser.parse_args()
 
 
@@ -143,6 +149,7 @@ def main() -> None:
         mz_max=args.mz_max,
         bin_width=args.bin_width,
     )
+    apply_fragment_args_to_model_config(model.config, args)
 
     df = read_table(args.input)
     if args.massspecgym_filter:
@@ -180,7 +187,9 @@ def main() -> None:
         memory_cache=args.memory_cache,
         disk_cache_dir=args.disk_cache_dir,
         include_fragments=True,
-        fragment_config=fragment_config_from_model_config(model.config),
+        fragment_support_profile=fragment_support_profile_from_model_config(
+            model.config
+        ),
     )
     if args.disk_cache_dir is not None:
         prefill_feature_cache(
@@ -220,7 +229,11 @@ def main() -> None:
         f'candidate_coverage_mean={summary["candidate_coverage_mean"]:.5f} '
         f'oos_target_mass_mean={summary["oos_target_mass_mean"]:.5f} '
         f'oracle_binned_cosine_mean={summary["oracle_binned_cosine_mean"]:.5f} '
-        f'oracle_tolerance_cosine_mean={summary["oracle_tolerance_cosine_mean"]:.5f}'
+        f'oracle_tolerance_cosine_mean={summary["oracle_tolerance_cosine_mean"]:.5f} '
+        f'support_gap_mean={summary["support_gap_mean"]:.5f} '
+        f'scorer_gap_mean={summary["scorer_gap_mean"]:.5f} '
+        f'oos_calibration_abs_error_mean='
+        f'{summary["oos_calibration_abs_error_mean"]:.5f}'
     )
     if args.stratify_metadata or args.stratify_output:
         predictions = _attach_metadata(predictions, df)
@@ -352,6 +365,11 @@ def _summarize_groups(
         'predicted_oos_probability',
         'oracle_binned_cosine',
         'oracle_tolerance_cosine',
+        'support_gap',
+        'scorer_gap',
+        'tolerance_scorer_gap',
+        'oos_calibration_error',
+        'oos_calibration_abs_error',
     ]
     rows = []
     for raw_keys, group in df.groupby(group_cols, dropna=False, observed=False):

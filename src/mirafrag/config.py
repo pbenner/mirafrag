@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from typing import Any
 
 
@@ -21,6 +21,11 @@ class MiraFragConfig:
     max_fragment_broken_bonds: int = 6
     max_fragments: int = 2048
     max_fragment_edges: int = 8192
+    high_ce_fragment_threshold: float | None = None
+    high_ce_max_fragment_tree_depth: int | None = None
+    high_ce_max_fragment_broken_bonds: int | None = None
+    high_ce_max_fragments: int | None = None
+    high_ce_max_fragment_edges: int | None = None
     include_fragment_isotopes: bool = True
     fragment_isotope_threshold: float = 0.001
     max_fragment_isotope_peaks: int = 1
@@ -35,16 +40,30 @@ class MiraFragConfig:
     aimnet_path: str | None = None
 
 
+_LEGACY_EXPERIMENTAL_FIELDS = {
+    'neutral_loss_layers',
+    'ce_regime_heads',
+    'aimnet_adapter_layers',
+    'aimnet_adapter_hidden_dim',
+    'aimnet_adapter_feature_dim',
+    'aimnet_adapter_dropout',
+}
+
+
 def mirafrag_config_from_dict(data: dict[str, Any]) -> MiraFragConfig:
     """
     Reconstruct :class:`MiraFragConfig` from checkpoint data.
 
-    The loader is intentionally strict: missing or unknown fields raise errors rather than being silently ignored. This prevents ambiguous checkpoint compatibility after architecture changes.
+    The loader is strict about unknown fields and required fields without defaults. Missing optional fields are filled from dataclass defaults so checkpoints created before optional config extensions remain usable.
     """
     expected = {field.name for field in fields(MiraFragConfig)}
     supplied = set(data)
-    missing = expected - supplied
-    unknown = supplied - expected
+    missing = {
+        field.name
+        for field in fields(MiraFragConfig)
+        if field.name not in supplied and field.default is MISSING
+    }
+    unknown = supplied - expected - _LEGACY_EXPERIMENTAL_FIELDS
     if missing or unknown:
         parts = []
         if missing:
@@ -54,6 +73,10 @@ def mirafrag_config_from_dict(data: dict[str, Any]) -> MiraFragConfig:
         raise ValueError(
             'Invalid MiraFragConfig checkpoint payload: ' + ', '.join(parts)
         )
-    return MiraFragConfig(
-        **{field.name: data[field.name] for field in fields(MiraFragConfig)}
-    )
+    values = {}
+    for field in fields(MiraFragConfig):
+        if field.name in data:
+            values[field.name] = data[field.name]
+        elif field.default is not MISSING:
+            values[field.name] = field.default
+    return MiraFragConfig(**values)
