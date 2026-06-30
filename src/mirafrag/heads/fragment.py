@@ -581,13 +581,21 @@ class FragmentSpectrumHead(nn.Module):
         if num_fragments == 0:
             return pooled
 
-        counts = (atom_ptr[1:] - atom_ptr[:-1]).clamp_min(1)
-        fragment_idx = torch.repeat_interleave(
-            torch.arange(num_fragments, device=node_feats.device),
-            counts.to(device=node_feats.device),
-        )
-        pooled.index_add_(0, fragment_idx, node_feats[atom_index])
-        return pooled / counts.to(
+        counts = (atom_ptr[1:] - atom_ptr[:-1]).clamp_min(0)
+        if atom_index.numel() > 0:
+            fragment_idx = torch.repeat_interleave(
+                torch.arange(num_fragments, device=node_feats.device),
+                counts.to(device=node_feats.device),
+            )
+            if fragment_idx.numel() != atom_index.numel():
+                raise ValueError(
+                    'Fragment atom pointer ranges do not match atom indices: '
+                    f'ptr_count={int(fragment_idx.numel())} '
+                    f'atom_count={int(atom_index.numel())}'
+                )
+            pooled.index_add_(0, fragment_idx, node_feats[atom_index])
+        safe_counts = counts.clamp_min(1)
+        return pooled / safe_counts.to(
             dtype=node_feats.dtype, device=node_feats.device
         ).unsqueeze(-1)
 

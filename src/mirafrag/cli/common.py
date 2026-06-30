@@ -74,7 +74,7 @@ def add_high_ce_fragment_support_args(parser) -> None:
         type=float,
         default=None,
         help=(
-            'Raw collision-energy threshold at which rows switch to expanded '
+            'Raw collision-energy threshold above which rows switch to expanded '
             'fragment support; unset keeps one global fragment config.'
         ),
     )

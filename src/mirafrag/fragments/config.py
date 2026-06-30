@@ -31,7 +31,7 @@ class FragmentSupportProfile:
     """
     Row-level fragment support profile.
 
-    Most spectra use base. Rows whose raw collision energy is at or above
+    Most spectra use base. Rows whose raw collision energy is above
     high_ce_threshold use high_ce when it is configured. This keeps the
     normal cache compact while allowing targeted high-collision-energy support
     experiments.
@@ -53,7 +53,7 @@ class FragmentSupportProfile:
         threshold = _finite_float_or_none(self.high_ce_threshold)
         if value is None or threshold is None:
             return self.base
-        if value >= threshold:
+        if value > threshold:
             return self.high_ce
         return self.base
 

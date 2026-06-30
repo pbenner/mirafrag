@@ -47,6 +47,10 @@ _LEGACY_EXPERIMENTAL_FIELDS = {
     'aimnet_adapter_hidden_dim',
     'aimnet_adapter_feature_dim',
     'aimnet_adapter_dropout',
+    'fragment_transition_features',
+    'encoder_bond_adapter_layers',
+    'encoder_bond_adapter_dropout',
+    'encoder_bond_adapter_feature_dim',
 }
 
 

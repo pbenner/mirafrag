@@ -329,6 +329,24 @@ def parse_args() -> argparse.Namespace:
         help='Optional disk cache for precomputed encoder graphs and fragment candidates.',
     )
     parser.add_argument(
+        '--prefill-cache',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Precompute missing disk-cache entries before constructing DataLoaders.',
+    )
+    parser.add_argument(
+        '--cache-num-workers',
+        type=int,
+        default=None,
+        help='Worker count for disk-cache prefill. Defaults to --num-workers.',
+    )
+    parser.add_argument(
+        '--cache-chunk-size',
+        type=int,
+        default=None,
+        help='Chunk size for disk-cache prefill. Defaults to 1.',
+    )
+    parser.add_argument(
         '--slow-sample-seconds',
         type=float,
         default=0.0,
@@ -527,8 +545,8 @@ def main() -> None:
             mz_max=args.mz_max,
             bin_width=args.bin_width,
         )
-        set_encoder_finetune_strategy(model, fine_tune_strategy)
         _apply_fragment_args_to_model_config(model.config, args)
+        set_encoder_finetune_strategy(model, fine_tune_strategy)
         metadata_config = model.metadata_config
         print(
             'Loaded init checkpoint '
@@ -552,7 +570,10 @@ def main() -> None:
             device=device,
         )
     graph_source = model.encoder if args.init_checkpoint else encoder
-    graph_config = infer_graph_config(graph_source, seed=args.seed)
+    graph_config = infer_graph_config(
+        graph_source,
+        seed=args.seed,
+    )
     train_df, train_element_stats = filter_supported_elements(
         train_df,
         supported_atomic_numbers=graph_config.atomic_numbers,
@@ -664,20 +685,26 @@ def main() -> None:
         if not val_df.empty
         else None
     )
-    if args.disk_cache_dir is not None:
+    if args.disk_cache_dir is not None and args.prefill_cache:
+        cache_num_workers = (
+            args.num_workers
+            if args.cache_num_workers is None
+            else args.cache_num_workers
+        )
+        cache_chunk_size = 1 if args.cache_chunk_size is None else args.cache_chunk_size
         prefill_feature_cache(
             train_ds,
             split_name='train',
-            chunk_size=args.batch_size,
-            num_workers=args.num_workers,
+            chunk_size=cache_chunk_size,
+            num_workers=cache_num_workers,
             show_progress=args.progress,
         )
         if val_ds is not None:
             prefill_feature_cache(
                 val_ds,
                 split_name='val',
-                chunk_size=args.batch_size,
-                num_workers=args.num_workers,
+                chunk_size=cache_chunk_size,
+                num_workers=cache_num_workers,
                 show_progress=args.progress,
             )
 
@@ -845,8 +872,8 @@ def _run_validation_tuning(
             mz_max=args.mz_max,
             bin_width=args.bin_width,
         )
-        set_encoder_finetune_strategy(trial_model, fine_tune_strategy)
         _apply_fragment_args_to_model_config(trial_model.config, args)
+        set_encoder_finetune_strategy(trial_model, fine_tune_strategy)
         _set_head_dropout(trial_model, candidate.dropout)
         trial_train_config = _train_config(
             args,
@@ -960,8 +987,8 @@ def _evaluate_validation_tune_initial(
         mz_max=args.mz_max,
         bin_width=args.bin_width,
     )
-    set_encoder_finetune_strategy(model, fine_tune_strategy)
     _apply_fragment_args_to_model_config(model.config, args)
+    set_encoder_finetune_strategy(model, fine_tune_strategy)
     model.to(device)
     stats = run_epoch(
         model,

@@ -45,6 +45,7 @@ from mirafrag.fragments import (
     parse_fragment_adduct,
     smiles_to_fragment_candidates,
 )
+from mirafrag.heads.fragment import FragmentSpectrumHead
 from mirafrag.losses import (
     LOSS_NAMES,
     fragnnet_sparse_cross_entropy,
@@ -84,6 +85,22 @@ class NonPersistentFakeMace(nn.Module):
 
     def forward(self, graph, **kwargs):
         return {'node_feats': self.proj(graph['node_attrs'].float())}
+
+
+def test_pool_fragment_atoms_allows_empty_pointer_ranges():
+    node_feats = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    atom_index = torch.tensor([0, 1, 3], dtype=torch.long)
+    atom_ptr = torch.tensor([0, 2, 2, 3], dtype=torch.long)
+
+    pooled = FragmentSpectrumHead._pool_fragment_atoms(
+        node_feats,
+        atom_index,
+        atom_ptr,
+    )
+
+    assert torch.allclose(pooled[0], node_feats[:2].mean(dim=0))
+    assert torch.allclose(pooled[1], torch.zeros(3))
+    assert torch.allclose(pooled[2], node_feats[3])
 
 
 def test_oracle_checkpoint_config_reads_saved_graph_config_for_nonpersistent_encoder(

@@ -3,6 +3,14 @@ import pytest
 from mirafrag.cache_fill import prefill_feature_cache
 
 
+class SimpleDataset:
+    def __len__(self):
+        return 5
+
+    def __getitem__(self, idx):
+        return int(idx)
+
+
 class FailingDataset:
     def __len__(self):
         return 3
@@ -37,3 +45,17 @@ def test_prefill_feature_cache_raises_by_default():
             show_progress=False,
             print_ready=False,
         )
+
+
+def test_prefill_feature_cache_parallel_completes():
+    failures = prefill_feature_cache(
+        SimpleDataset(),
+        split_name='test',
+        chunk_size=2,
+        num_workers=2,
+        show_progress=False,
+        print_ready=False,
+        ignore_errors=True,
+    )
+
+    assert failures == []

@@ -434,6 +434,15 @@ def test_fragment_support_profile_ignores_nonnumeric_collision_energy():
     assert profile.config_for_collision_energy(float('nan')) == profile.base
 
 
+def test_fragment_support_profile_uses_strict_high_ce_threshold():
+    config = MiraFragConfig(num_bins=16, high_ce_fragment_threshold=60.0)
+    profile = fragment_support_profile_from_model_config(config)
+
+    assert profile.high_ce is not None
+    assert profile.config_for_collision_energy(60.0) == profile.base
+    assert profile.config_for_collision_energy(60.0001) == profile.high_ce
+
+
 def test_mirafrag_config_from_dict_defaults_missing_high_ce_fields():
     config = MiraFragConfig(num_bins=16)
     payload = {
