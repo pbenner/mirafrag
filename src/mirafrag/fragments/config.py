@@ -24,6 +24,7 @@ class FragmentConfig:
     max_isotope_peaks: int = 1
     include_root: bool = True
     proton_mass: float = PROTON_MASS
+    include_bond_breaks: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,12 @@ def fragment_config_from_model_config(config: Any) -> FragmentConfig:
         include_isotopes=config.include_fragment_isotopes,
         isotope_threshold=config.fragment_isotope_threshold,
         max_isotope_peaks=config.max_fragment_isotope_peaks,
+        include_bond_breaks=bool(
+            getattr(config, 'fragment_bond_break_layers', 0) > 0
+            or getattr(config, 'fragment_action_primary_layers', 0) > 0
+            or getattr(config, 'fragment_action_bond_gnn_layers', 0) > 0
+            or getattr(config, 'physical_bond_features', False)
+        ),
     )
 
 
@@ -126,6 +133,7 @@ def high_ce_fragment_config_from_model_config(
         max_isotope_peaks=int(base.max_isotope_peaks),
         include_root=bool(base.include_root),
         proton_mass=float(base.proton_mass),
+        include_bond_breaks=bool(base.include_bond_breaks),
     )
 
 

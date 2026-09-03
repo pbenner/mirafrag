@@ -1,5 +1,6 @@
 # ruff: noqa: F401
 import math
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pandas as pd
@@ -8,6 +9,7 @@ from torch import nn
 from torch.nn import LazyLinear
 from torch.utils.data import DataLoader
 
+import mirafrag.checkpoint as checkpoint_module
 from mirafrag.checkpoint import load_checkpoint
 from mirafrag.chem import GraphConfig
 from mirafrag.cli.cache import (
@@ -27,8 +29,10 @@ from mirafrag.data import (
     select_split,
 )
 from mirafrag.encoders.mace import repair_mace_cuequivariance_config
+from mirafrag.encoders.unimol import UniMolNodeEncoder
 from mirafrag.evaluation import _sparse_prediction_rows
 from mirafrag.fragments import (
+    BOND_BREAK_FEATURE_DIM,
     FRAGMENT_EDGE_FEATURE_DIM,
     PROTON_MASS,
     SODIUM_ADDUCT_MASS,
@@ -65,6 +69,98 @@ from tests.helpers import (
     _tiny_loader,
     _tiny_training_df,
 )
+
+
+def test_state_checkpoint_loads_without_fragnnet_dag_parameters(monkeypatch):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    old_config = MiraFragConfig(num_bins=16, hidden_dim=8, metadata_dim=4)
+    old_model = MiraFragModel(FakeMace(), metadata_config=metadata, config=old_config)
+    new_config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        fragnnet_dag_layers=1,
+    )
+    payload = {
+        'checkpoint_format': checkpoint_module.CHECKPOINT_FORMAT,
+        'model_state_dict': old_model.state_dict(),
+        'mirafrag_config': asdict(new_config),
+        'metadata_config': metadata.to_dict(),
+        'train_config': {},
+    }
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        'load_foundation_encoder',
+        lambda **_kwargs: FakeMace(),
+    )
+
+    loaded = checkpoint_module._load_state_checkpoint_model(payload, device='cpu')
+
+    assert isinstance(loaded, MiraFragModel)
+    assert loaded.config.fragnnet_dag_layers == 1
+    assert len(loaded.head.fragnnet_dag_message_layers) == 1
+
+
+def test_state_checkpoint_loads_without_formula_count_parameters(monkeypatch):
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    config = MiraFragConfig(num_bins=16, hidden_dim=8, metadata_dim=4)
+    model = MiraFragModel(FakeMace(), metadata_config=metadata, config=config)
+    state = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not key.startswith('head.formula_count_')
+    }
+    payload = {
+        'checkpoint_format': checkpoint_module.CHECKPOINT_FORMAT,
+        'model_state_dict': state,
+        'mirafrag_config': asdict(config),
+        'metadata_config': metadata.to_dict(),
+        'train_config': {},
+    }
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        'load_foundation_encoder',
+        lambda **_kwargs: FakeMace(),
+    )
+
+    loaded = checkpoint_module._load_state_checkpoint_model(payload, device='cpu')
+
+    assert isinstance(loaded, MiraFragModel)
+    assert loaded.head.formula_count_encoder[-1].weight.abs().sum().item() == 0.0
+
+
+def test_mirafrag_forward_with_fragnnet_dag_scorer():
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    dataset = BinnedSpectrumDataset(
+        _tiny_training_df(),
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=True,
+        fragment_config=FragmentConfig(max_tree_depth=2, max_fragments=16),
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        collate_fn=collate_spectrum_batch,
+    )
+    config = MiraFragConfig(
+        num_bins=64,
+        hidden_dim=8,
+        metadata_dim=4,
+        fragnnet_dag_layers=2,
+    )
+    model = MiraFragModel(FakeMace(), metadata_config=metadata, config=config)
+    pred = model(next(iter(loader)))
+
+    assert pred['kind'] == 'sparse'
+    assert pred['logits'].shape == pred['mzs'].shape
+    assert pred['oos_logits'].shape == (2,)
 
 
 def test_mirafrag_forward_with_fake_mace():
@@ -187,6 +283,43 @@ def test_mirafrag_passes_charge_only_to_charge_aware_encoder():
         molecular_charge=model._molecular_charge(batch),
     )
     assert torch.equal(encoder.last_molecular_charge.cpu(), torch.tensor([-1.0]))
+
+
+def test_smiles_aware_encoder_requires_and_receives_smiles_for_direct_encoding():
+    class FakeSmilesEncoder(nn.Module):
+        uses_smiles = True
+
+        def __init__(self):
+            super().__init__()
+            self.last_smiles = None
+
+        def forward(self, graph, **kwargs):
+            self.last_smiles = kwargs.get('smiles')
+            return {'node_feats': torch.ones(graph['atomic_numbers'].numel(), 4)}
+
+    graph = {
+        'atomic_numbers': torch.tensor([6, 1]),
+        'positions': torch.zeros(2, 3),
+    }
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    encoder = FakeSmilesEncoder()
+    model = MiraFragModel(
+        encoder,
+        metadata_config=metadata,
+        config=MiraFragConfig(num_bins=16, hidden_dim=8, metadata_dim=4),
+    )
+
+    try:
+        model.encode_node_features(graph)
+    except ValueError as exc:
+        assert 'smiles are required' in str(exc)
+    else:
+        raise AssertionError('Expected SMILES-aware encoder to require smiles.')
+
+    out = model.encode_node_features(graph, smiles=['C'])
+
+    assert out.shape == (2, 4)
+    assert encoder.last_smiles == ['C']
 
 
 def test_charge_aware_encoder_requires_charge_for_direct_encoding():
@@ -330,6 +463,55 @@ def test_fragment_path_scorer_starts_as_noop_and_can_train_output_layer():
     assert torch.count_nonzero(final_layer.weight.grad).item() > 0
 
 
+def test_fragment_path_residual_chunking_matches_full_concat():
+    torch.manual_seed(23)
+    config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_path_layers=1,
+    )
+    head = FragmentSpectrumHead(config)
+    final_layer = head.fragment_path_residual[-1]
+    assert isinstance(final_layer, nn.Linear)
+    nn.init.normal_(final_layer.weight, mean=0.0, std=0.1)
+    nn.init.normal_(final_layer.bias, mean=0.0, std=0.1)
+    formula_features = torch.randn(17, 8, requires_grad=True)
+    context_features = torch.randn(17, 8, requires_grad=True)
+    collision_features = torch.randn(17, 8, requires_grad=True)
+    path_features = torch.randn(17, 8, requires_grad=True)
+
+    chunked = head._fragment_path_residual_logits(
+        formula_features,
+        context_features,
+        collision_features,
+        path_features,
+    )
+    full_inputs = torch.cat(
+        [
+            formula_features,
+            context_features,
+            formula_features * context_features,
+            collision_features,
+            formula_features * collision_features,
+            path_features,
+            formula_features * path_features,
+            context_features * path_features,
+        ],
+        dim=-1,
+    )
+    full = head.fragment_path_residual(full_inputs).squeeze(-1)
+
+    assert torch.allclose(chunked, full)
+    chunked.sum().backward(retain_graph=True)
+    chunked_grad = formula_features.grad.detach().clone()
+    formula_features.grad.zero_()
+    full.sum().backward()
+
+    assert torch.allclose(formula_features.grad, chunked_grad)
+
+
 def test_fragment_path_propagation_starts_only_from_retained_roots():
     head = FragmentSpectrumHead(
         MiraFragConfig(
@@ -404,6 +586,110 @@ def test_fragment_path_gradients_stay_finite_with_unreachable_frontier_nodes():
         for param in module.parameters():
             assert param.grad is not None
             assert torch.isfinite(param.grad).all()
+
+
+def test_fragment_action_bond_gnn_branch_preserves_initial_head_predictions():
+    config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_gnn_layers=1,
+    )
+    gnn_config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_gnn_layers=1,
+        fragment_action_bond_gnn_layers=2,
+    )
+    node_feats = torch.randn(4, 5)
+    metadata_features = torch.randn(1, 10)
+    graph_batch = torch.zeros(4, dtype=torch.long)
+    fragments = {
+        'batch': torch.zeros(3, dtype=torch.long),
+        'formula_batch': torch.zeros(3, dtype=torch.long),
+        'atom_index': torch.tensor([0, 1, 2], dtype=torch.long),
+        'atom_ptr': torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        'features': torch.randn(3, 6),
+        'edge_index': torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        'edge_attr': torch.zeros(2, FRAGMENT_EDGE_FEATURE_DIM),
+        'formula_index': torch.tensor([0, 1, 2], dtype=torch.long),
+        'mz': torch.tensor([10.0, 20.0, 30.0]),
+        'bin': torch.tensor([10, 20, 30], dtype=torch.long),
+        'log_prior': torch.zeros(3),
+        'bond_atom_index': torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long),
+        'bond_ptr': torch.tensor([0, 1, 3, 3], dtype=torch.long),
+        'bond_features': torch.rand(3, BOND_BREAK_FEATURE_DIM),
+    }
+
+    torch.manual_seed(23)
+    base_head = FragmentSpectrumHead(config)
+    torch.manual_seed(23)
+    gnn_head = FragmentSpectrumHead(gnn_config)
+    torch.manual_seed(29)
+    base_pred = base_head(node_feats, fragments, metadata_features, graph_batch)
+    torch.manual_seed(29)
+    gnn_pred = gnn_head(node_feats, fragments, metadata_features, graph_batch)
+
+    assert torch.allclose(gnn_pred['logits'], base_pred['logits'])
+    assert torch.allclose(gnn_pred['oos_logits'], base_pred['oos_logits'])
+
+
+def test_fragment_action_bond_gnn_residual_can_change_multibreak_scores():
+    config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        dropout=0.0,
+        fragment_action_bond_gnn_layers=1,
+    )
+    head = FragmentSpectrumHead(config)
+    node_feats = torch.randn(4, 5)
+    formula_features = torch.randn(3, 8)
+    context_features = torch.randn(3, 8)
+    collision_features = torch.randn(3, 8)
+    fragment_descriptor = torch.randn(3, 6)
+    formula_batch = torch.zeros(3, dtype=torch.long)
+    base_logits = torch.tensor([0.1, -0.2, 0.3])
+    fragments = {
+        'bond_atom_index': torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long),
+        'bond_ptr': torch.tensor([0, 1, 3, 3], dtype=torch.long),
+        'bond_features': torch.rand(3, BOND_BREAK_FEATURE_DIM),
+    }
+
+    delta = head._fragment_action_bond_gnn_delta(
+        node_feats,
+        formula_features,
+        context_features,
+        collision_features,
+        fragment_descriptor,
+        fragments,
+        formula_batch,
+        batch_size=1,
+        base_logits=base_logits,
+    )
+    assert torch.allclose(delta, torch.zeros_like(delta))
+
+    final_layer = head.fragment_action_bond_gnn_residual[-1]
+    assert isinstance(final_layer, nn.Linear)
+    nn.init.ones_(final_layer.weight)
+    nn.init.zeros_(final_layer.bias)
+    delta = head._fragment_action_bond_gnn_delta(
+        node_feats,
+        formula_features,
+        context_features,
+        collision_features,
+        fragment_descriptor,
+        fragments,
+        formula_batch,
+        batch_size=1,
+        base_logits=base_logits,
+    )
+
+    assert torch.isfinite(delta).all()
+    assert not torch.allclose(delta, torch.zeros_like(delta))
 
 
 def test_fragment_path_branch_preserves_initial_head_predictions():
@@ -542,6 +828,37 @@ def test_metadata_config_learns_collision_energy_scaling():
     assert metadata.collision_energy_by_instrument['CID']['center'] == 120.0
 
 
+def test_model_pools_merged_collision_energy_values_after_scaling():
+    metadata = MetadataConfig(
+        adduct_to_idx={'[M+H]+': 0},
+        instrument_to_idx={'HCD': 0, 'CID': 1},
+        precursor_mz_max=100.0,
+        collision_energy_center=50.0,
+        collision_energy_scale=10.0,
+        collision_energy_by_instrument={
+            'HCD': {'center': 20.0, 'scale': 5.0},
+        },
+    )
+    model = MiraFragModel(
+        FakeMace(),
+        metadata_config=metadata,
+        config=MiraFragConfig(num_bins=16, hidden_dim=8, metadata_dim=4),
+    )
+    features = model.metadata_features(
+        {
+            'precursor_mz': torch.tensor([50.0, 50.0]),
+            'collision_energy': torch.tensor([20.0, 70.0]),
+            'collision_energy_values': torch.tensor([10.0, 30.0, 70.0]),
+            'collision_energy_batch': torch.tensor([0, 0, 1]),
+            'adduct': torch.tensor([0, 0]),
+            'instrument_type': torch.tensor([0, 1]),
+        }
+    )
+
+    assert torch.allclose(features[:, 0], torch.tensor([0.5, 0.5]))
+    assert torch.allclose(features[:, 1], torch.tensor([0.0, 2.0]))
+
+
 def test_model_uses_instrument_specific_collision_energy_scaling():
     metadata = MetadataConfig(
         adduct_to_idx={'[M+H]+': 0},
@@ -568,3 +885,259 @@ def test_model_uses_instrument_specific_collision_energy_scaling():
     )
     assert torch.allclose(features[:, 0], torch.tensor([0.5, 0.5]))
     assert torch.allclose(features[:, 1], torch.tensor([1.0, 2.0]))
+
+
+def test_metadata_ce_interaction_is_zero_initialized_noop():
+    metadata = MetadataConfig(
+        adduct_to_idx={'[M+H]+': 0},
+        instrument_to_idx={'HCD': 0, 'CID': 1},
+        precursor_mz_max=100.0,
+        collision_energy_center=50.0,
+        collision_energy_scale=10.0,
+    )
+    config = MiraFragConfig(
+        num_bins=16,
+        hidden_dim=8,
+        metadata_dim=4,
+        metadata_ce_interaction=True,
+    )
+    model = MiraFragModel(FakeMace(), metadata_config=metadata, config=config)
+
+    assert model.metadata_ce_interaction is not None
+    assert torch.count_nonzero(model.metadata_ce_interaction.weight).item() == 0
+    assert torch.count_nonzero(model.metadata_ce_interaction.bias).item() == 0
+
+    batch = {
+        'precursor_mz': torch.tensor([50.0, 75.0]),
+        'collision_energy': torch.tensor([60.0, 70.0]),
+        'adduct': torch.tensor([0, 0]),
+        'instrument_type': torch.tensor([0, 1]),
+    }
+    features = model.metadata_features(batch)
+    expected_dim = 2 + 2 * config.metadata_dim
+    assert features.shape == (2, expected_dim)
+    assert torch.allclose(
+        features[:, -config.metadata_dim :],
+        model.instrument_embedding(batch['instrument_type']),
+    )
+
+
+def test_lazy_unimol_parameters_follow_fine_tune_strategy():
+    class FakeTrainableUniMol(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    encoder = UniMolNodeEncoder(max_atoms=8, mode='trainable')
+    model = MiraFragModel(
+        encoder,
+        metadata_config=metadata,
+        config=MiraFragConfig(
+            num_bins=16,
+            hidden_dim=8,
+            metadata_dim=4,
+            encoder_type='unimol',
+            encoder_finetune_strategy='head',
+        ),
+    )
+    model.encoder.unimol_model = FakeTrainableUniMol()
+
+    set_encoder_finetune_strategy(model, 'head')
+    assert not model.encoder.unimol_model.weight.requires_grad
+
+    set_encoder_finetune_strategy(model, 'full')
+    assert model.encoder.unimol_model.weight.requires_grad
+
+
+def test_trainable_unimol_encoder_preserves_gradients_and_atom_alignment(monkeypatch):
+    class FakeTrainableUniMol(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(2.0))
+            self.dictionary = object()
+
+        def batch_collate_fn(self, samples):
+            lengths = [sample[0]['length'] for sample in samples]
+            return {'lengths': torch.tensor(lengths, dtype=torch.long)}, None
+
+        def forward(self, lengths, return_repr=False, return_atomic_reprs=False):
+            assert return_repr
+            assert return_atomic_reprs
+            atomic_reprs = []
+            for length in lengths.tolist():
+                values = torch.arange(length, dtype=torch.float32).unsqueeze(-1)
+                atomic_reprs.append(values * self.weight)
+            return {'atomic_reprs': atomic_reprs}
+
+    encoder = UniMolNodeEncoder(max_atoms=8, mode='trainable')
+    encoder.unimol_model = FakeTrainableUniMol()
+
+    def fake_input_features(atomic_numbers, positions, ptr):
+        del positions
+        features = []
+        lengths = []
+        for start, end in zip(ptr[:-1].tolist(), ptr[1:].tolist(), strict=True):
+            length = int(end - start)
+            features.append({'length': length})
+            lengths.append(length)
+        assert sum(lengths) == int(atomic_numbers.numel())
+        return features, lengths
+
+    monkeypatch.setattr(encoder, '_input_features', fake_input_features)
+
+    def fake_atomic_reprs(model, net_input, expected_lengths):
+        result = model(
+            **net_input,
+            return_repr=True,
+            return_atomic_reprs=True,
+        )
+        assert expected_lengths == [2, 1]
+        return result['atomic_reprs']
+
+    monkeypatch.setattr(encoder, '_unimolv1_atomic_reprs', fake_atomic_reprs)
+    graph = {
+        'atomic_numbers': torch.tensor([6, 1, 8]),
+        'positions': torch.zeros(3, 3),
+        'ptr': torch.tensor([0, 2, 3]),
+    }
+
+    out = encoder(graph, training=True)
+    loss = out['node_feats'].sum()
+    loss.backward()
+
+    assert out['node_feats'].requires_grad
+    assert torch.allclose(out['node_feats'], torch.tensor([[0.0], [2.0], [0.0]]))
+    assert encoder.unimol_model.weight.grad is not None
+    assert encoder.unimol_model.weight.grad.item() == 1.0
+
+
+def test_trainable_unimolv2_maps_heavy_reprs_to_full_graph_and_keeps_gradients(
+    monkeypatch,
+):
+    class FakeTrainableUniMolV2(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(3.0))
+
+        def batch_collate_fn(self, samples):
+            lengths = [sample[0]['length'] for sample in samples]
+            return {'lengths': torch.tensor(lengths, dtype=torch.long)}, None
+
+        def forward(self, lengths, return_repr=False, return_atomic_reprs=False):
+            assert return_repr
+            assert return_atomic_reprs
+            atomic_reprs = []
+            for length in lengths.tolist():
+                values = torch.arange(1, length + 1, dtype=torch.float32).unsqueeze(-1)
+                atomic_reprs.append(values * self.weight)
+            return {'atomic_reprs': atomic_reprs}
+
+    encoder = UniMolNodeEncoder(max_atoms=8, mode='trainable', model_name='unimolv2')
+    encoder.unimol_model = FakeTrainableUniMolV2()
+
+    def fake_input_features_v2(atomic_numbers, positions, ptr, smiles):
+        del positions
+        assert smiles == ['CO']
+        assert ptr.tolist() == [0, 4]
+        assert atomic_numbers.tolist() == [6, 1, 8, 1]
+        return [{'length': 2}], [2], [torch.tensor([0, 0, 1, 1])]
+
+    monkeypatch.setattr(encoder, '_input_features_v2', fake_input_features_v2)
+    graph = {
+        'atomic_numbers': torch.tensor([6, 1, 8, 1]),
+        'positions': torch.zeros(4, 3),
+        'ptr': torch.tensor([0, 4]),
+    }
+
+    out = encoder(graph, training=True, smiles=['CO'])
+    loss = out['node_feats'].sum()
+    loss.backward()
+
+    assert out['node_feats'].requires_grad
+    assert torch.allclose(out['node_feats'], torch.tensor([[3.0], [3.0], [6.0], [6.0]]))
+    assert encoder.unimol_model.weight.grad is not None
+    assert encoder.unimol_model.weight.grad.item() == 6.0
+
+
+def test_trainable_unimolv2_features_collate_with_package_model():
+    try:
+        from unimol_tools.models.unimolv2 import UniMolV2Model
+    except ImportError:
+        return
+
+    class BareUniMolV2(UniMolV2Model):
+        def __init__(self):
+            pass
+
+    encoder = UniMolNodeEncoder(max_atoms=16, mode='trainable', model_name='unimolv2')
+    atomic_numbers = torch.tensor([6, 1, 8, 1, 6, 1, 1, 1])
+    positions = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.4, 0.0, 0.0],
+            [1.4, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    ptr = torch.tensor([0, 4, 8])
+
+    features, lengths, maps = encoder._input_features_v2(
+        atomic_numbers, positions, ptr, ['CO', 'C']
+    )
+    bare_model = BareUniMolV2()
+    bare_model.padding_idx = 0
+    batch, labels = UniMolV2Model.batch_collate_fn(
+        bare_model, [(feature, None) for feature in features]
+    )
+
+    assert labels is None
+    assert lengths == [2, 1]
+    assert [mapping.numel() for mapping in maps] == [4, 4]
+    assert batch['atom_feat'].shape == (2, 2, 8)
+    assert batch['edge_feat'].shape == (2, 2, 2, 3)
+    assert batch['attn_bias'].shape == (2, 3, 3)
+    assert batch['src_tokens'].shape == (2, 2)
+    assert batch['src_coord'].shape == (2, 2, 3)
+
+
+def test_unimolv2_frozen_mode_is_rejected_for_atom_alignment():
+    try:
+        UniMolNodeEncoder(max_atoms=8, mode='frozen', model_name='unimolv2')
+    except ValueError as exc:
+        assert 'trainable mode only' in str(exc)
+    else:
+        raise AssertionError('Expected frozen Uni-Mol2 mode to be rejected.')
+
+
+def test_unimol_encoder_preserves_batched_atom_alignment():
+    class FakeUniMolRepr:
+        def get_repr(self, data, return_atomic_reprs=False):
+            assert return_atomic_reprs
+            arrays = []
+            for atoms, _coords in zip(data['atoms'], data['coordinates'], strict=True):
+                arrays.append(
+                    [[float(i), float(len(atoms))] for i in range(len(atoms))]
+                )
+            return {'atomic_reprs': arrays}
+
+    encoder = UniMolNodeEncoder(max_atoms=8, mode='frozen')
+    encoder._repr = FakeUniMolRepr()
+    graph = {
+        'atomic_numbers': torch.tensor([6, 1, 8]),
+        'positions': torch.zeros(3, 3),
+        'ptr': torch.tensor([0, 2, 3]),
+    }
+
+    out = encoder(graph)
+
+    assert out['node_feats'].shape == (3, 2)
+    assert torch.allclose(
+        out['node_feats'],
+        torch.tensor([[0.0, 2.0], [1.0, 2.0], [0.0, 1.0]]),
+    )

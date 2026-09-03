@@ -36,6 +36,11 @@ class GraphConfig:
     fallback_to_2d: bool = True
     warn_2d_fallback: bool = False
     validate_bond_geometry: bool = True
+    relaxation: str = 'rdkit'
+    aimnet_relax_model: str = 'aimnet2'
+    aimnet_relax_steps: int = 50
+    aimnet_relax_fmax: float = 0.05
+    aimnet_relax_device: str = 'auto'
 
 
 def atomic_number_index(atomic_numbers: list[int] | tuple[int, ...]) -> dict[int, int]:
@@ -53,6 +58,11 @@ def infer_graph_config(
     seed: int = 17,
     add_hydrogens: bool = True,
     optimize: bool = True,
+    relaxation: str = 'rdkit',
+    aimnet_relax_model: str = 'aimnet2',
+    aimnet_relax_steps: int = 50,
+    aimnet_relax_fmax: float = 0.05,
+    aimnet_relax_device: str = 'auto',
 ) -> GraphConfig:
     """
     Build a :class:`GraphConfig` from a foundation encoder.
@@ -67,6 +77,11 @@ def infer_graph_config(
         seed=seed,
         add_hydrogens=add_hydrogens,
         optimize=optimize,
+        relaxation=relaxation,
+        aimnet_relax_model=aimnet_relax_model,
+        aimnet_relax_steps=aimnet_relax_steps,
+        aimnet_relax_fmax=aimnet_relax_fmax,
+        aimnet_relax_device=aimnet_relax_device,
     )
 
 
@@ -153,12 +168,32 @@ def _set_embed_param(params, name: str, value) -> None:
 
 def _optimize_molecule(mol: Chem.Mol, config: GraphConfig) -> Chem.Mol:
     """
-    Relax an embedded molecule with classical force fields.
+    Relax an embedded molecule with the configured optimizer.
 
-    UFF is tried first because it has broad element coverage; MMFF is used as a fallback when all parameters are available. The input molecule is returned even when optimization fails.
+    The default ``rdkit`` path preserves the original UFF/MMFF behavior. The
+    optional ``aimnet`` path uses the RDKit-relaxed conformer as a starting point
+    and then optimizes coordinates with AIMNet forces through ASE.
     """
     if not config.optimize:
         return mol
+    relaxation = str(config.relaxation).lower()
+    if relaxation == 'none':
+        return mol
+    if relaxation == 'aimnet':
+        rdkit_mol = _rdkit_optimize_molecule(mol)
+        return _aimnet_relax_molecule(rdkit_mol, config)
+    if relaxation != 'rdkit':
+        raise ValueError(
+            f'Unsupported graph relaxation method {config.relaxation!r}; '
+            "expected 'rdkit', 'aimnet', or 'none'."
+        )
+    return _rdkit_optimize_molecule(mol)
+
+
+def _rdkit_optimize_molecule(mol: Chem.Mol) -> Chem.Mol:
+    """
+    Relax an embedded molecule with classical RDKit force fields.
+    """
     try:
         with rdBase.BlockLogs():
             AllChem.UFFOptimizeMolecule(mol, maxIters=200)
@@ -172,6 +207,57 @@ def _optimize_molecule(mol: Chem.Mol, config: GraphConfig) -> Chem.Mol:
             return mol
     except Exception:
         pass
+    return mol
+
+
+def _aimnet_relax_molecule(mol: Chem.Mol, config: GraphConfig) -> Chem.Mol:
+    """
+    Relax an embedded molecule with AIMNet forces through ASE.
+
+    AIMNet relaxation is imported lazily so default RDKit preprocessing keeps its
+    light dependency surface. The molecule is treated as neutral because graph
+    construction currently receives only a SMILES string, not the row adduct.
+    """
+    try:
+        from aimnet.calculators import AIMNet2Calculator
+        from aimnet.calculators.aimnet2ase import AIMNet2ASE
+        from ase import Atoms
+        from ase.optimize import FIRE
+    except Exception as exc:
+        raise RuntimeError(
+            'AIMNet graph relaxation requires aimnetcentral and ASE.'
+        ) from exc
+
+    if mol.GetNumConformers() == 0:
+        return mol
+
+    conformer = mol.GetConformer()
+    atom_numbers = [int(atom.GetAtomicNum()) for atom in mol.GetAtoms()]
+    positions = np.asarray(conformer.GetPositions(), dtype=np.float64)
+    atoms = Atoms(numbers=atom_numbers, positions=positions)
+    device = (
+        None
+        if str(config.aimnet_relax_device) == 'auto'
+        else str(config.aimnet_relax_device)
+    )
+    calculator = AIMNet2Calculator(
+        model=str(config.aimnet_relax_model),
+        device=device,
+        train=False,
+    )
+    atoms.calc = AIMNet2ASE(calculator, charge=0)
+
+    opt = FIRE(atoms, logfile=None)
+    opt.run(
+        fmax=float(config.aimnet_relax_fmax),
+        steps=int(config.aimnet_relax_steps),
+    )
+    relaxed_positions = np.asarray(atoms.get_positions(), dtype=np.float64)
+    for atom_idx, position in enumerate(relaxed_positions):
+        conformer.SetAtomPosition(
+            int(atom_idx),
+            (float(position[0]), float(position[1]), float(position[2])),
+        )
     return mol
 
 

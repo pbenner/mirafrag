@@ -1,4 +1,5 @@
 # ruff: noqa: F401
+import json
 import math
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -19,12 +20,16 @@ from mirafrag.cli.train import (
 )
 from mirafrag.config import MiraFragConfig
 from mirafrag.data import (
+    RAW_COLLISION_ENERGY_COLUMN,
     BinnedSpectrumDataset,
     MetadataConfig,
+    _graph_config_cache_settings,
     collate_spectrum_batch,
     dataloader_performance_kwargs,
     filter_massspecgym_simulation,
     filter_supported_elements,
+    merge_group_spectra,
+    normalize_collision_energy_dataframe,
     select_split,
 )
 from mirafrag.encoders.mace import repair_mace_cuequivariance_config
@@ -57,6 +62,7 @@ from mirafrag.optim import (
     _optimizer_param_groups,
     _scheduler_total_steps,
 )
+from mirafrag.spectra import parse_number_list
 from mirafrag.training import train_model
 from tests.helpers import (
     FakeChargeEncoder,
@@ -100,6 +106,233 @@ def test_select_split_strips_split_labels_and_explicit_values():
     ].tolist() == [3]
 
 
+def test_normalize_collision_energy_dataframe_uses_instrument_stats():
+    train = pd.DataFrame(
+        {
+            'smiles': ['C'] * 10,
+            'adduct': ['[M+H]+'] * 10,
+            'instrument_type': ['Orbitrap'] * 5 + ['QTOF'] * 5,
+            'collision_energy': [
+                10.0,
+                15.0,
+                20.0,
+                25.0,
+                30.0,
+                100.0,
+                110.0,
+                120.0,
+                130.0,
+                140.0,
+            ],
+        }
+    )
+    val = pd.DataFrame(
+        {
+            'smiles': ['C', 'C', 'C'],
+            'adduct': ['[M+H]+'] * 3,
+            'instrument_type': ['Orbitrap', 'QTOF', 'unknown'],
+            'collision_energy': [20.0, 140.0, 75.0],
+        }
+    )
+    metadata = MetadataConfig.from_dataframe(
+        train,
+        collision_energy_mode='normalized',
+    )
+
+    out = normalize_collision_energy_dataframe(val, metadata_config=metadata)
+
+    assert out['collision_energy'].iloc[0] == 0.0
+    assert out['collision_energy'].iloc[1] > 1.0
+    assert abs(out['collision_energy'].iloc[2]) < 0.2
+
+
+def test_normalized_collision_energy_preserves_raw_ce_for_fragment_support():
+    df = pd.DataFrame(
+        {
+            'smiles': ['CC', 'CC'],
+            'adduct': ['[M+H]+', '[M+H]+'],
+            'instrument_type': ['Orbitrap', 'Orbitrap'],
+            'collision_energy': [20.0, 80.0],
+        }
+    )
+    metadata = MetadataConfig.from_dataframe(
+        df,
+        collision_energy_mode='normalized',
+    )
+
+    out = normalize_collision_energy_dataframe(df, metadata_config=metadata)
+
+    assert RAW_COLLISION_ENERGY_COLUMN in out.columns
+    assert out[RAW_COLLISION_ENERGY_COLUMN].tolist() == [20.0, 80.0]
+    assert out['collision_energy'].tolist() != [20.0, 80.0]
+    normalized_again = normalize_collision_energy_dataframe(
+        out, metadata_config=metadata
+    )
+    assert (
+        normalized_again['collision_energy'].tolist()
+        == out['collision_energy'].tolist()
+    )
+
+    with_peaks = out.assign(
+        precursor_mz=[100.0, 100.0],
+        mzs=['10', '20'],
+        intensities=['1', '1'],
+    )
+    merged = merge_group_spectra(with_peaks, mz_max=64.0, bin_width=1.0)
+    assert json.loads(merged[RAW_COLLISION_ENERGY_COLUMN].iloc[0]) == [20.0, 80.0]
+
+
+def test_merge_group_spectra_merges_replicates_and_drops_precursor():
+    df = pd.DataFrame(
+        {
+            'identifier': ['a', 'b', 'c'],
+            'smiles': ['CCO', 'CCO', 'CCN'],
+            'adduct': ['[M+H]+', '[M+H]+', '[M+H]+'],
+            'instrument_type': ['Orbitrap', 'Orbitrap', 'Orbitrap'],
+            'precursor_mz': [47.0, 47.0, 46.0],
+            'collision_energy': [10.0, 30.0, 20.0],
+            'mzs': ['10,47', '10,20,47', '10'],
+            'intensities': ['1,100', '2,3,100', '4'],
+        }
+    )
+
+    out = merge_group_spectra(df, mz_max=64.0, bin_width=1.0)
+
+    assert len(out) == 2
+    merged = out[out['smiles'] == 'CCO'].iloc[0]
+    assert merged['identifier'] == 'a|b'
+    assert json.loads(merged['collision_energy']) == [10.0, 30.0]
+    mzs = parse_number_list(merged['mzs'])
+    intensities = parse_number_list(merged['intensities'])
+    assert mzs == [10.5, 20.5]
+    assert intensities == [3.0, 3.0]
+
+
+def test_merged_collision_energy_lists_collate_with_scalar_fallback():
+    df = pd.DataFrame(
+        {
+            'identifier': ['a', 'b'],
+            'smiles': ['CCO', 'CCO'],
+            'adduct': ['[M+H]+', '[M+H]+'],
+            'instrument_type': ['Orbitrap', 'Orbitrap'],
+            'precursor_mz': [47.0, 47.0],
+            'collision_energy': [10.0, 30.0],
+            'mzs': ['10', '20'],
+            'intensities': ['1', '1'],
+        }
+    )
+    merged = merge_group_spectra(df, mz_max=64.0, bin_width=1.0)
+    metadata = MetadataConfig.from_dataframe(merged)
+    dataset = BinnedSpectrumDataset(
+        merged,
+        graph_config=GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7),
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=False,
+    )
+
+    batch = collate_spectrum_batch([dataset[0]])
+
+    assert torch.allclose(batch['collision_energy'], torch.tensor([20.0]))
+    assert torch.allclose(
+        batch['collision_energy_values'],
+        torch.tensor([10.0, 30.0]),
+    )
+    assert torch.equal(batch['collision_energy_batch'], torch.tensor([0, 0]))
+
+
+def test_binned_dataset_excludes_precursor_peaks_from_targets():
+    df = _tiny_training_df().copy()
+    df.loc[0, 'mzs'] = '18,47,60'
+    df.loc[0, 'intensities'] = '1,10,2'
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    dataset = BinnedSpectrumDataset(
+        df.iloc[:1],
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=False,
+    )
+
+    item = dataset[0]
+
+    assert item['true_mzs'].tolist() == [18.0, 60.0]
+    assert item['true_intensities'].tolist() == [1.0, 2.0]
+
+
+def test_binned_dataset_target_neighbor_smoothing_uses_nearby_replicates():
+    df = pd.DataFrame(
+        {
+            'identifier': ['a', 'b', 'c', 'd'],
+            'smiles': ['CCO', 'CCO', 'CCO', 'CCO'],
+            'adduct': ['[M+H]+', '[M+H]+', '[M+H]+', '[M+H]+'],
+            'instrument_type': ['HCD', 'HCD', 'HCD', 'QTOF'],
+            'precursor_mz': [100.0, 100.0, 100.0, 100.0],
+            'collision_energy': [10.0, 15.0, 80.0, 12.0],
+            'mzs': ['10', '20', '30', '40'],
+            'intensities': ['1', '1', '1', '1'],
+        }
+    )
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    dataset = BinnedSpectrumDataset(
+        df,
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=False,
+        target_neighbor_smoothing=True,
+        target_neighbor_weight=0.5,
+        target_neighbor_ce_window=10.0,
+        target_neighbor_same_instrument=True,
+        target_neighbor_same_adduct=True,
+    )
+
+    item = dataset[0]
+
+    assert item['true_mzs'].tolist() == [10.5, 20.5]
+    assert torch.allclose(
+        torch.as_tensor(item['true_intensities']),
+        torch.tensor([0.5, 0.5]),
+    )
+
+
+def test_binned_dataset_target_neighbor_smoothing_falls_back_without_neighbors():
+    df = pd.DataFrame(
+        {
+            'identifier': ['a', 'b'],
+            'smiles': ['CCO', 'CCN'],
+            'adduct': ['[M+H]+', '[M+H]+'],
+            'instrument_type': ['HCD', 'HCD'],
+            'precursor_mz': [100.0, 100.0],
+            'collision_energy': [10.0, 12.0],
+            'mzs': ['10', '20'],
+            'intensities': ['2', '1'],
+        }
+    )
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 7, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig.from_dataframe(df, precursor_mz_max=100.0)
+    dataset = BinnedSpectrumDataset(
+        df,
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=False,
+        target_neighbor_smoothing=True,
+        target_neighbor_weight=0.5,
+    )
+
+    item = dataset[0]
+
+    assert item['true_mzs'].tolist() == [10.5]
+    assert item['true_intensities'].tolist() == [1.0]
+
+
 def test_binned_dataset_disk_cache_reuses_graphs_and_fragments(tmp_path):
     graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
     metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
@@ -122,6 +355,48 @@ def test_binned_dataset_disk_cache_reuses_graphs_and_fragments(tmp_path):
     reloaded = BinnedSpectrumDataset(_tiny_training_df(), **kwargs)[0]
     assert torch.equal(first['graph']['node_attrs'], reloaded['graph']['node_attrs'])
     assert first['fragments']['bins'] == reloaded['fragments']['bins']
+
+
+def test_fragment_disk_cache_augments_bond_break_fields_from_shared_cache(tmp_path):
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
+    cache_dir = tmp_path / 'features'
+    base_kwargs = {
+        'graph_config': graph_config,
+        'metadata_config': metadata,
+        'mz_max': 64.0,
+        'bin_width': 1.0,
+        'include_fragments': True,
+        'disk_cache_dir': cache_dir,
+    }
+    base_dataset = BinnedSpectrumDataset(
+        _tiny_training_df(),
+        fragment_config=FragmentConfig(max_tree_depth=2, max_fragments=16),
+        **base_kwargs,
+    )
+    base_fragments = base_dataset[0]['fragments']
+    fragment_files_before = set((cache_dir / 'fragments').glob('*.pt'))
+
+    bond_dataset = BinnedSpectrumDataset(
+        _tiny_training_df(),
+        fragment_config=FragmentConfig(
+            max_tree_depth=2,
+            max_fragments=16,
+            include_bond_breaks=True,
+        ),
+        **base_kwargs,
+    )
+    bond_fragments = bond_dataset[0]['fragments']
+    fragment_files_after = set((cache_dir / 'fragments').glob('*.pt'))
+
+    assert 'bond_atom_indices' not in base_fragments
+    assert 'bond_features' not in base_fragments
+    assert fragment_files_before == fragment_files_after
+    assert len(bond_fragments['bond_atom_indices']) == len(
+        bond_fragments['atom_indices']
+    )
+    assert len(bond_fragments['bond_features']) == len(bond_fragments['atom_indices'])
+    assert any(bond_fragments['bond_atom_indices'])
 
 
 def test_graph_cache_is_namespaced_but_fragment_cache_is_shared(tmp_path):
@@ -151,12 +426,12 @@ def test_graph_cache_is_namespaced_but_fragment_cache_is_shared(tmp_path):
     graph_path_a = dataset_a._feature_cache_path(
         'graphs',
         smiles,
-        {'graph_config': asdict(dataset_a.graph_config)},
+        {'graph_config': _graph_config_cache_settings(dataset_a.graph_config)},
     )
     graph_path_b = dataset_b._feature_cache_path(
         'graphs',
         smiles,
-        {'graph_config': asdict(dataset_b.graph_config)},
+        {'graph_config': _graph_config_cache_settings(dataset_b.graph_config)},
     )
     fragment_settings = {
         'fragment_config': asdict(fragment_config),
@@ -180,6 +455,69 @@ def test_graph_cache_is_namespaced_but_fragment_cache_is_shared(tmp_path):
     assert graph_path_b.parent.parent == cache_dir / 'graphs'
     assert fragment_path_a == fragment_path_b
     assert fragment_path_a.parent == cache_dir / 'fragments'
+
+
+def test_default_graph_cache_settings_preserve_legacy_key():
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    settings = _graph_config_cache_settings(graph_config)
+
+    assert settings == {
+        'atomic_numbers': (1, 6, 8),
+        'cutoff': 5.0,
+        'seed': 7,
+        'add_hydrogens': True,
+        'optimize': True,
+        'max_embed_attempts': 50,
+        'embed_timeout_seconds': 10,
+        'fallback_to_2d': True,
+        'warn_2d_fallback': False,
+        'validate_bond_geometry': True,
+    }
+
+
+def test_aimnet_relaxation_graph_cache_settings_fork_key():
+    graph_config = GraphConfig(
+        atomic_numbers=(1, 6, 8),
+        cutoff=5.0,
+        seed=7,
+        relaxation='aimnet',
+        aimnet_relax_model='aimnet2',
+        aimnet_relax_steps=20,
+        aimnet_relax_fmax=0.1,
+        aimnet_relax_device='cpu',
+    )
+    settings = _graph_config_cache_settings(graph_config)
+
+    assert settings['relaxation'] == 'aimnet'
+    assert settings['aimnet_relax_model'] == 'aimnet2'
+    assert settings['aimnet_relax_steps'] == 20
+    assert settings['aimnet_relax_fmax'] == 0.1
+    assert settings['aimnet_relax_device'] == 'cpu'
+
+
+def test_high_ce_fragment_support_uses_raw_ce_after_normalization():
+    df = _tiny_training_df().copy()
+    df.loc[0, 'collision_energy'] = 20.0
+    df.loc[1, 'collision_energy'] = 80.0
+    metadata = MetadataConfig.from_dataframe(df, collision_energy_mode='normalized')
+    normalized = normalize_collision_energy_dataframe(df, metadata_config=metadata)
+    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
+    dataset = BinnedSpectrumDataset(
+        normalized,
+        graph_config=graph_config,
+        metadata_config=metadata,
+        mz_max=64.0,
+        bin_width=1.0,
+        include_fragments=True,
+        fragment_support_profile=FragmentSupportProfile(
+            base=FragmentConfig(max_tree_depth=1, max_fragments=8),
+            high_ce_threshold=60.0,
+            high_ce=FragmentConfig(max_tree_depth=3, max_fragments=16),
+        ),
+    )
+
+    assert dataset._fragment_config_for_row(0).max_tree_depth == 1
+    assert dataset._fragment_config_for_row(1).max_tree_depth == 3
 
 
 def test_high_ce_fragment_support_selects_row_specific_cache_config(tmp_path):

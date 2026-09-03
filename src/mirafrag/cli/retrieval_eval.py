@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import signal
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -17,11 +19,18 @@ from mirafrag.cli.common import (
     validate_checkpoint_bin_config,
 )
 from mirafrag.data import (
+    ADDUCT_ALIASES,
+    CE_ALIASES,
+    INSTRUMENT_ALIASES,
+    PRECURSOR_ALIASES,
+    RAW_COLLISION_ENERGY_COLUMN,
     BinnedSpectrumDataset,
     collate_spectrum_batch,
     dataloader_performance_kwargs,
     filter_massspecgym_simulation,
     filter_supported_elements,
+    find_column,
+    normalize_collision_energy_dataframe,
     read_table,
     select_split,
 )
@@ -39,7 +48,17 @@ from mirafrag.retrieval import (
     resolve_candidate_mode,
     summarize_retrieval_hits,
 )
-from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX
+from mirafrag.sparse_spectra import (
+    SparseSpectrum,
+    normalize_sparse_spectrum,
+    sparse_cosine,
+    sparse_from_peaks,
+)
+from mirafrag.spectra import (
+    MASS_SPEC_GYM_BIN_WIDTH,
+    MASS_SPEC_GYM_MZ_MAX,
+    parse_peaks,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +88,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--candidate-seed', type=int, default=0)
     parser.add_argument('--hit-ks', default='1,5,10,20')
     parser.add_argument('--score', choices=('cosine', 'sqrt_cosine'), default='cosine')
+    parser.add_argument(
+        '--fast-retrieval',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Score candidate predictions against parsed query spectra outside the '
+            'model DataLoader. This avoids duplicating target-spectrum parsing for '
+            'every candidate row.'
+        ),
+    )
     parser.add_argument('--device', default='auto')
     parser.add_argument('--checkpoint-metric', default=None, help=argparse.SUPPRESS)
     parser.add_argument('--split', default='test')
@@ -85,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         help='DataLoader workers for candidate scoring; defaults to 0 with disk cache.',
     )
     parser.add_argument('--cache-chunk-size', type=int, default=1)
+    parser.add_argument(
+        '--score-sample-timeout',
+        type=float,
+        default=300.0,
+        help=(
+            'Maximum seconds spent building one candidate inside fast retrieval '
+            'scoring workers. Non-positive disables the timeout.'
+        ),
+    )
     parser.add_argument(
         '--memory-cache',
         action=argparse.BooleanOptionalAction,
@@ -103,6 +141,19 @@ def parse_args() -> argparse.Namespace:
         help='Fill missing disk-cache entries before ordered model inference.',
     )
     parser.add_argument('--max-rows', type=int, default=None)
+    parser.add_argument(
+        '--row-offset',
+        type=int,
+        default=0,
+        help='Skip this many selected query rows before --max-rows is applied.',
+    )
+    parser.add_argument(
+        '--sample-rows',
+        type=int,
+        default=None,
+        help='Randomly sample this many query rows after split/filter selection.',
+    )
+    parser.add_argument('--sample-seed', type=int, default=0)
     parser.add_argument('--mass-candidate-tolerance', type=float, default=0.01)
     parser.add_argument(
         '--progress',
@@ -150,6 +201,10 @@ def main() -> None:
         split_col=args.split_col,
         split_value=args.split_value,
     )
+    if args.row_offset < 0:
+        raise SystemExit('--row-offset must be non-negative.')
+    if args.row_offset:
+        query_df = query_df.iloc[args.row_offset :].copy()
     if args.max_rows:
         query_df = query_df.iloc[: args.max_rows].copy()
     if query_df.empty:
@@ -158,6 +213,14 @@ def main() -> None:
         query_df,
         supported_atomic_numbers=graph_config.atomic_numbers,
     )
+    if args.sample_rows is not None:
+        if args.sample_rows <= 0:
+            raise SystemExit('--sample-rows must be positive when provided.')
+        if args.sample_rows < len(query_df):
+            query_df = query_df.sample(
+                n=args.sample_rows,
+                random_state=int(args.sample_seed),
+            ).sort_index()
     if (
         query_filter_stats['dropped_invalid_smiles']
         or query_filter_stats['dropped_unsupported_elements']
@@ -190,6 +253,7 @@ def main() -> None:
     )
 
     per_query_frames = []
+    fast_prediction_cache: dict[tuple[object, ...], SparseSpectrum | None] = {}
     query_chunk_size = max(1, int(args.query_chunk_size))
     query_chunks = range(0, len(query_df), query_chunk_size)
     candidate_total = estimate_retrieval_candidate_count(
@@ -229,14 +293,17 @@ def main() -> None:
         )
         if candidate_rows.empty:
             continue
+        if _checkpoint_uses_normalized_ce(model):
+            candidate_rows = normalize_collision_energy_dataframe(
+                candidate_rows,
+                metadata_config=model.metadata_config,
+            )
         if (
             row_filter_stats['dropped_invalid_smiles']
             or row_filter_stats['dropped_unsupported_elements']
         ):
             print(f'Retrieval chunk element filter: {row_filter_stats}')
-        scores = _score_candidate_rows(
-            model,
-            candidate_rows,
+        score_kwargs = dict(
             graph_config=graph_config,
             fragment_support_profile=fragment_support_profile,
             device=device,
@@ -253,7 +320,21 @@ def main() -> None:
             score=args.score,
             show_progress=args.progress,
             split_name=f'{args.split}:{chunk_start}-{chunk_start + len(chunk) - 1}',
+            score_sample_timeout=args.score_sample_timeout,
         )
+        if args.fast_retrieval:
+            scores = _score_candidate_rows_fast(
+                model,
+                candidate_rows,
+                prediction_cache=fast_prediction_cache,
+                **score_kwargs,
+            )
+        else:
+            scores = _score_candidate_rows(
+                model,
+                candidate_rows,
+                **score_kwargs,
+            )
         per_query, _summary = summarize_retrieval_hits(
             candidate_rows,
             scores,
@@ -278,6 +359,15 @@ def main() -> None:
     if args.output:
         per_query.to_csv(args.output, index=False)
         print(f'Wrote retrieval metrics to {args.output}')
+
+
+def _checkpoint_uses_normalized_ce(model) -> bool:
+    return (
+        str(
+            getattr(model.metadata_config, 'collision_energy_mode', 'raw') or 'raw'
+        ).lower()
+        == 'normalized'
+    )
 
 
 def _resolve_score_num_workers(args: argparse.Namespace) -> int:
@@ -325,7 +415,9 @@ def _score_candidate_rows(
     score: str,
     show_progress: bool,
     split_name: str,
+    score_sample_timeout: float = 0.0,
 ) -> list[float]:
+    del score_sample_timeout
     dataset = BinnedSpectrumDataset(
         candidate_rows,
         graph_config=graph_config,
@@ -398,22 +490,389 @@ def _score_candidate_rows(
         leave=False,
         disable=not show_progress,
     )
-    for raw_batch in progress:
-        batch = _move(raw_batch, device)
-        probs = model.predict_proba(batch)
-        values = _retrieval_score(
-            probs,
-            batch,
-            probability_mode=probability_mode,
-            score=score,
-        )
-        scored_values.extend(float(value) for value in values.detach().cpu())
+    with torch.no_grad():
+        for raw_batch in progress:
+            batch = _move(raw_batch, device)
+            probs = model.predict_proba(batch)
+            values = _retrieval_score(
+                probs,
+                batch,
+                probability_mode=probability_mode,
+                score=score,
+            )
+            scored_values.extend(float(value) for value in values.detach().cpu())
     scores = [float('-inf')] * num_candidate_rows
     if len(scored_values) != len(score_positions):
         raise RuntimeError('Retrieval scoring produced an unexpected number of scores.')
     for position, value in zip(score_positions, scored_values, strict=True):
         scores[position] = value
     return scores
+
+
+class _SafeRetrievalDataset:
+    def __init__(self, dataset, *, timeout_seconds: float = 0.0) -> None:
+        self.dataset = dataset
+        self.timeout_seconds = max(0.0, float(timeout_seconds))
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> dict:
+        try:
+            item = self._run_with_timeout(lambda: self.dataset[int(idx)])
+            item['_retrieval_position'] = int(idx)
+            return item
+        except Exception as exc:  # noqa: BLE001 - retrieval should skip bad candidates.
+            return {
+                '_retrieval_failed': True,
+                '_retrieval_position': int(idx),
+                '_retrieval_error': str(exc),
+            }
+
+    def materialize_feature_cache(self, idx: int) -> None:
+        def materialize() -> None:
+            materialize_cache = getattr(self.dataset, 'materialize_feature_cache', None)
+            if callable(materialize_cache):
+                materialize_cache(int(idx))
+            else:
+                self.dataset[int(idx)]
+
+        self._run_with_timeout(materialize)
+
+    def _run_with_timeout(self, fn):
+        previous_handler = None
+        timeout_active = self.timeout_seconds > 0.0
+        try:
+            if timeout_active:
+                previous_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, _retrieval_timeout_handler)
+                signal.setitimer(signal.ITIMER_REAL, self.timeout_seconds)
+            return fn()
+        finally:
+            if timeout_active:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _retrieval_timeout_handler(_signum, _frame) -> None:
+    raise TimeoutError('retrieval candidate feature generation timed out')
+
+
+def _collate_retrieval_batch(items: list[dict]) -> dict:
+    good = [item for item in items if not item.get('_retrieval_failed')]
+    failed = [item for item in items if item.get('_retrieval_failed')]
+    failed_positions = torch.as_tensor(
+        [int(item['_retrieval_position']) for item in failed],
+        dtype=torch.long,
+    )
+    failed_errors = [
+        str(item.get('_retrieval_error', 'unknown retrieval error')) for item in failed
+    ]
+    if not good:
+        return {
+            '_retrieval_empty': True,
+            '_retrieval_positions': torch.empty(0, dtype=torch.long),
+            '_retrieval_failed_positions': failed_positions,
+            '_retrieval_errors': failed_errors,
+        }
+    positions = torch.as_tensor(
+        [int(item.pop('_retrieval_position')) for item in good],
+        dtype=torch.long,
+    )
+    batch = collate_spectrum_batch(good)
+    batch['_retrieval_empty'] = False
+    batch['_retrieval_positions'] = positions
+    batch['_retrieval_failed_positions'] = failed_positions
+    batch['_retrieval_errors'] = failed_errors
+    return batch
+
+
+def _score_candidate_rows_fast(
+    model,
+    candidate_rows,
+    *,
+    graph_config,
+    fragment_support_profile,
+    device,
+    batch_size: int,
+    cache_num_workers: int,
+    score_num_workers: int,
+    memory_cache: bool,
+    disk_cache_dir: str | None,
+    prefill_cache: bool,
+    cache_chunk_size: int,
+    mz_max: float,
+    bin_width: float,
+    probability_mode: str,
+    score: str,
+    show_progress: bool,
+    split_name: str,
+    score_sample_timeout: float = 300.0,
+    prediction_cache: dict[tuple[object, ...], SparseSpectrum | None] | None = None,
+) -> list[float]:
+    target_spectra = _target_spectrum_lookup(
+        candidate_rows,
+        mz_max=mz_max,
+        bin_width=bin_width,
+    )
+    num_candidate_rows = len(candidate_rows)
+    keys = [_prediction_cache_key(row) for _idx, row in candidate_rows.iterrows()]
+    if prediction_cache is None:
+        prediction_cache = {}
+    missing_positions = [
+        idx for idx, key in enumerate(keys) if key not in prediction_cache
+    ]
+    if missing_positions:
+        missing_rows = candidate_rows.iloc[missing_positions].reset_index(drop=True)
+    else:
+        missing_rows = candidate_rows.iloc[0:0].copy()
+    failed_positions: set[int] = set()
+
+    score_original_positions = list(missing_positions)
+    dataset = _SafeRetrievalDataset(
+        BinnedSpectrumDataset(
+            missing_rows,
+            graph_config=graph_config,
+            metadata_config=model.metadata_config,
+            mz_max=mz_max,
+            bin_width=bin_width,
+            require_spectrum=False,
+            memory_cache=memory_cache,
+            disk_cache_dir=disk_cache_dir,
+            include_fragments=True,
+            fragment_support_profile=fragment_support_profile,
+        ),
+        timeout_seconds=score_sample_timeout,
+    )
+    score_positions = list(range(len(missing_rows)))
+    if disk_cache_dir is not None and prefill_cache and len(missing_rows) > 0:
+        failures = prefill_feature_cache(
+            dataset,
+            split_name=f'retrieval {split_name}',
+            chunk_size=cache_chunk_size,
+            num_workers=cache_num_workers,
+            show_progress=show_progress,
+            print_ready=False,
+            ignore_errors=True,
+        )
+        if failures:
+            failed_local_positions = {idx for idx, _error in failures}
+            tqdm.write(
+                f'retrieval {split_name}: assigning -inf to '
+                f'{len(failures)}/{len(missing_rows)} unscoreable uncached candidates'
+            )
+            for idx, error in failures[:3]:
+                tqdm.write(f'  example idx={idx}: {_shorten_error(error)}')
+            score_positions = [
+                idx for idx in score_positions if idx not in failed_local_positions
+            ]
+            for local_idx in failed_local_positions:
+                original_idx = missing_positions[local_idx]
+                prediction_cache[keys[original_idx]] = None
+                failed_positions.add(original_idx)
+            score_original_positions = [
+                missing_positions[idx] for idx in score_positions
+            ]
+            missing_rows = missing_rows.iloc[score_positions].reset_index(drop=True)
+            dataset = _SafeRetrievalDataset(
+                BinnedSpectrumDataset(
+                    missing_rows,
+                    graph_config=graph_config,
+                    metadata_config=model.metadata_config,
+                    mz_max=mz_max,
+                    bin_width=bin_width,
+                    require_spectrum=False,
+                    memory_cache=memory_cache,
+                    disk_cache_dir=disk_cache_dir,
+                    include_fragments=True,
+                    fragment_support_profile=fragment_support_profile,
+                ),
+                timeout_seconds=score_sample_timeout,
+            )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=score_num_workers,
+        collate_fn=_collate_retrieval_batch,
+        **_retrieval_dataloader_kwargs(
+            num_workers=score_num_workers,
+            device=device,
+        ),
+    )
+    model.to(device)
+    model.eval()
+    progress = tqdm(
+        loader,
+        desc='retrieval score fast',
+        total=len(loader),
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+    )
+    scored_count = 0
+    with torch.no_grad():
+        for raw_batch in progress:
+            failed_local_positions = raw_batch.pop('_retrieval_failed_positions')
+            failed_errors = raw_batch.pop('_retrieval_errors')
+            for local_position, error in zip(
+                failed_local_positions.tolist(),
+                failed_errors,
+                strict=True,
+            ):
+                original_position = score_original_positions[int(local_position)]
+                prediction_cache[keys[original_position]] = None
+                failed_positions.add(original_position)
+                if len(failed_positions) <= 3:
+                    tqdm.write(
+                        f'retrieval {split_name}: assigning -inf to candidate '
+                        f'{original_position}: {_shorten_error(error)}'
+                    )
+            local_positions = raw_batch.pop('_retrieval_positions')
+            empty_batch = bool(raw_batch.pop('_retrieval_empty'))
+            if empty_batch:
+                continue
+            batch = _move(raw_batch, device)
+            probs = model.predict_proba(batch)
+            spectra = _prediction_sparse_spectra(
+                probs,
+                probability_mode=probability_mode,
+            )
+            for spectrum, local_position in zip(
+                spectra,
+                local_positions.tolist(),
+                strict=True,
+            ):
+                original_position = score_original_positions[int(local_position)]
+                prediction_cache[keys[original_position]] = spectrum
+                scored_count += 1
+
+    expected_scored = sum(
+        1 for position in score_original_positions if position not in failed_positions
+    )
+    if scored_count != expected_scored:
+        raise RuntimeError(
+            'Retrieval scoring produced an unexpected number of spectra.'
+        )
+
+    scores = [float('-inf')] * num_candidate_rows
+    for position, (_idx, row) in enumerate(candidate_rows.iterrows()):
+        if position in failed_positions:
+            continue
+        spectrum = prediction_cache.get(keys[position])
+        if spectrum is None:
+            continue
+        target = target_spectra[str(row['_retrieval_query_identifier'])]
+        scores[position] = sparse_cosine(
+            spectrum,
+            target,
+            sqrt=(score == 'sqrt_cosine'),
+        )
+    return scores
+
+
+def _prediction_cache_key(row: pd.Series) -> tuple[object, ...]:
+    columns = []
+    for aliases in (
+        ('smiles', 'SMILES', 'Smiles'),
+        PRECURSOR_ALIASES,
+        ADDUCT_ALIASES,
+        INSTRUMENT_ALIASES,
+        CE_ALIASES,
+    ):
+        column = next(
+            (candidate for candidate in aliases if candidate in row.index),
+            None,
+        )
+        if column is not None:
+            columns.append(column)
+    if RAW_COLLISION_ENERGY_COLUMN in row.index:
+        columns.append(RAW_COLLISION_ENERGY_COLUMN)
+    key = []
+    for column in columns:
+        key.append((column, _cacheable_value(row.get(column))))
+    return tuple(key)
+
+
+def _cacheable_value(value) -> object:
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return tuple(_cacheable_value(item) for item in value)
+    if isinstance(value, np.ndarray):
+        return tuple(_cacheable_value(item) for item in value.tolist())
+    return str(value) if isinstance(value, pd.Timestamp) else value
+
+
+def _target_spectrum_lookup(
+    candidate_rows: pd.DataFrame,
+    *,
+    mz_max: float,
+    bin_width: float,
+) -> dict[str, SparseSpectrum]:
+    precursor_col = find_column(candidate_rows, PRECURSOR_ALIASES, required=False)
+    spectra: dict[str, SparseSpectrum] = {}
+    for query_id, group in candidate_rows.groupby(
+        '_retrieval_query_identifier',
+        sort=False,
+    ):
+        row = group.iloc[0]
+        precursor_mz = row.get(precursor_col) if precursor_col is not None else None
+        mzs, intensities = parse_peaks(
+            row,
+            precursor_mz=precursor_mz,
+            exclude_precursor=True,
+        )
+        spectra[str(query_id)] = sparse_from_peaks(
+            mzs,
+            intensities,
+            mz_max=mz_max,
+            bin_width=bin_width,
+        )
+    return spectra
+
+
+def _prediction_sparse_spectra(
+    pred: dict[str, object],
+    *,
+    probability_mode: str,
+) -> list[SparseSpectrum]:
+    if probability_mode == 'decoupled':
+        values = _decoupled_fragment_probabilities(pred)
+    elif probability_mode == 'joint':
+        from mirafrag.probability import fragment_oos_log_probs
+
+        fragment_log_probs, _oos_log_probs = fragment_oos_log_probs(pred)
+        values = torch.exp(fragment_log_probs)
+    else:
+        raise ValueError("probability_mode must be one of: 'joint', 'decoupled'.")
+
+    bins = pred['bins'].detach().long().cpu().numpy()
+    batch = pred['batch'].detach().long().cpu().numpy()
+    values_np = values.detach().cpu().numpy().astype(np.float32, copy=False)
+    rows: list[SparseSpectrum] = []
+    for batch_idx in range(int(pred['batch_size'])):
+        mask = batch == batch_idx
+        rows.append(
+            normalize_sparse_spectrum(
+                SparseSpectrum(bins=bins[mask], values=values_np[mask])
+            )
+        )
+    return rows
+
+
+def _decoupled_fragment_probabilities(pred: dict[str, object]) -> torch.Tensor:
+    logits = pred['logits']
+    batch = pred['batch'].long()
+    out = torch.empty_like(logits)
+    for batch_idx in range(int(pred['batch_size'])):
+        mask = batch == batch_idx
+        if bool(mask.any()):
+            out[mask] = torch.softmax(logits[mask], dim=0)
+    return out
 
 
 def _shorten_error(error: str, *, max_length: int = 180) -> str:

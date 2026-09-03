@@ -44,7 +44,9 @@ from mirafrag.fragments import (
 )
 from mirafrag.losses import (
     LOSS_NAMES,
+    candidate_responsibility_kl_divergence,
     decoupled_sparse_binned_kl_divergence,
+    exclude_precursor_prediction_candidates,
     fragnnet_sparse_cross_entropy,
     projected_sparse_binned_kl_divergence,
     soft_binned_coverage_kl_divergence,
@@ -78,8 +80,13 @@ from tests.helpers import (
 def test_loss_registry_exposes_cli_choices():
     assert 'kl' in LOSS_NAMES
     assert 'decoupled_kl' in LOSS_NAMES
+    assert 'decoupled_kl_cosine' in LOSS_NAMES
+    assert 'fiora_decoupled_kl' in LOSS_NAMES
+    assert 'responsibility_decoupled_kl' in LOSS_NAMES
     assert 'fragnnet_ce' in LOSS_NAMES
     assert 'cosine' in LOSS_NAMES
+    assert 'fragment_cosine' in LOSS_NAMES
+    assert 'fragment_sqrt_cosine' in LOSS_NAMES
 
 
 def test_fragment_sparse_loss_with_fake_mace():
@@ -121,6 +128,64 @@ def test_fragment_sparse_loss_with_fake_mace():
     assert torch.isfinite(kl_loss)
     assert torch.isfinite(hybrid_loss)
     assert cosine.shape == (2,)
+
+
+def test_fragment_cosine_loss_ignores_oos_probability():
+    batch = {
+        'target_mz': torch.tensor([1.2, 2.2]),
+        'target_intensity': torch.tensor([0.25, 0.75]),
+        'target_batch': torch.tensor([0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    pred_low_oos = {
+        'logits': torch.log(torch.tensor([0.25, 0.75])),
+        'oos_logits': torch.tensor([-10.0]),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+    pred_high_oos = {
+        **pred_low_oos,
+        'oos_logits': torch.tensor([10.0]),
+    }
+
+    assert spectrum_loss(pred_high_oos, batch, loss='cosine') > spectrum_loss(
+        pred_low_oos,
+        batch,
+        loss='cosine',
+    )
+    assert torch.allclose(
+        spectrum_loss(pred_low_oos, batch, loss='fragment_cosine'),
+        spectrum_loss(pred_high_oos, batch, loss='fragment_cosine'),
+    )
+
+
+def test_fragment_sqrt_cosine_loss_matches_fragment_only_metric():
+    batch = {
+        'target_mz': torch.tensor([1.2, 2.2]),
+        'target_intensity': torch.tensor([0.25, 0.75]),
+        'target_batch': torch.tensor([0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    pred = {
+        'logits': torch.log(torch.tensor([0.20, 0.80])),
+        'oos_logits': torch.tensor([20.0]),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+
+    expected = 1.0 - sparse_fragment_only_binned_cosine_similarity(
+        pred,
+        batch,
+        sqrt=True,
+    )
+    assert torch.allclose(
+        spectrum_loss(pred, batch, loss='fragment_sqrt_cosine', reduction='none'),
+        expected,
+    )
 
 
 def test_binned_cosine_penalizes_oos_probability():
@@ -200,6 +265,24 @@ def test_probability_mode_from_checkpoint_payload_detects_decoupled_loss():
     )
     assert (
         probability_mode_from_checkpoint_payload(
+            {'train_config': {'loss': 'responsibility_decoupled_kl'}}
+        )
+        == 'decoupled'
+    )
+    assert (
+        probability_mode_from_checkpoint_payload(
+            {'train_config': {'loss': 'fragment_cosine'}}
+        )
+        == 'decoupled'
+    )
+    assert (
+        probability_mode_from_checkpoint_payload(
+            {'train_config': {'loss': 'fragment_sqrt_cosine'}}
+        )
+        == 'decoupled'
+    )
+    assert (
+        probability_mode_from_checkpoint_payload(
             {'train_config': {'prediction_probability_mode': 'decoupled'}}
         )
         == 'decoupled'
@@ -237,6 +320,48 @@ def test_prediction_rows_decoupled_mode_uses_fragment_softmax_threshold():
 
     assert joint_rows == [{'mz': [], 'intensity': []}]
     assert decoupled_rows == [{'mz': [1.5], 'intensity': [100.0]}]
+
+
+def test_exclude_precursor_prediction_candidates_filters_candidate_tensors():
+    pred = {
+        'logits': torch.tensor([1.0, 2.0]),
+        'mzs': torch.tensor([47.0, 60.0]),
+        'bins': torch.tensor([47, 60]),
+        'batch': torch.tensor([0, 0]),
+        'formula_index': torch.tensor([3, 4]),
+        'oos_logits': torch.tensor([-1.0]),
+        'batch_size': 1,
+        'num_bins': 100,
+    }
+    batch = {'precursor_mz': torch.tensor([47.0]), 'bin_width': torch.tensor([1.0])}
+
+    filtered = exclude_precursor_prediction_candidates(pred, batch, tolerance=0.01)
+
+    assert filtered['logits'].tolist() == [2.0]
+    assert filtered['mzs'].tolist() == [60.0]
+    assert filtered['formula_index'].tolist() == [4]
+    assert filtered['oos_logits'].tolist() == [-1.0]
+
+
+def test_prediction_rows_exclude_precursor_peak_before_export():
+    pred = {
+        'logits': torch.log(torch.tensor([0.25, 0.75])),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+
+    rows = _sparse_prediction_rows(
+        pred,
+        bin_width=1.0,
+        min_intensity=0.0,
+        top_k=10,
+        precursor_mz=torch.tensor([1.5]),
+        precursor_tolerance=0.01,
+    )
+
+    assert rows == [{'mz': [2.5], 'intensity': [100.0]}]
 
 
 def test_prediction_rows_aggregate_duplicate_bins_before_top_k():
@@ -352,6 +477,51 @@ def test_decoupled_kl_trains_oos_without_stealing_fragment_mass():
     assert torch.allclose(logits.grad, torch.zeros_like(logits.grad))
     assert oos_logits.grad is not None
     assert float(oos_logits.grad[0]) < 0.0
+
+
+def test_candidate_responsibility_distinguishes_same_bin_off_tolerance_candidates():
+    good_pred = {
+        'logits': torch.tensor([2.0, -2.0]),
+        'oos_logits': torch.tensor([-5.0]),
+        'mzs': torch.tensor([1.005, 1.40]),
+        'bins': torch.tensor([1, 1]),
+        'batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 5,
+    }
+    bad_pred = {
+        **good_pred,
+        'logits': torch.tensor([-2.0, 2.0]),
+    }
+    batch = {
+        'target_mz': torch.tensor([1.005]),
+        'target_intensity': torch.tensor([1.0]),
+        'target_batch': torch.tensor([0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+
+    good_decoupled = decoupled_sparse_binned_kl_divergence(good_pred, batch)
+    bad_decoupled = decoupled_sparse_binned_kl_divergence(bad_pred, batch)
+    good_responsibility = candidate_responsibility_kl_divergence(
+        good_pred, batch, tolerance=0.01
+    )
+    bad_responsibility = candidate_responsibility_kl_divergence(
+        bad_pred, batch, tolerance=0.01
+    )
+
+    assert torch.allclose(good_decoupled, bad_decoupled, atol=1e-6)
+    assert good_responsibility < bad_responsibility
+    assert spectrum_loss(
+        good_pred,
+        batch,
+        loss='responsibility_decoupled_kl',
+        coverage_weight=1.0,
+    ) < spectrum_loss(
+        bad_pred,
+        batch,
+        loss='responsibility_decoupled_kl',
+        coverage_weight=1.0,
+    )
 
 
 def test_decoupled_metrics_use_fragment_softmax_and_sigmoid_oos():
@@ -758,6 +928,41 @@ def test_kl_cosine_loss_matches_weighted_components():
     assert torch.allclose(hybrid_loss, expected)
 
 
+def test_decoupled_kl_cosine_loss_matches_weighted_components():
+    pred = {
+        'logits': torch.tensor([0.0, 1.0, -1.0]),
+        'oos_logits': torch.tensor([-0.5]),
+        'bins': torch.tensor([1, 2, 3]),
+        'batch': torch.tensor([0, 0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+    }
+    batch = {
+        'target_mz': torch.tensor([1.2, 4.2]),
+        'target_intensity': torch.tensor([0.25, 0.75]),
+        'target_batch': torch.tensor([0, 0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    kl_weight = 0.7
+    decoupled_loss = spectrum_loss(pred, batch, loss='decoupled_kl')
+    fragment_cosine_loss = (
+        1.0
+        - sparse_binned_cosine_similarity(
+            pred,
+            batch,
+            include_oos=False,
+        ).mean()
+    )
+    hybrid_loss = spectrum_loss(
+        pred,
+        batch,
+        loss='decoupled_kl_cosine',
+        kl_weight=kl_weight,
+    )
+    expected = kl_weight * decoupled_loss + (1.0 - kl_weight) * fragment_cosine_loss
+    assert torch.allclose(hybrid_loss, expected)
+
+
 def test_sparse_oos_probability_and_cosine_without_oos():
     batch = {
         'target_mz': torch.tensor([1.2]),
@@ -847,3 +1052,49 @@ def test_sparse_binned_kl_aggregates_unreachable_bins_into_single_oos_event():
 
     assert loss.item() >= 0.0
     assert torch.allclose(loss, -torch.log(torch.tensor([0.8])), atol=1e-6)
+
+
+def test_fiora_decoupled_kl_supervises_bond_break_events():
+    batch = {
+        'target_mz': torch.tensor([2.0]),
+        'target_intensity': torch.tensor([1.0]),
+        'target_batch': torch.tensor([0]),
+        'bin_width': torch.tensor([1.0]),
+    }
+    base_pred = {
+        'logits': torch.tensor([0.0, 0.0]),
+        'oos_logits': torch.tensor([-5.0]),
+        'mzs': torch.tensor([1.0, 2.0]),
+        'bins': torch.tensor([1, 2]),
+        'batch': torch.tensor([0, 0]),
+        'formula_index': torch.tensor([0, 1]),
+        'formula_batch': torch.tensor([0, 0]),
+        'batch_size': 1,
+        'num_bins': 4,
+        'bond_break_formula_index': torch.tensor([0, 1]),
+        'bond_break_batch': torch.tensor([0, 0]),
+    }
+    good_pred = {
+        **base_pred,
+        'bond_break_logits': torch.tensor([-2.0, 2.0]),
+    }
+    bad_pred = {
+        **base_pred,
+        'bond_break_logits': torch.tensor([2.0, -2.0]),
+    }
+
+    good = spectrum_loss(
+        good_pred,
+        batch,
+        loss='fiora_decoupled_kl',
+        coverage_weight=1.0,
+    )
+    bad = spectrum_loss(
+        bad_pred,
+        batch,
+        loss='fiora_decoupled_kl',
+        coverage_weight=1.0,
+    )
+
+    assert torch.isfinite(good)
+    assert good < bad

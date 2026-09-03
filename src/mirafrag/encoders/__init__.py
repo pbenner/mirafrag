@@ -5,6 +5,8 @@ from torch import nn
 
 from mirafrag.encoders.aimnet import AimnetNodeEncoder, load_aimnet_encoder
 from mirafrag.encoders.mace import load_mace_encoder, repair_mace_cuequivariance_config
+from mirafrag.encoders.small3d import Small3DNodeEncoder, load_small3d_encoder
+from mirafrag.encoders.unimol import UniMolNodeEncoder, load_unimol_encoder
 
 
 def load_foundation_encoder(
@@ -15,13 +17,24 @@ def load_foundation_encoder(
     foundation_path: str | None = None,
     aimnet_model: str | None = 'aimnet2',
     aimnet_path: str | None = None,
+    unimol_model_name: str = 'unimolv1',
+    unimol_model_size: str = '84m',
+    unimol_pretrained_model_path: str | None = None,
+    unimol_pretrained_dict_path: str | None = None,
+    unimol_max_atoms: int = 512,
+    unimol_mode: str = 'trainable',
     device: str | torch.device = 'cpu',
 ) -> nn.Module:
     """
-    Load the configured foundation atom encoder.
+    Load the configured atom encoder.
 
-    The returned module must expose ``atomic_numbers`` and ``r_max`` and return a dictionary containing per-atom ``node_feats`` when called by :class:`MiraFragModel`. Supported encoder families are MACE and AIMNet.
+    The returned module must expose ``atomic_numbers`` and ``r_max`` and return
+    per-atom ``node_feats`` when called by :class:`MiraFragModel`. Supported
+    encoder families are MACE, AIMNet, Uni-Mol, and the compact ``small3d``
+    encoder.
     """
+    if encoder_type == 'small3d':
+        return load_small3d_encoder(device=device)
     if encoder_type == 'mace':
         return load_mace_encoder(
             source=foundation_source,
@@ -35,15 +48,30 @@ def load_foundation_encoder(
             model_path=aimnet_path,
             device=device,
         )
+    if encoder_type == 'unimol':
+        return load_unimol_encoder(
+            model_name=unimol_model_name,
+            model_size=unimol_model_size,
+            pretrained_model_path=unimol_pretrained_model_path,
+            pretrained_dict_path=unimol_pretrained_dict_path,
+            max_atoms=unimol_max_atoms,
+            mode=unimol_mode,
+            device=device,
+        )
     raise ValueError(
-        f'Unknown encoder_type {encoder_type!r}; expected one of: mace, aimnet.'
+        'Unknown encoder_type '
+        f'{encoder_type!r}; expected one of: mace, aimnet, unimol, small3d.'
     )
 
 
 __all__ = [
     'AimnetNodeEncoder',
+    'Small3DNodeEncoder',
+    'UniMolNodeEncoder',
     'load_aimnet_encoder',
     'load_foundation_encoder',
     'load_mace_encoder',
+    'load_small3d_encoder',
+    'load_unimol_encoder',
     'repair_mace_cuequivariance_config',
 ]

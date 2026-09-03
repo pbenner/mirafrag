@@ -36,9 +36,42 @@ def _bond_break_stats(mol: Chem.Mol) -> list[dict[str, Any]]:
                 'end': end,
                 'order_weight': order_weight,
                 'score': float(score),
+                'hetero': bool(hetero),
             }
         )
     return stats
+
+
+def _fragment_bond_breaks(
+    atom_set: set[int],
+    bond_stats: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Return original-molecule bonds crossing a retained fragment boundary.
+
+    Each returned item is oriented from the atom retained in the fragment to the
+    neighboring atom that was lost. This orientation gives the scorer explicit
+    access to kept-versus-neutral-loss local chemistry.
+    """
+    out: list[dict[str, Any]] = []
+    for bond in bond_stats:
+        begin = int(bond['begin'])
+        end = int(bond['end'])
+        begin_in = begin in atom_set
+        end_in = end in atom_set
+        if begin_in == end_in:
+            continue
+        inside, outside = (begin, end) if begin_in else (end, begin)
+        out.append(
+            {
+                'inside': int(inside),
+                'outside': int(outside),
+                'order_weight': int(bond['order_weight']),
+                'score': float(bond['score']),
+                'hetero': bool(bond.get('hetero', False)),
+            }
+        )
+    return out
 
 
 def _fragment_break_score(

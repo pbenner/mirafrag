@@ -58,12 +58,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--foundation-path', default=None)
     parser.add_argument(
         '--encoder',
-        choices=['mace', 'aimnet'],
+        choices=['mace', 'aimnet', 'unimol', 'small3d'],
         default='mace',
         help='Foundation atom encoder.',
     )
     parser.add_argument('--aimnet-model', default='aimnet2')
     parser.add_argument('--aimnet-path', default=None)
+    parser.add_argument('--unimol-model-name', default='unimolv1')
+    parser.add_argument('--unimol-model-size', default='84m')
+    parser.add_argument('--unimol-pretrained-model-path', default=None)
+    parser.add_argument('--unimol-pretrained-dict-path', default=None)
+    parser.add_argument('--unimol-max-atoms', type=int, default=512)
+    parser.add_argument(
+        '--unimol-mode',
+        choices=['trainable', 'frozen'],
+        default='trainable',
+        help='Uni-Mol encoder mode: trainable uses the underlying nn.Module; frozen uses UniMolRepr inference.',
+    )
+    parser.add_argument(
+        '--graph-relaxation',
+        choices=['rdkit', 'aimnet', 'none'],
+        default='rdkit',
+        help='Coordinate relaxation method used when building molecular graphs.',
+    )
+    parser.add_argument(
+        '--aimnet-relax-model',
+        default=None,
+        help='AIMNet model name used for --graph-relaxation aimnet.',
+    )
+    parser.add_argument('--aimnet-relax-steps', type=int, default=50)
+    parser.add_argument('--aimnet-relax-fmax', type=float, default=0.05)
+    parser.add_argument('--aimnet-relax-device', default='auto')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--mz-max', type=float, default=MASS_SPEC_GYM_MZ_MAX)
     parser.add_argument('--bin-width', type=float, default=MASS_SPEC_GYM_BIN_WIDTH)
@@ -78,6 +103,48 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--fragment-isotope-threshold', type=float, default=None)
     parser.add_argument('--max-fragment-isotope-peaks', type=int, default=None)
+    parser.add_argument(
+        '--fragment-bond-break-layers',
+        type=int,
+        default=None,
+        help=(
+            'Include fragment cut-bond provenance in cache entries when positive; '
+            'matches training --fragment-bond-break-layers.'
+        ),
+    )
+    parser.add_argument(
+        '--fragment-action-primary-layers',
+        type=int,
+        default=None,
+        help=(
+            'Include fragment cut-bond provenance in cache entries when positive; '
+            'matches training --fragment-action-primary-layers.'
+        ),
+    )
+    parser.add_argument(
+        '--bond-break-geometry-features',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Accept training head geometry setting for cache/config parity. '
+            'This does not change cache contents by itself.'
+        ),
+    )
+    parser.add_argument(
+        '--fragment-action-geometry-features',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Deprecated alias for --bond-break-geometry-features.',
+    )
+    parser.add_argument(
+        '--fragment-action-bond-gnn-layers',
+        type=int,
+        default=None,
+        help=(
+            'Include fragment cut-bond provenance in cache entries when positive; '
+            'matches training --fragment-action-bond-gnn-layers.'
+        ),
+    )
     parser.add_argument(
         '--splits',
         nargs='+',
@@ -132,6 +199,21 @@ def main() -> None:
     The command loads either a checkpoint-defined encoder/config or a fresh foundation encoder on CPU by default, filters rows to supported elements, deduplicates cache keys, and fills graph/fragment cache files.
     """
     args = parse_args()
+    if (
+        args.fragment_bond_break_layers is not None
+        and args.fragment_bond_break_layers < 0
+    ):
+        raise SystemExit('--fragment-bond-break-layers must be nonnegative.')
+    if (
+        args.fragment_action_primary_layers is not None
+        and args.fragment_action_primary_layers < 0
+    ):
+        raise SystemExit('--fragment-action-primary-layers must be nonnegative.')
+    if (
+        args.fragment_action_bond_gnn_layers is not None
+        and args.fragment_action_bond_gnn_layers < 0
+    ):
+        raise SystemExit('--fragment-action-bond-gnn-layers must be nonnegative.')
     quiet_rdkit_logs()
     device = 'cpu' if args.device == 'auto' else resolve_device(args.device)
 
@@ -150,6 +232,12 @@ def main() -> None:
             foundation_path=args.foundation_path,
             aimnet_model=args.aimnet_model,
             aimnet_path=args.aimnet_path,
+            unimol_model_name=args.unimol_model_name,
+            unimol_model_size=args.unimol_model_size,
+            unimol_pretrained_model_path=args.unimol_pretrained_model_path,
+            unimol_pretrained_dict_path=args.unimol_pretrained_dict_path,
+            unimol_max_atoms=args.unimol_max_atoms,
+            unimol_mode=args.unimol_mode,
             device=device,
         )
         graph_source = encoder
@@ -160,7 +248,15 @@ def main() -> None:
             high_ce=high_ce_fragment_config_from_args(fragment_config, args),
         )
 
-    graph_config = infer_graph_config(graph_source, seed=args.seed)
+    graph_config = infer_graph_config(
+        graph_source,
+        seed=args.seed,
+        relaxation=args.graph_relaxation,
+        aimnet_relax_model=args.aimnet_relax_model or args.aimnet_model,
+        aimnet_relax_steps=args.aimnet_relax_steps,
+        aimnet_relax_fmax=args.aimnet_relax_fmax,
+        aimnet_relax_device=args.aimnet_relax_device,
+    )
     df = read_table(args.input)
     if args.massspecgym_filter:
         df = filter_massspecgym_simulation(df)
@@ -341,6 +437,11 @@ def _fragment_config_from_args(args: argparse.Namespace) -> FragmentConfig:
         max_isotope_peaks=value_or_default(
             args.max_fragment_isotope_peaks,
             default.max_isotope_peaks,
+        ),
+        include_bond_breaks=bool(
+            (args.fragment_bond_break_layers or 0) > 0
+            or (args.fragment_action_primary_layers or 0) > 0
+            or (args.fragment_action_bond_gnn_layers or 0) > 0
         ),
     )
 

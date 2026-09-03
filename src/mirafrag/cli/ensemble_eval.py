@@ -12,6 +12,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from mirafrag.data import (
+    PRECURSOR_ALIASES,
     SMILES_ALIASES,
     filter_massspecgym_simulation,
     find_column,
@@ -24,6 +25,7 @@ from mirafrag.sparse_spectra import (
     scale_sparse_spectrum,
     sparse_cosine,
     sparse_from_peaks,
+    sparse_jensen_shannon_similarity,
 )
 from mirafrag.spectra import MASS_SPEC_GYM_BIN_WIDTH, MASS_SPEC_GYM_MZ_MAX, parse_peaks
 
@@ -177,6 +179,9 @@ def run_ensemble_eval(
         for name, spectrum in zip(names, spectra):
             record[f'{name}_cosine'] = sparse_cosine(spectrum, target)
             record[f'{name}_sqrt_cosine'] = sparse_cosine(spectrum, target, sqrt=True)
+            record[f'{name}_jensen_shannon_similarity'] = (
+                sparse_jensen_shannon_similarity(spectrum, target)
+            )
         for vector in weights:
             label = _weight_label(vector)
             ensemble = _weighted_sum(spectra, vector)
@@ -185,6 +190,9 @@ def run_ensemble_eval(
                 ensemble,
                 target,
                 sqrt=True,
+            )
+            record[f'ensemble_jensen_shannon_similarity_{label}'] = (
+                sparse_jensen_shannon_similarity(ensemble, target)
             )
         row_records.append(record)
 
@@ -205,8 +213,21 @@ def _weighted_sum(
 
 
 def _row_spectrum(row: pd.Series, *, mz_max: float, bin_width: float) -> SparseSpectrum:
-    mzs, intensities = parse_peaks(row)
+    precursor_col = _find_precursor_column(row)
+    mzs, intensities = parse_peaks(
+        row,
+        precursor_mz=row.get(precursor_col) if precursor_col is not None else None,
+        exclude_precursor=True,
+        precursor_tolerance=bin_width,
+    )
     return sparse_from_peaks(mzs, intensities, mz_max=mz_max, bin_width=bin_width)
+
+
+def _find_precursor_column(row: pd.Series) -> str | None:
+    for column in PRECURSOR_ALIASES:
+        if column in row.index:
+            return column
+    return None
 
 
 def _prediction_lookup(predictions: pd.DataFrame) -> dict[str, int] | None:
@@ -329,6 +350,9 @@ def _summarize_rows(
                 'weights': name,
                 'cosine_mean': _mean(rows[f'{name}_cosine']),
                 'sqrt_cosine_mean': _mean(rows[f'{name}_sqrt_cosine']),
+                'jensen_shannon_similarity_mean': _mean(
+                    rows[f'{name}_jensen_shannon_similarity']
+                ),
             }
         )
     for vector in weight_grid:
@@ -339,6 +363,9 @@ def _summarize_rows(
                 'weights': ':'.join(_format_float(value) for value in vector),
                 'cosine_mean': _mean(rows[f'ensemble_cosine_{label}']),
                 'sqrt_cosine_mean': _mean(rows[f'ensemble_sqrt_cosine_{label}']),
+                'jensen_shannon_similarity_mean': _mean(
+                    rows[f'ensemble_jensen_shannon_similarity_{label}']
+                ),
             }
         )
     return pd.DataFrame(records).sort_values(
@@ -357,7 +384,9 @@ def _print_summary(summary: pd.DataFrame) -> None:
         print(
             f'mode={row.mode} weights={row.weights} '
             f'cosine_mean={row.cosine_mean:.5f} '
-            f'sqrt_cosine_mean={row.sqrt_cosine_mean:.5f}'
+            f'sqrt_cosine_mean={row.sqrt_cosine_mean:.5f} '
+            f'jensen_shannon_similarity_mean='
+            f'{row.jensen_shannon_similarity_mean:.5f}'
         )
 
 

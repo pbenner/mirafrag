@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 from rdkit import Chem
+from rdkit.Chem import Crippen, Descriptors, Lipinski, rdMolDescriptors
 from torch.utils.data import Dataset
 
 from mirafrag.adducts import parse_adduct
@@ -28,9 +30,11 @@ from mirafrag.fragments import (
     collate_fragment_candidates,
     smiles_to_fragment_candidates,
 )
+from mirafrag.fragments.mol import _bond_break_stats, _fragment_bond_breaks
 from mirafrag.spectra import (
     MASS_SPEC_GYM_BIN_WIDTH,
     MASS_SPEC_GYM_MZ_MAX,
+    bin_spectrum,
     parse_peaks,
 )
 
@@ -39,6 +43,50 @@ PRECURSOR_ALIASES = ('precursor_mz', 'PrecursorMZ', 'PRECURSORMZ', 'PEPMASS')
 ADDUCT_ALIASES = ('adduct', 'precursor_type', 'Precursor_type', 'PRECURSORTYPE')
 INSTRUMENT_ALIASES = ('instrument_type', 'Instrument_type', 'INSTRUMENTTYPE')
 CE_ALIASES = ('collision_energy', 'CE', 'CollisionEnergy', 'COLLISIONENERGY')
+RAW_COLLISION_ENERGY_COLUMN = '_mirafrag_raw_collision_energy'
+SAMPLE_WEIGHT_COLUMN = '_mirafrag_sample_weight'
+DEFAULT_PHYSICAL_BOND_FEATURE_COLUMNS = (
+    'bond_distance_A',
+    'rdkit_bond_order',
+    'rdkit_bond_is_single',
+    'rdkit_bond_is_double',
+    'rdkit_bond_is_triple',
+    'rdkit_bond_is_aromatic',
+    'rdkit_bond_is_conjugated',
+    'rdkit_bond_is_in_ring',
+    'rdkit_bond_min_ring_size',
+    'rdkit_atom_i_formal_charge',
+    'rdkit_atom_j_formal_charge',
+    'rdkit_atom_i_total_degree',
+    'rdkit_atom_j_total_degree',
+    'rdkit_atom_i_total_h_count',
+    'rdkit_atom_j_total_h_count',
+    'rdkit_atom_i_is_aromatic',
+    'rdkit_atom_j_is_aromatic',
+    'rdkit_atom_i_is_in_ring',
+    'rdkit_atom_j_is_in_ring',
+    'rdkit_atom_i_hetero_neighbor_count',
+    'rdkit_atom_j_hetero_neighbor_count',
+    'rdkit_atom_i_gasteiger_charge',
+    'rdkit_atom_j_gasteiger_charge',
+    'rdkit_gasteiger_charge_sum',
+    'rdkit_gasteiger_charge_abs_diff',
+    'rdkit_pauling_en_abs_diff',
+    'rdkit_is_c_hetero_bond',
+    'rdkit_is_hetero_hetero_bond',
+    'rdkit_is_carbonyl_adjacent',
+    'rdkit_is_carbonyl_hetero_bond',
+    'rdkit_is_ester_like_bond',
+    'rdkit_is_amide_like_bond',
+    'rdkit_is_thioester_like_bond',
+    'rdkit_is_acetal_like_bond',
+    'rdkit_is_glycosidic_like_bond',
+    'rdkit_local_hetero_neighbor_count',
+    'rdkit_local_aromatic_neighbor_count',
+    'rdkit_local_ring_neighbor_count',
+)
+PHYSICAL_BOND_FEATURE_PRESENT_COLUMN = 'physical_bond_feature_present'
+MOLECULE_DESCRIPTOR_DIM = 20
 FEATURE_CACHE_VERSION = 'v12'
 FEATURE_CACHE_FORMAT = 'mirafrag-feature-v1'
 
@@ -60,6 +108,7 @@ class MetadataConfig:
     collision_energy_by_instrument: dict[str, dict[str, float]] = field(
         default_factory=dict
     )
+    collision_energy_mode: str = 'raw'
 
     @property
     def num_adducts(self) -> int:
@@ -82,6 +131,7 @@ class MetadataConfig:
         *,
         precursor_mz_max: float = MASS_SPEC_GYM_MZ_MAX,
         collision_energy_max: float = 100.0,
+        collision_energy_mode: str = 'raw',
     ) -> MetadataConfig:
         """
         Learn metadata vocabularies and collision-energy statistics from a dataframe.
@@ -101,6 +151,9 @@ class MetadataConfig:
             if instrument_col is not None
             else []
         )
+        ce_mode = str(collision_energy_mode).lower()
+        if ce_mode not in {'raw', 'normalized'}:
+            raise ValueError('collision_energy_mode must be one of: raw, normalized.')
         ce_values = (
             _finite_float_array(df[ce_col]) if ce_col is not None else np.array([])
         )
@@ -126,6 +179,7 @@ class MetadataConfig:
             collision_energy_center=ce_center,
             collision_energy_scale=ce_scale,
             collision_energy_by_instrument=ce_by_instrument,
+            collision_energy_mode=ce_mode,
         )
 
     @classmethod
@@ -144,8 +198,9 @@ class MetadataConfig:
             'collision_energy_scale',
             'collision_energy_by_instrument',
         }
+        optional = {'collision_energy_mode'}
         missing = required - set(data)
-        unknown = set(data) - required
+        unknown = set(data) - required - optional
         if missing or unknown:
             parts = []
             if missing:
@@ -171,6 +226,7 @@ class MetadataConfig:
                 }
                 for instrument, stats in data['collision_energy_by_instrument'].items()
             },
+            collision_energy_mode=str(data.get('collision_energy_mode', 'raw')),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -221,6 +277,168 @@ def read_table(path: str | Path | None) -> pd.DataFrame:
     if path.suffix.lower() == '.jsonl':
         return pd.read_json(path, lines=True)
     return pd.read_csv(path)
+
+
+def normalize_collision_energy_dataframe(
+    df: pd.DataFrame,
+    *,
+    metadata_config: MetadataConfig | None = None,
+    reference_df: pd.DataFrame | None = None,
+    collision_energy_max: float = 100.0,
+) -> pd.DataFrame:
+    """
+    Replace collision energy with train-reference normalized collision energy.
+
+    This mirrors FraGNNet's NCE-style usage at the dataframe boundary: the model
+    can then consume CE as an already normalized scalar without applying a second
+    robust transform. Per-instrument robust stats are used when available, with a
+    global robust fallback.
+    """
+    ce_col = find_column(df, CE_ALIASES, required=False)
+    if ce_col is None:
+        return df.reset_index(drop=True).copy()
+    if metadata_config is None:
+        if reference_df is None:
+            raise ValueError(
+                'Pass metadata_config or reference_df for CE normalization.'
+            )
+        ref_ce_col = find_column(reference_df, CE_ALIASES, required=False)
+        if ref_ce_col is None:
+            return df.reset_index(drop=True).copy()
+        metadata_config = MetadataConfig.from_dataframe(
+            reference_df,
+            collision_energy_max=collision_energy_max,
+            collision_energy_mode='normalized',
+        )
+    instrument_col = find_column(df, INSTRUMENT_ALIASES, required=False)
+    global_center = float(metadata_config.collision_energy_center)
+    global_scale = float(metadata_config.collision_energy_scale)
+    by_instrument = metadata_config.collision_energy_by_instrument
+
+    out = df.reset_index(drop=True).copy()
+    if RAW_COLLISION_ENERGY_COLUMN not in out.columns:
+        out[RAW_COLLISION_ENERGY_COLUMN] = pd.to_numeric(
+            out[ce_col],
+            errors='coerce',
+        )
+    source_ce_col = (
+        RAW_COLLISION_ENERGY_COLUMN
+        if RAW_COLLISION_ENERGY_COLUMN in out.columns
+        else ce_col
+    )
+    normalized: list[float] = []
+    for _, row in out.iterrows():
+        value = _coerce_optional_float(row.get(source_ce_col))
+        if not np.isfinite(value):
+            normalized.append(0.0)
+            continue
+        center = global_center
+        scale = global_scale
+        if instrument_col is not None:
+            stats = by_instrument.get(_coerce_string(row.get(instrument_col)))
+            if stats:
+                center = float(stats['center'])
+                scale = float(stats['scale'])
+        normalized.append((float(value) - center) / max(float(scale), 1e-6))
+    out[ce_col] = normalized
+    return out
+
+
+def merge_group_spectra(
+    df: pd.DataFrame,
+    *,
+    mz_max: float = MASS_SPEC_GYM_MZ_MAX,
+    bin_width: float = MASS_SPEC_GYM_BIN_WIDTH,
+    group_cols: str | list[str] | tuple[str, ...] = 'auto',
+    exclude_precursor_peaks: bool = True,
+    precursor_peak_tolerance: float = MASS_SPEC_GYM_BIN_WIDTH,
+) -> pd.DataFrame:
+    """
+    Merge replicate spectra inside the already selected split.
+
+    The default grouping keeps molecule structure, adduct, and instrument fixed,
+    while allowing collision energies to merge into a single consensus target.
+    Peaks are accumulated on the configured m/z grid and exported as sparse
+    bin-center peaks. Collision-energy values are preserved as JSON lists so
+    downstream metadata encoders can aggregate them without losing replicate CE
+    information.
+    """
+    if df.empty:
+        return df.reset_index(drop=True).copy()
+    precursor_col = find_column(df, PRECURSOR_ALIASES, required=False)
+    ce_col = find_column(df, CE_ALIASES, required=False)
+    resolved_group_cols = _resolve_merge_group_cols(df, group_cols)
+    rows: list[pd.Series] = []
+    for _, group in df.groupby(resolved_group_cols, dropna=False, sort=False):
+        first = group.iloc[0].copy()
+        spectrum = None
+        for _, row in group.iterrows():
+            precursor_mz = (
+                _coerce_float(row.get(precursor_col), 0.0)
+                if precursor_col is not None
+                else 0.0
+            )
+            mzs, intensities = parse_peaks(
+                row,
+                precursor_mz=precursor_mz,
+                exclude_precursor=exclude_precursor_peaks,
+                precursor_tolerance=precursor_peak_tolerance,
+            )
+            binned = bin_spectrum(
+                mzs,
+                intensities,
+                mz_max=mz_max,
+                bin_width=bin_width,
+                normalize='none',
+            ).numpy()
+            spectrum = binned if spectrum is None else spectrum + binned
+        assert spectrum is not None
+        nonzero = np.flatnonzero(spectrum > 0)
+        first['mzs'] = ','.join(
+            f'{(float(idx) + 0.5) * float(bin_width):.6g}' for idx in nonzero
+        )
+        first['intensities'] = ','.join(
+            f'{float(spectrum[idx]):.8g}' for idx in nonzero
+        )
+        if 'peaks' in first.index:
+            first['peaks'] = np.nan
+        if ce_col is not None:
+            ce_values = _finite_float_array(group[ce_col])
+            first[ce_col] = _json_float_list(ce_values) if ce_values.size else np.nan
+        if RAW_COLLISION_ENERGY_COLUMN in first.index:
+            raw_ce_values = _finite_float_array(group[RAW_COLLISION_ENERGY_COLUMN])
+            first[RAW_COLLISION_ENERGY_COLUMN] = (
+                _json_float_list(raw_ce_values) if raw_ce_values.size else np.nan
+            )
+        if 'identifier' in first.index:
+            first['identifier'] = '|'.join(str(x) for x in group['identifier'].tolist())
+        rows.append(first)
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def _resolve_merge_group_cols(
+    df: pd.DataFrame,
+    group_cols: str | list[str] | tuple[str, ...],
+) -> list[str]:
+    if group_cols != 'auto':
+        if isinstance(group_cols, str):
+            cols = [col.strip() for col in group_cols.split(',') if col.strip()]
+        else:
+            cols = [str(col) for col in group_cols]
+        missing = [col for col in cols if col not in df.columns]
+        if missing:
+            raise ValueError(f'Merge group columns are missing: {missing}')
+        return cols
+    cols: list[str] = []
+    smiles_col = find_column(df, SMILES_ALIASES, required=False)
+    adduct_col = find_column(df, ADDUCT_ALIASES, required=False)
+    instrument_col = find_column(df, INSTRUMENT_ALIASES, required=False)
+    for col in (smiles_col, adduct_col, instrument_col):
+        if col is not None and col not in cols:
+            cols.append(col)
+    if not cols:
+        raise ValueError('Could not infer merge group columns.')
+    return cols
 
 
 def filter_massspecgym_simulation(df: pd.DataFrame) -> pd.DataFrame:
@@ -365,6 +583,68 @@ def _coerce_float(value, default: float = 0.0) -> float:
         return default
 
 
+def molecule_descriptor_features(smiles: str) -> torch.Tensor:
+    """
+    Return normalized RDKit descriptors used for molecule-level support conditioning.
+
+    The features are cheap to compute from SMILES, independent of graph/fragment
+    cache settings, and scaled to roughly order-one ranges so they can be fed
+    directly into small residual heads.
+    """
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return torch.zeros(MOLECULE_DESCRIPTOR_DIM, dtype=torch.float32)
+    atoms = list(mol.GetAtoms())
+    bonds = list(mol.GetBonds())
+    ring_info = mol.GetRingInfo()
+    atom_rings = ring_info.AtomRings()
+    num_atoms = max(float(mol.GetNumAtoms()), 1.0)
+    num_bonds = max(float(mol.GetNumBonds()), 1.0)
+    hetero_atoms = sum(1 for atom in atoms if atom.GetAtomicNum() not in {1, 6})
+    aromatic_atoms = sum(1 for atom in atoms if atom.GetIsAromatic())
+    ring_bonds = sum(1 for bond in bonds if bond.IsInRing())
+    hetero_bonds = sum(
+        1
+        for bond in bonds
+        if mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomicNum() not in {1, 6}
+        or mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomicNum() not in {1, 6}
+    )
+    carbon_hetero_bonds = sum(
+        1
+        for bond in bonds
+        if {
+            mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomicNum() == 6,
+            mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomicNum() == 6,
+        }
+        == {True, False}
+    )
+    chiral_centers = Chem.FindMolChiralCenters(mol, includeUnassigned=True)
+    max_ring_size = max((len(ring) for ring in atom_rings), default=0)
+    values = [
+        1.0,
+        float(mol.GetNumAtoms()) / 100.0,
+        float(mol.GetNumBonds()) / 120.0,
+        float(Descriptors.ExactMolWt(mol)) / 1500.0,
+        float(rdMolDescriptors.CalcTPSA(mol)) / 300.0,
+        float(Crippen.MolLogP(mol)) / 10.0,
+        float(Lipinski.NumHAcceptors(mol)) / 30.0,
+        float(Lipinski.NumHDonors(mol)) / 20.0,
+        float(Lipinski.NumRotatableBonds(mol)) / 50.0,
+        float(rdMolDescriptors.CalcFractionCSP3(mol)),
+        float(ring_info.NumRings()) / 20.0,
+        float(rdMolDescriptors.CalcNumAromaticRings(mol)) / 10.0,
+        float(rdMolDescriptors.CalcNumAliphaticRings(mol)) / 15.0,
+        float(max_ring_size) / 20.0,
+        float(hetero_atoms) / num_atoms,
+        float(aromatic_atoms) / num_atoms,
+        float(ring_bonds) / num_bonds,
+        float(hetero_bonds) / num_bonds,
+        float(carbon_hetero_bonds) / num_bonds,
+        float(len(chiral_centers)) / 30.0,
+    ]
+    return torch.nan_to_num(torch.tensor(values, dtype=torch.float32))
+
+
 def _coerce_string(value) -> str:
     """
     Convert a dataframe value to a clean string, mapping missing values to empty string.
@@ -395,9 +675,65 @@ def _coerce_optional_float(value) -> float:
 def _finite_float_array(values) -> np.ndarray:
     """
     Convert a sequence to a finite-only NumPy float array.
+
+    Entries may themselves be merged collision-energy lists encoded as Python
+    sequences or JSON strings. Those nested values are flattened so metadata
+    normalization statistics are learned from the original spectra, not from
+    per-group averages.
     """
-    out = np.asarray([_coerce_optional_float(value) for value in values], dtype=float)
-    return out[np.isfinite(out)]
+    out: list[float] = []
+    for value in values:
+        out.extend(_coerce_float_list(value))
+    array = np.asarray(out, dtype=float)
+    return array[np.isfinite(array)]
+
+
+def _coerce_float_list(value: Any) -> list[float]:
+    """Return finite float values from a scalar or merged CE list."""
+    out: list[float] = []
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        pass
+    elif isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        for item in value:
+            out.extend(_coerce_float_list(item))
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith('[') and text.endswith(']'):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                out.extend(_coerce_float_list(parsed))
+        elif ';' in text:
+            for part in text.split(';'):
+                out.extend(_coerce_float_list(part))
+        elif text:
+            number = _coerce_optional_float(text)
+            if np.isfinite(number):
+                out.append(float(number))
+    else:
+        number = _coerce_optional_float(value)
+        if np.isfinite(number):
+            out.append(float(number))
+    return out
+
+
+def _collision_energy_scalar(value: Any, *, default: float = 0.0) -> float:
+    """Return the mean CE for scalar compatibility with old code paths."""
+    values = _coerce_float_list(value)
+    return float(np.mean(values)) if values else float(default)
+
+
+def _collision_energy_support_value(value: Any) -> float | None:
+    """Return a conservative CE value for fragment-support selection."""
+    values = _coerce_float_list(value)
+    return float(np.max(values)) if values else None
+
+
+def _json_float_list(values: np.ndarray) -> str:
+    """Serialize finite CE values without losing replicate-level metadata."""
+    return json.dumps([float(value) for value in values if np.isfinite(value)])
 
 
 def _robust_center_scale(
@@ -449,6 +785,218 @@ def _collision_energy_stats_by_instrument(
     return stats
 
 
+def parse_physical_bond_feature_columns(value: str | None) -> tuple[str, ...]:
+    """
+    Parse a comma-separated physical bond sidecar column list.
+    """
+    if value is None or not str(value).strip():
+        return DEFAULT_PHYSICAL_BOND_FEATURE_COLUMNS
+    columns = tuple(part.strip() for part in str(value).split(',') if part.strip())
+    if not columns:
+        raise ValueError('physical bond feature column list is empty.')
+    return columns
+
+
+def physical_bond_feature_width(columns: tuple[str, ...] | list[str]) -> int:
+    """
+    Return appended sidecar feature width including the presence bit.
+    """
+    return len(tuple(columns)) + 1
+
+
+def _sidecar_value_column(columns: set[str], name: str) -> str | None:
+    if name in columns:
+        return name
+    mean_name = f'{name}_mean'
+    if mean_name in columns:
+        return mean_name
+    return None
+
+
+@lru_cache(maxsize=16)
+def load_physical_bond_feature_table(
+    path: str,
+    columns: tuple[str, ...],
+) -> dict[tuple[str, str], tuple[float, ...]]:
+    """
+    Load cid-physical-features bond sidecars keyed by ``(smiles, bond_key)``.
+
+    Missing requested columns are filled with zeros. The last feature is a
+    presence bit, so partial sidecars can be mixed with the full dataset without
+    changing tensor shapes.
+    """
+    table = pd.read_csv(path)
+    required = {'smiles', 'bond_key'}
+    missing = required - set(table.columns)
+    if missing:
+        raise ValueError(
+            f'Physical bond feature sidecar {path!r} is missing columns {sorted(missing)}.'
+        )
+    available = set(table.columns)
+    value_columns = [_sidecar_value_column(available, name) for name in columns]
+    lookup: dict[tuple[str, str], tuple[float, ...]] = {}
+    grouped = table.groupby(['smiles', 'bond_key'], sort=False, dropna=False)
+    for (smiles, bond_key), group in grouped:
+        values: list[float] = []
+        for source in value_columns:
+            if source is None:
+                values.append(0.0)
+                continue
+            numeric = pd.to_numeric(group[source], errors='coerce')
+            value = float(numeric.mean()) if numeric.notna().any() else 0.0
+            if not np.isfinite(value):
+                value = 0.0
+            values.append(value)
+        values.append(1.0)
+        lookup[(str(smiles), str(bond_key))] = tuple(values)
+    return lookup
+
+
+def _bond_feature_key(pair: tuple[int, int]) -> str:
+    i, j = int(pair[0]), int(pair[1])
+    if i <= j:
+        return f'{i}-{j}'
+    return f'{j}-{i}'
+
+
+def _append_physical_bond_features(
+    fragments: dict[str, Any],
+    *,
+    smiles: str,
+    sidecar_path: str | None,
+    sidecar_columns: tuple[str, ...],
+) -> dict[str, Any]:
+    if sidecar_path is None:
+        return fragments
+    atom_indices = fragments.get('atom_indices')
+    bond_atom_indices = fragments.get('bond_atom_indices')
+    bond_features = fragments.get('bond_features')
+    if atom_indices is None or bond_atom_indices is None or bond_features is None:
+        return fragments
+    if len(bond_atom_indices) != len(atom_indices) or len(bond_features) != len(
+        atom_indices
+    ):
+        raise ValueError(
+            'Fragment bond-break fields are inconsistent before physical feature append.'
+        )
+    width = physical_bond_feature_width(sidecar_columns)
+    zeros = tuple(0.0 for _ in range(width))
+    lookup = load_physical_bond_feature_table(str(sidecar_path), tuple(sidecar_columns))
+    features_out: list[tuple[tuple[float, ...], ...]] = []
+    for formula_pairs, formula_features in zip(bond_atom_indices, bond_features):
+        if len(formula_pairs) != len(formula_features):
+            raise ValueError(
+                'Fragment bond-break pairs/features are inconsistent before physical feature append.'
+            )
+        appended: list[tuple[float, ...]] = []
+        for pair, base_features in zip(formula_pairs, formula_features):
+            extra = lookup.get((str(smiles), _bond_feature_key(pair)), zeros)
+            appended.append(
+                tuple(float(value) for value in base_features)
+                + tuple(float(value) for value in extra)
+            )
+        features_out.append(tuple(appended))
+    out = dict(fragments)
+    out['bond_features'] = features_out
+    out['physical_bond_feature_columns'] = tuple(sidecar_columns) + (
+        PHYSICAL_BOND_FEATURE_PRESENT_COLUMN,
+    )
+    return out
+
+
+def _graph_config_cache_settings(config: GraphConfig) -> dict[str, Any]:
+    """
+    Return cache-key settings for graph generation.
+
+    Default RDKit preprocessing intentionally preserves the historical graph
+    cache key even though newer ``GraphConfig`` objects contain AIMNet relaxation
+    fields. Opting into AIMNet relaxation records those fields and therefore
+    uses a separate graph namespace while sharing fragment caches.
+    """
+    settings = asdict(config)
+    relaxation = str(settings.get('relaxation', 'rdkit')).lower()
+    if relaxation == 'rdkit':
+        for key in (
+            'relaxation',
+            'aimnet_relax_model',
+            'aimnet_relax_steps',
+            'aimnet_relax_fmax',
+            'aimnet_relax_device',
+        ):
+            settings.pop(key, None)
+    return settings
+
+
+def _fragment_config_cache_settings(config: FragmentConfig) -> dict[str, Any]:
+    """
+    Return fragment-cache settings without invalidating old default caches.
+
+    Formula-composition features are part of the fragment payload schema, so a
+    schema marker prevents old disk-cache entries from silently disabling them.
+    Bond-break provenance is derived from retained atom masks on cache load, so
+    it intentionally does not fork the recursive-fragment cache namespace.
+    """
+    settings = asdict(config)
+    settings['fragment_feature_schema'] = 3
+    settings.pop('include_bond_breaks', None)
+    return settings
+
+
+def _ensure_fragment_bond_break_fields(
+    fragments: dict[str, Any],
+    smiles: str,
+) -> dict[str, Any]:
+    """
+    Add bond-break provenance to cached fragment payloads when requested.
+
+    The expensive fragment tree already stores retained atom masks. Boundary-bond
+    provenance is a deterministic function of those masks and the molecule bond
+    table, so it can be reconstructed cheaply without forking the fragment-cache
+    key or rebuilding recursive candidates.
+    """
+    atom_indices = fragments.get('atom_indices')
+    if atom_indices is None:
+        return fragments
+    bond_atom_indices = fragments.get('bond_atom_indices')
+    bond_features = fragments.get('bond_features')
+    if (
+        bond_atom_indices is not None
+        and bond_features is not None
+        and len(bond_atom_indices) == len(atom_indices)
+        and len(bond_features) == len(atom_indices)
+    ):
+        return fragments
+
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        raise ValueError(f'Invalid SMILES: {smiles!r}')
+    bond_stats = _bond_break_stats(mol)
+    max_bond_score = max((float(item['score']) for item in bond_stats), default=1.0)
+    denominator = max(max_bond_score, 1.0)
+    pairs_out: list[tuple[tuple[int, int], ...]] = []
+    features_out: list[tuple[tuple[float, float, float], ...]] = []
+    for indices in atom_indices:
+        atom_set = {int(idx) for idx in indices}
+        bond_breaks = _fragment_bond_breaks(atom_set, bond_stats)
+        pairs_out.append(
+            tuple((int(item['inside']), int(item['outside'])) for item in bond_breaks)
+        )
+        features_out.append(
+            tuple(
+                (
+                    float(item['order_weight']) / 3.0,
+                    float(item['score']) / denominator,
+                    1.0 if bool(item.get('hetero', False)) else 0.0,
+                )
+                for item in bond_breaks
+            )
+        )
+    out = dict(fragments)
+    out['bond_atom_indices'] = pairs_out
+    out['bond_features'] = features_out
+    return out
+
+
 class BinnedSpectrumDataset(Dataset):
     """
     Dataset that yields graph, metadata, spectrum targets, and fragment candidates.
@@ -472,6 +1020,16 @@ class BinnedSpectrumDataset(Dataset):
         fragment_support_profile: FragmentSupportProfile | None = None,
         slow_sample_seconds: float = 0.0,
         trace_samples: bool = False,
+        exclude_precursor_peaks: bool = True,
+        precursor_peak_tolerance: float = MASS_SPEC_GYM_BIN_WIDTH,
+        physical_bond_features_path: str | Path | None = None,
+        physical_bond_feature_columns: tuple[str, ...] | list[str] | None = None,
+        target_neighbor_smoothing: bool = False,
+        target_neighbor_weight: float = 0.0,
+        target_neighbor_ce_window: float = 10.0,
+        target_neighbor_same_instrument: bool = True,
+        target_neighbor_same_adduct: bool = True,
+        sample_weight_col: str | None = None,
     ) -> None:
         """
         Initialize dataframe columns, cache settings, and feature-generation configs.
@@ -498,14 +1056,46 @@ class BinnedSpectrumDataset(Dataset):
         )
         self.slow_sample_seconds = float(slow_sample_seconds)
         self.trace_samples = bool(trace_samples)
+        self.exclude_precursor_peaks = bool(exclude_precursor_peaks)
+        self.precursor_peak_tolerance = float(precursor_peak_tolerance)
         self._graph_cache: dict[int, dict[str, torch.Tensor]] = {}
         self._fragment_cache: dict[int, dict[str, Any]] = {}
+        self.physical_bond_features_path = (
+            str(Path(physical_bond_features_path))
+            if physical_bond_features_path is not None
+            else None
+        )
+        self.physical_bond_feature_columns = tuple(
+            physical_bond_feature_columns
+            if physical_bond_feature_columns is not None
+            else DEFAULT_PHYSICAL_BOND_FEATURE_COLUMNS
+        )
+        self.target_neighbor_smoothing = bool(target_neighbor_smoothing)
+        self.target_neighbor_weight = max(0.0, min(1.0, float(target_neighbor_weight)))
+        self.target_neighbor_ce_window = max(0.0, float(target_neighbor_ce_window))
+        self.target_neighbor_same_instrument = bool(target_neighbor_same_instrument)
+        self.target_neighbor_same_adduct = bool(target_neighbor_same_adduct)
+        self.sample_weight_col = sample_weight_col
+        self._target_spectrum_cache: dict[
+            int,
+            tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]],
+        ] = {}
 
         self.smiles_col = find_column(self.df, SMILES_ALIASES)
         self.precursor_col = find_column(self.df, PRECURSOR_ALIASES, required=False)
         self.adduct_col = find_column(self.df, ADDUCT_ALIASES, required=False)
         self.instrument_col = find_column(self.df, INSTRUMENT_ALIASES, required=False)
         self.ce_col = find_column(self.df, CE_ALIASES, required=False)
+        self.raw_ce_col = (
+            RAW_COLLISION_ENERGY_COLUMN
+            if RAW_COLLISION_ENERGY_COLUMN in self.df.columns
+            else self.ce_col
+        )
+        self._target_neighbor_weights = (
+            self._build_target_neighbor_weights()
+            if self.target_neighbor_smoothing and self.target_neighbor_weight > 0.0
+            else None
+        )
 
     def __len__(self) -> int:
         """
@@ -527,7 +1117,7 @@ class BinnedSpectrumDataset(Dataset):
                 'graphs',
                 smiles,
                 {
-                    'graph_config': asdict(self.graph_config),
+                    'graph_config': _graph_config_cache_settings(self.graph_config),
                 },
             )
             graph = _load_feature_cache(path)
@@ -547,8 +1137,8 @@ class BinnedSpectrumDataset(Dataset):
         Return base or high-collision-energy fragment support for one row.
         """
         collision_energy = (
-            _coerce_optional_float(self.df.at[idx, self.ce_col])
-            if self.ce_col is not None
+            _collision_energy_support_value(self.df.at[idx, self.raw_ce_col])
+            if self.raw_ce_col is not None
             else None
         )
         return self.fragment_support_profile.config_for_collision_energy(
@@ -573,7 +1163,7 @@ class BinnedSpectrumDataset(Dataset):
                 'fragments',
                 smiles,
                 {
-                    'fragment_config': asdict(fragment_config),
+                    'fragment_config': _fragment_config_cache_settings(fragment_config),
                     'adduct': adduct,
                     'mz_max': self.mz_max,
                     'bin_width': self.bin_width,
@@ -581,6 +1171,19 @@ class BinnedSpectrumDataset(Dataset):
             )
             fragments = _load_feature_cache(path)
             if fragments is not None:
+                if bool(fragment_config.include_bond_breaks):
+                    fragments = _ensure_fragment_bond_break_fields(fragments, smiles)
+                    if (
+                        'bond_atom_indices' not in fragments
+                        or 'bond_features' not in fragments
+                    ):
+                        raise ValueError('Fragment bond-break augmentation failed.')
+                    fragments = _append_physical_bond_features(
+                        fragments,
+                        smiles=smiles,
+                        sidecar_path=self.physical_bond_features_path,
+                        sidecar_columns=self.physical_bond_feature_columns,
+                    )
                 if self.memory_cache:
                     self._fragment_cache[idx] = fragments
                 return fragments
@@ -593,9 +1196,158 @@ class BinnedSpectrumDataset(Dataset):
         )
         if self.disk_cache_dir is not None:
             _save_feature_cache(path, fragments)
+        if bool(fragment_config.include_bond_breaks):
+            fragments = _append_physical_bond_features(
+                fragments,
+                smiles=smiles,
+                sidecar_path=self.physical_bond_features_path,
+                sidecar_columns=self.physical_bond_feature_columns,
+            )
         if self.memory_cache:
             self._fragment_cache[idx] = fragments
         return fragments
+
+    def _target_group_key(self, row) -> tuple[str, ...]:
+        key = [str(row[self.smiles_col])]
+        if self.target_neighbor_same_adduct and self.adduct_col is not None:
+            key.append(_coerce_string(row.get(self.adduct_col)))
+        if self.target_neighbor_same_instrument and self.instrument_col is not None:
+            key.append(_coerce_string(row.get(self.instrument_col)))
+        return tuple(key)
+
+    def _row_collision_energy_for_neighbors(self, idx: int) -> float:
+        if self.raw_ce_col is None:
+            return 0.0
+        value = _collision_energy_support_value(self.df.at[idx, self.raw_ce_col])
+        return 0.0 if value is None or not np.isfinite(value) else float(value)
+
+    def _build_target_neighbor_weights(self) -> list[list[tuple[int, float]]]:
+        groups: dict[tuple[str, ...], list[int]] = {}
+        for idx, row in self.df.iterrows():
+            groups.setdefault(self._target_group_key(row), []).append(int(idx))
+        ce_values = [
+            self._row_collision_energy_for_neighbors(i) for i in range(len(self.df))
+        ]
+        window = max(float(self.target_neighbor_ce_window), 1e-6)
+        all_neighbors: list[list[tuple[int, float]]] = []
+        for idx, row in self.df.iterrows():
+            candidates = [
+                j for j in groups[self._target_group_key(row)] if j != int(idx)
+            ]
+            weighted: list[tuple[int, float]] = []
+            for other_idx in candidates:
+                delta = abs(float(ce_values[other_idx]) - float(ce_values[int(idx)]))
+                if delta > float(self.target_neighbor_ce_window):
+                    continue
+                weight = float(np.exp(-0.5 * (delta / window) ** 2))
+                if weight > 0.0:
+                    weighted.append((int(other_idx), weight))
+            total = sum(weight for _, weight in weighted)
+            if total > 0.0:
+                weighted = [
+                    (neighbor_idx, weight / total) for neighbor_idx, weight in weighted
+                ]
+            all_neighbors.append(weighted)
+        return all_neighbors
+
+    def _sparse_target_to_peaks(
+        self,
+        bins: np.ndarray,
+        intensities: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if bins.size == 0:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+        values = intensities.astype(np.float32, copy=True)
+        total = float(values.sum())
+        if total > 0.0:
+            values = values / total
+        mzs = (bins.astype(np.float32) + 0.5) * np.float32(self.bin_width)
+        return mzs, values
+
+    def _row_sparse_binned_target(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        cached = self._target_spectrum_cache.get(idx)
+        if cached is not None:
+            return cached[1]
+        row = self.df.iloc[idx]
+        precursor_mz = (
+            _coerce_float(row.get(self.precursor_col), 0.0)
+            if self.precursor_col is not None
+            else 0.0
+        )
+        mzs, intensities = parse_peaks(
+            row,
+            precursor_mz=precursor_mz,
+            exclude_precursor=self.exclude_precursor_peaks,
+            precursor_tolerance=self.precursor_peak_tolerance,
+        )
+        bins = np.floor(mzs / float(self.bin_width)).astype(np.int64)
+        num_bins = int(np.ceil(float(self.mz_max) / float(self.bin_width)))
+        mask = (
+            (bins >= 0)
+            & (bins < num_bins)
+            & np.isfinite(intensities)
+            & (intensities > 0)
+        )
+        bins = bins[mask]
+        values = intensities[mask].astype(np.float32, copy=False)
+        if bins.size > 0:
+            unique_bins, inverse = np.unique(bins, return_inverse=True)
+            summed = np.zeros(unique_bins.shape, dtype=np.float32)
+            np.add.at(summed, inverse, values)
+            total = float(summed.sum())
+            if total > 0.0:
+                summed = summed / total
+            bins = unique_bins.astype(np.int64, copy=False)
+            values = summed
+        else:
+            bins = np.empty(0, dtype=np.int64)
+            values = np.empty(0, dtype=np.float32)
+        self._target_spectrum_cache[idx] = ((mzs, intensities), (bins, values))
+        return bins, values
+
+    def _smoothed_target_peaks(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        if self._target_neighbor_weights is None:
+            row = self.df.iloc[idx]
+            precursor_mz = (
+                _coerce_float(row.get(self.precursor_col), 0.0)
+                if self.precursor_col is not None
+                else 0.0
+            )
+            return parse_peaks(
+                row,
+                precursor_mz=precursor_mz,
+                exclude_precursor=self.exclude_precursor_peaks,
+                precursor_tolerance=self.precursor_peak_tolerance,
+            )
+        neighbors = self._target_neighbor_weights[idx]
+        if not neighbors:
+            bins, intensities = self._row_sparse_binned_target(idx)
+            return self._sparse_target_to_peaks(bins, intensities)
+        mixed: dict[int, float] = {}
+        alpha = float(self.target_neighbor_weight)
+        own_bins, own_values = self._row_sparse_binned_target(idx)
+        for bin_idx, value in zip(own_bins.tolist(), own_values.tolist(), strict=True):
+            mixed[int(bin_idx)] = mixed.get(int(bin_idx), 0.0) + (1.0 - alpha) * float(
+                value
+            )
+        for neighbor_idx, weight in neighbors:
+            neighbor_bins, neighbor_values = self._row_sparse_binned_target(
+                neighbor_idx
+            )
+            for bin_idx, value in zip(
+                neighbor_bins.tolist(), neighbor_values.tolist(), strict=True
+            ):
+                mixed[int(bin_idx)] = mixed.get(int(bin_idx), 0.0) + alpha * float(
+                    weight
+                ) * float(value)
+        if not mixed:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+        bins = np.asarray(sorted(mixed), dtype=np.int64)
+        intensities = np.asarray(
+            [mixed[int(bin_idx)] for bin_idx in bins],
+            dtype=np.float32,
+        )
+        return self._sparse_target_to_peaks(bins, intensities)
 
     def materialize_feature_cache(self, idx: int) -> None:
         """
@@ -680,9 +1432,10 @@ class BinnedSpectrumDataset(Dataset):
             if self.precursor_col
             else 0.0
         )
-        collision_energy = (
-            _coerce_float(row.get(self.ce_col), 0.0) if self.ce_col else 0.0
-        )
+        ce_values = _coerce_float_list(row.get(self.ce_col)) if self.ce_col else []
+        if not ce_values:
+            ce_values = [0.0]
+        collision_energy = float(np.mean(ce_values))
         adduct = _coerce_string(row.get(self.adduct_col)) if self.adduct_col else ''
         instrument = (
             _coerce_string(row.get(self.instrument_col)) if self.instrument_col else ''
@@ -690,6 +1443,10 @@ class BinnedSpectrumDataset(Dataset):
         return {
             'precursor_mz': torch.tensor(precursor_mz, dtype=torch.float32),
             'collision_energy': torch.tensor(collision_energy, dtype=torch.float32),
+            'collision_energy_values': torch.tensor(
+                ce_values,
+                dtype=torch.float32,
+            ),
             'adduct': torch.tensor(
                 self.metadata_config.adduct_to_idx.get(
                     adduct, len(self.metadata_config.adduct_to_idx)
@@ -733,6 +1490,7 @@ class BinnedSpectrumDataset(Dataset):
             'smiles': smiles,
             'identifier': identifier,
             'bin_width': torch.tensor(self.bin_width, dtype=torch.float32),
+            'molecule_descriptors': molecule_descriptor_features(smiles),
         }
         item.update(self._metadata(row))
         fragment_seconds = 0.0
@@ -741,8 +1499,28 @@ class BinnedSpectrumDataset(Dataset):
             item['fragments'] = self._fragments(idx)
             fragment_seconds = time.perf_counter() - fragment_start
 
+        if '_retrieval_query_identifier' in row.index:
+            item['_retrieval_query_identifier'] = str(
+                row.get('_retrieval_query_identifier')
+            )
+        if '_retrieval_is_true' in row.index:
+            item['_retrieval_is_true'] = bool(row.get('_retrieval_is_true'))
+        if self.sample_weight_col is not None:
+            item['sample_weight'] = torch.tensor(
+                float(row.get(self.sample_weight_col)),
+                dtype=torch.float32,
+            )
         if self.require_spectrum:
-            mzs, intensities = parse_peaks(row)
+            precursor_mz = float(item['precursor_mz'].item())
+            if self._target_neighbor_weights is not None:
+                mzs, intensities = self._smoothed_target_peaks(idx)
+            else:
+                mzs, intensities = parse_peaks(
+                    row,
+                    precursor_mz=precursor_mz,
+                    exclude_precursor=self.exclude_precursor_peaks,
+                    precursor_tolerance=self.precursor_peak_tolerance,
+                )
             item['true_mzs'] = mzs
             item['true_intensities'] = intensities
         elapsed = time.perf_counter() - start
@@ -770,13 +1548,44 @@ def collate_spectrum_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
         'graph': graph,
         'precursor_mz': torch.stack([item['precursor_mz'] for item in items]),
         'collision_energy': torch.stack([item['collision_energy'] for item in items]),
+        'collision_energy_values': torch.cat(
+            [item['collision_energy_values'] for item in items]
+        ),
+        'collision_energy_batch': torch.cat(
+            [
+                torch.full(
+                    (int(item['collision_energy_values'].numel()),),
+                    batch_idx,
+                    dtype=torch.long,
+                )
+                for batch_idx, item in enumerate(items)
+            ]
+        ),
         'adduct': torch.stack([item['adduct'] for item in items]),
         'adduct_charge': torch.stack([item['adduct_charge'] for item in items]),
         'instrument_type': torch.stack([item['instrument_type'] for item in items]),
         'bin_width': torch.stack([item['bin_width'] for item in items]),
+        'molecule_descriptors': torch.stack(
+            [item['molecule_descriptors'] for item in items]
+        ),
         'smiles': [item['smiles'] for item in items],
         'identifier': [item['identifier'] for item in items],
     }
+    if 'sample_weight' in items[0]:
+        batch['sample_weight'] = torch.stack([item['sample_weight'] for item in items])
+    if '_retrieval_query_identifier' in items[0]:
+        group_lookup: dict[str, int] = {}
+        group_indices: list[int] = []
+        for item in items:
+            query_id = str(item['_retrieval_query_identifier'])
+            if query_id not in group_lookup:
+                group_lookup[query_id] = len(group_lookup)
+            group_indices.append(group_lookup[query_id])
+        batch['_retrieval_group'] = torch.tensor(group_indices, dtype=torch.long)
+        batch['_retrieval_is_true'] = torch.tensor(
+            [bool(item.get('_retrieval_is_true', False)) for item in items],
+            dtype=torch.bool,
+        )
     if 'true_mzs' in items[0]:
         target_mzs: list[torch.Tensor] = []
         target_intensities: list[torch.Tensor] = []

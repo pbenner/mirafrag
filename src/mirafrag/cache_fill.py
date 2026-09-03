@@ -154,7 +154,9 @@ def _fill_feature_cache_worker_pool(
     The parent keeps a bounded window of tasks in flight. Whenever a worker
     returns a result, a new task is submitted immediately, so fast workers do not
     wait behind slow rows. If the in-flight window stops producing results, the
-    run aborts with row diagnostics instead of restarting the same slow work.
+    parent reports long-pending rows periodically instead of aborting by default.
+    Timeouts remain available through MIRAFRAG_CACHE_TASK_TIMEOUT_SECONDS and
+    MIRAFRAG_CACHE_POOL_STALL_SECONDS for debugging stuck workers.
     """
     total = len(dataset)
     context = mp.get_context(_multiprocessing_start_method())
@@ -163,12 +165,13 @@ def _fill_feature_cache_worker_pool(
     print(
         f'{desc}: cache worker pool start_method={context.get_start_method()} '
         f'workers={num_workers} chunk_size={chunk_size} '
-        f'task_timeout={task_timeout_seconds:g}s '
-        f'stall_timeout={stall_seconds:g}s',
+        f'task_timeout={_format_timeout_seconds(task_timeout_seconds)} '
+        f'stall_timeout={_format_timeout_seconds(stall_seconds)}',
         file=sys.stderr,
         flush=True,
     )
     poll_seconds = _cache_pool_poll_seconds()
+    status_seconds = _cache_pool_status_seconds()
     completed: set[int] = set()
     failures: list[tuple[int, str]] = []
     worker_fn = (
@@ -185,11 +188,10 @@ def _fill_feature_cache_worker_pool(
         leave=False,
         disable=not show_progress,
     )
-    pool = context.Pool(
-        processes=num_workers,
-        initializer=_init_cache_worker,
-        initargs=(dataset,),
-        maxtasksperchild=_cache_pool_max_tasks_per_child(),
+    pool = _create_cache_pool(
+        context=context,
+        dataset=dataset,
+        num_workers=num_workers,
     )
     pool_closed = False
     pending: dict[object, tuple[tuple[int, ...], float]] = {}
@@ -203,6 +205,7 @@ def _fill_feature_cache_worker_pool(
             max_pending=max_pending,
         )
         last_result_time = time.monotonic()
+        last_status_time = last_result_time
         while pending:
             now = time.monotonic()
             made_progress = False
@@ -239,21 +242,122 @@ def _fill_feature_cache_worker_pool(
                     )
                     continue
 
-                if now - start_time > task_timeout_seconds:
+                if (
+                    task_timeout_seconds is not None
+                    and now - start_time > task_timeout_seconds
+                ):
                     description = _describe_cache_indices(dataset, chunk)
-                    raise TimeoutError(
-                        f'{desc}: cache worker task exceeded '
-                        f'{task_timeout_seconds:g}s for {description}.'
+                    if not allow_failures:
+                        raise TimeoutError(
+                            f'{desc}: cache worker task exceeded '
+                            f'{task_timeout_seconds:g}s for {description}.'
+                        )
+                    message = (
+                        'cache worker task exceeded '
+                        f'{task_timeout_seconds:g}s for {description}'
                     )
+                    print(
+                        f'{desc}: skipping timed-out cache task; {message}',
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _mark_cache_chunk_failed(
+                        chunk,
+                        message=message,
+                        failures=failures,
+                        completed=completed,
+                        progress=progress,
+                    )
+                    del pending[result]
+                    _requeue_pending_cache_chunks(
+                        pending=pending,
+                        remaining=remaining,
+                        completed=completed,
+                    )
+                    pending.clear()
+                    pool.terminate()
+                    pool.join()
+                    pool = _create_cache_pool(
+                        context=context,
+                        dataset=dataset,
+                        num_workers=num_workers,
+                    )
+                    made_progress = True
+                    _submit_cache_tasks(
+                        pool=pool,
+                        worker_fn=worker_fn,
+                        remaining=remaining,
+                        pending=pending,
+                        chunk_size=chunk_size,
+                        max_pending=max_pending,
+                    )
+                    restart_time = time.monotonic()
+                    last_result_time = restart_time
+                    last_status_time = restart_time
+                    break
 
             if made_progress:
                 continue
-            if time.monotonic() - last_result_time > stall_seconds:
+            if (
+                stall_seconds is not None
+                and time.monotonic() - last_result_time > stall_seconds
+            ):
                 pending_description = _describe_pending_cache_tasks(dataset, pending)
+                if allow_failures:
+                    print(
+                        f'{desc}: skipping stalled cache tasks; cache worker pool '
+                        f'produced no results for {stall_seconds:g}s. Pending '
+                        f'tasks: {pending_description}',
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _mark_pending_cache_chunks_failed(
+                        dataset=dataset,
+                        pending=pending,
+                        stall_seconds=stall_seconds,
+                        max_chunks=num_workers,
+                        failures=failures,
+                        completed=completed,
+                        progress=progress,
+                    )
+                    _requeue_pending_cache_chunks(
+                        pending=pending,
+                        remaining=remaining,
+                        completed=completed,
+                    )
+                    pending.clear()
+                    pool.terminate()
+                    pool.join()
+                    pool = _create_cache_pool(
+                        context=context,
+                        dataset=dataset,
+                        num_workers=num_workers,
+                    )
+                    _submit_cache_tasks(
+                        pool=pool,
+                        worker_fn=worker_fn,
+                        remaining=remaining,
+                        pending=pending,
+                        chunk_size=chunk_size,
+                        max_pending=max_pending,
+                    )
+                    restart_time = time.monotonic()
+                    last_result_time = restart_time
+                    last_status_time = restart_time
+                    continue
                 raise TimeoutError(
                     f'{desc}: cache worker pool produced no results for '
                     f'{stall_seconds:g}s. Pending tasks: {pending_description}'
                 )
+            if time.monotonic() - last_status_time > status_seconds:
+                pending_description = _describe_pending_cache_tasks(dataset, pending)
+                print(
+                    f'{desc}: cache worker pool waiting; pending tasks: '
+                    f'{pending_description}',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                last_status_time = time.monotonic()
             time.sleep(poll_seconds)
         pool.close()
         pool_closed = True
@@ -289,25 +393,103 @@ def _submit_cache_tasks(
         pending[result] = (tuple(chunk), time.monotonic())
 
 
-def _cache_pool_stall_seconds(*, default_seconds: float | None = None) -> float:
-    if default_seconds is None:
-        default_seconds = _cache_task_timeout_seconds()
-    return max(
-        0.1,
-        float(
-            os.environ.get(
-                'MIRAFRAG_CACHE_POOL_STALL_SECONDS',
-                f'{float(default_seconds):g}',
-            )
-        ),
+def _create_cache_pool(*, context, dataset: BinnedSpectrumDataset, num_workers: int):
+    return context.Pool(
+        processes=num_workers,
+        initializer=_init_cache_worker,
+        initargs=(dataset,),
+        maxtasksperchild=_cache_pool_max_tasks_per_child(),
     )
 
 
-def _cache_task_timeout_seconds() -> float:
+def _mark_cache_chunk_failed(
+    chunk: tuple[int, ...],
+    *,
+    message: str,
+    failures: list[tuple[int, str]],
+    completed: set[int],
+    progress,
+) -> None:
+    for raw_idx in chunk:
+        idx = int(raw_idx)
+        if idx in completed:
+            continue
+        completed.add(idx)
+        failures.append((idx, message))
+        progress.update(1)
+
+
+def _mark_pending_cache_chunks_failed(
+    *,
+    dataset: BinnedSpectrumDataset,
+    pending: dict[object, tuple[tuple[int, ...], float]],
+    stall_seconds: float,
+    max_chunks: int,
+    failures: list[tuple[int, str]],
+    completed: set[int],
+    progress,
+) -> None:
+    oldest_chunks = sorted(pending.values(), key=lambda item: item[1])[
+        : max(1, int(max_chunks))
+    ]
+    for chunk, _start_time in oldest_chunks:
+        description = _describe_cache_indices(dataset, chunk)
+        _mark_cache_chunk_failed(
+            chunk,
+            message=(
+                'cache worker pool produced no results for '
+                f'{stall_seconds:g}s for {description}'
+            ),
+            failures=failures,
+            completed=completed,
+            progress=progress,
+        )
+
+
+def _requeue_pending_cache_chunks(
+    *,
+    pending: dict[object, tuple[tuple[int, ...], float]],
+    remaining: deque[int],
+    completed: set[int],
+) -> None:
+    chunks = [chunk for chunk, _start_time in pending.values()]
+    for chunk in reversed(chunks):
+        for raw_idx in reversed(chunk):
+            idx = int(raw_idx)
+            if idx not in completed:
+                remaining.appendleft(idx)
+
+
+def _cache_pool_stall_seconds(*, default_seconds: float | None = None) -> float | None:
+    if 'MIRAFRAG_CACHE_POOL_STALL_SECONDS' in os.environ:
+        return _optional_cache_timeout_seconds(
+            'MIRAFRAG_CACHE_POOL_STALL_SECONDS', default='0'
+        )
+    return default_seconds
+
+
+def _cache_task_timeout_seconds() -> float | None:
+    return _optional_cache_timeout_seconds(
+        'MIRAFRAG_CACHE_TASK_TIMEOUT_SECONDS', default='0'
+    )
+
+
+def _cache_pool_status_seconds() -> float:
     return max(
         1.0,
-        float(os.environ.get('MIRAFRAG_CACHE_TASK_TIMEOUT_SECONDS', '3600')),
+        float(os.environ.get('MIRAFRAG_CACHE_POOL_STATUS_SECONDS', '300')),
     )
+
+
+def _optional_cache_timeout_seconds(name: str, *, default: str) -> float | None:
+    seconds = float(os.environ.get(name, default))
+    if seconds <= 0:
+        return None
+    return max(0.1, seconds)
+
+
+def _format_timeout_seconds(seconds: float | None) -> str:
+    return 'disabled' if seconds is None else f'{seconds:g}s'
 
 
 def _cache_pool_poll_seconds() -> float:

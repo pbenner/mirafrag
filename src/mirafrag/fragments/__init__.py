@@ -26,7 +26,13 @@ from mirafrag.fragments.config import (
     fragment_support_profile_from_model_config,
     high_ce_fragment_config_from_model_config,
 )
-from mirafrag.fragments.constants import FRAGMENT_EDGE_FEATURE_DIM, FRAGMENT_FEATURE_DIM
+from mirafrag.fragments.constants import (
+    BOND_BREAK_FEATURE_DIM,
+    FRAGMENT_EDGE_FEATURE_DIM,
+    FRAGMENT_FEATURE_DIM,
+    FRAGMENT_FORMULA_DIM,
+    FRAGMENT_FORMULA_ELEMENTS,
+)
 
 __all__ = [
     'AMMONIUM_ADDUCT_MASS',
@@ -45,6 +51,9 @@ __all__ = [
     'parse_fragment_adduct',
     'smiles_to_fragment_candidates',
     'collate_fragment_candidates',
+    'BOND_BREAK_FEATURE_DIM',
     'FRAGMENT_EDGE_FEATURE_DIM',
     'FRAGMENT_FEATURE_DIM',
+    'FRAGMENT_FORMULA_DIM',
+    'FRAGMENT_FORMULA_ELEMENTS',
 ]

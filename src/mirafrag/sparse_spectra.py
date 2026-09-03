@@ -98,6 +98,69 @@ def sparse_cosine(
     return float(dot / denom)
 
 
+def sparse_jensen_shannon_similarity(
+    left: SparseSpectrum,
+    right: SparseSpectrum,
+    *,
+    eps: float = 1e-12,
+) -> float:
+    """
+    Compute Jensen-Shannon similarity for two sparse binned spectra.
+
+    The score follows the MassSpecGym/FraGNNet convention: both spectra are
+    treated as L1-normalized distributions, JSD is computed with natural logs,
+    and similarity is ``1 - JSD / log(2)``. Non-overlapping non-empty spectra
+    therefore score 0, identical spectra score 1.
+    """
+    left_norm = normalize_sparse_spectrum(left)
+    right_norm = normalize_sparse_spectrum(right)
+    if left_norm.values.size == 0 and right_norm.values.size == 0:
+        return 1.0
+    if left_norm.values.size == 0 or right_norm.values.size == 0:
+        return 0.0
+
+    left_bins = np.asarray(left_norm.bins, dtype=np.int64)
+    right_bins = np.asarray(right_norm.bins, dtype=np.int64)
+    left_values = np.asarray(left_norm.values, dtype=np.float64)
+    right_values = np.asarray(right_norm.values, dtype=np.float64)
+    union = np.union1d(left_bins, right_bins)
+    left_dense = np.zeros(union.shape[0], dtype=np.float64)
+    right_dense = np.zeros(union.shape[0], dtype=np.float64)
+    left_pos = np.searchsorted(union, left_bins)
+    right_pos = np.searchsorted(union, right_bins)
+    left_dense[left_pos] = left_values
+    right_dense[right_pos] = right_values
+    mixture = 0.5 * (left_dense + right_dense)
+
+    left_mask = left_dense > 0.0
+    right_mask = right_dense > 0.0
+    kl_left = float(
+        np.sum(
+            left_dense[left_mask]
+            * (
+                np.log(np.maximum(left_dense[left_mask], eps))
+                - np.log(np.maximum(mixture[left_mask], eps))
+            )
+        )
+    )
+    kl_right = float(
+        np.sum(
+            right_dense[right_mask]
+            * (
+                np.log(np.maximum(right_dense[right_mask], eps))
+                - np.log(np.maximum(mixture[right_mask], eps))
+            )
+        )
+    )
+    jsd = 0.5 * (kl_left + kl_right)
+    score = 1.0 - jsd / math.log(2.0)
+    if abs(score) < 1e-12:
+        score = 0.0
+    if abs(score - 1.0) < 1e-12:
+        score = 1.0
+    return float(max(0.0, min(1.0, score)))
+
+
 def _sparse_dot(
     left_bins: np.ndarray,
     left_values: np.ndarray,

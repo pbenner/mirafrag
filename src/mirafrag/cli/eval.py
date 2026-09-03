@@ -25,6 +25,8 @@ from mirafrag.data import (
     filter_massspecgym_simulation,
     filter_supported_elements,
     find_column,
+    normalize_collision_energy_dataframe,
+    parse_physical_bond_feature_columns,
     read_table,
     select_split,
 )
@@ -52,6 +54,16 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument('--device', default='auto')
+    parser.add_argument(
+        '--graph-relaxation',
+        choices=['rdkit', 'aimnet', 'none'],
+        default=None,
+        help='Override checkpoint graph relaxation for molecular graph construction.',
+    )
+    parser.add_argument('--aimnet-relax-model', default=None)
+    parser.add_argument('--aimnet-relax-steps', type=int, default=None)
+    parser.add_argument('--aimnet-relax-fmax', type=float, default=None)
+    parser.add_argument('--aimnet-relax-device', default=None)
     parser.add_argument('--split', default='test')
     parser.add_argument('--split-col', default='auto')
     parser.add_argument('--split-value', default=None)
@@ -69,6 +81,16 @@ def parse_args() -> argparse.Namespace:
         '--disk-cache-dir',
         default=None,
         help='Optional disk cache for precomputed encoder graphs and fragments.',
+    )
+    parser.add_argument(
+        '--physical-bond-features-path',
+        default=None,
+        help='CSV sidecar from cid-physical-features for checkpoints trained with physical bond features.',
+    )
+    parser.add_argument(
+        '--physical-bond-feature-columns',
+        default=None,
+        help='Override physical bond sidecar columns; defaults to checkpoint columns.',
     )
     parser.add_argument('--min-intensity', type=float, default=0.001)
     parser.add_argument('--top-k', type=int, default=100)
@@ -165,7 +187,22 @@ def main() -> None:
     if df.empty:
         raise SystemExit('No rows selected for evaluation.')
 
-    graph_config = infer_graph_config(model.encoder)
+    saved_graph_config = payload.get('graph_config') or {}
+    graph_config = infer_graph_config(
+        model.encoder,
+        relaxation=args.graph_relaxation
+        or saved_graph_config.get('relaxation', 'rdkit'),
+        aimnet_relax_model=args.aimnet_relax_model
+        or saved_graph_config.get('aimnet_relax_model', 'aimnet2'),
+        aimnet_relax_steps=args.aimnet_relax_steps
+        if args.aimnet_relax_steps is not None
+        else int(saved_graph_config.get('aimnet_relax_steps', 50)),
+        aimnet_relax_fmax=args.aimnet_relax_fmax
+        if args.aimnet_relax_fmax is not None
+        else float(saved_graph_config.get('aimnet_relax_fmax', 0.05)),
+        aimnet_relax_device=args.aimnet_relax_device
+        or saved_graph_config.get('aimnet_relax_device', 'auto'),
+    )
     df, element_stats = filter_supported_elements(
         df,
         supported_atomic_numbers=graph_config.atomic_numbers,
@@ -177,6 +214,30 @@ def main() -> None:
         print(f'Evaluation element filter: {element_stats}')
     if df.empty:
         raise SystemExit('No rows left after encoder element filtering.')
+    metadata_df = df.reset_index(drop=True).copy()
+    metadata_ce_mode = str(
+        getattr(model.metadata_config, 'collision_energy_mode', 'raw') or 'raw'
+    ).lower()
+    if metadata_ce_mode == 'normalized':
+        df = normalize_collision_energy_dataframe(
+            df,
+            metadata_config=model.metadata_config,
+        )
+        print(
+            'Collision-energy preprocessing: normalized from checkpoint metadata stats'
+        )
+    physical_bond_features = bool(
+        getattr(model.config, 'physical_bond_features', False)
+    )
+    physical_bond_feature_columns = (
+        parse_physical_bond_feature_columns(args.physical_bond_feature_columns)
+        if args.physical_bond_feature_columns is not None
+        else tuple(getattr(model.config, 'physical_bond_feature_columns', ()) or ())
+    )
+    if physical_bond_features and not args.physical_bond_features_path:
+        raise SystemExit(
+            'Checkpoint uses physical bond features; pass --physical-bond-features-path.'
+        )
     ds = BinnedSpectrumDataset(
         df,
         graph_config=graph_config,
@@ -190,6 +251,10 @@ def main() -> None:
         fragment_support_profile=fragment_support_profile_from_model_config(
             model.config
         ),
+        physical_bond_features_path=args.physical_bond_features_path
+        if physical_bond_features
+        else None,
+        physical_bond_feature_columns=physical_bond_feature_columns,
     )
     if args.disk_cache_dir is not None:
         prefill_feature_cache(
@@ -236,7 +301,7 @@ def main() -> None:
         f'{summary["oos_calibration_abs_error_mean"]:.5f}'
     )
     if args.stratify_metadata or args.stratify_output:
-        predictions = _attach_metadata(predictions, df)
+        predictions = _attach_metadata(predictions, metadata_df)
         stratified = _stratified_summary(
             predictions,
             ce_bins=args.ce_bins,

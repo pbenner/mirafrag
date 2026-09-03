@@ -17,6 +17,7 @@ from mirafrag.data import (
     collate_spectrum_batch,
     dataloader_performance_kwargs,
     filter_supported_elements,
+    normalize_collision_energy_dataframe,
     read_table,
 )
 from mirafrag.evaluation import evaluate_model, probability_mode_from_checkpoint_payload
@@ -99,6 +100,17 @@ def main() -> None:
         print(f'Prediction element filter: {element_stats}')
     if df.empty:
         raise SystemExit('No rows left after encoder element filtering.')
+    metadata_ce_mode = str(
+        getattr(model.metadata_config, 'collision_energy_mode', 'raw') or 'raw'
+    ).lower()
+    if metadata_ce_mode == 'normalized':
+        df = normalize_collision_energy_dataframe(
+            df,
+            metadata_config=model.metadata_config,
+        )
+        print(
+            'Collision-energy preprocessing: normalized from checkpoint metadata stats'
+        )
     ds = BinnedSpectrumDataset(
         df,
         graph_config=graph_config,

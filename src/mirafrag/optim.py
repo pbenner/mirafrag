@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import re
+from collections import defaultdict
 from typing import Any
 
 import torch
@@ -19,6 +21,7 @@ def _optimizer_param_groups(
     encoder_lr: float | None = None,
     head_weight_decay: float = 0.0,
     encoder_weight_decay: float | None = None,
+    encoder_layer_lr_decay: float = 1.0,
 ) -> list[dict[str, Any]]:
     """
     Build AdamW parameter groups for head and trainable encoder parameters.
@@ -35,6 +38,8 @@ def _optimizer_param_groups(
         encoder_lr = float(lr)
     if encoder_weight_decay is None:
         encoder_weight_decay = 0.0 if weight_decay is None else float(weight_decay)
+    if encoder_layer_lr_decay <= 0.0 or encoder_layer_lr_decay > 1.0:
+        raise ValueError('encoder_layer_lr_decay must be in the interval (0, 1].')
 
     modules = dict(model.named_modules())
     encoder_named_params = [
@@ -62,17 +67,102 @@ def _optimizer_param_groups(
         lr=float(head_lr),
         weight_decay=float(head_weight_decay),
     )
-    _append_decay_split_groups(
+    _append_encoder_groups(
         groups,
-        name='encoder',
         named_params=encoder_named_params,
         modules=modules,
         lr=float(encoder_lr),
         weight_decay=float(encoder_weight_decay),
+        layer_lr_decay=float(encoder_layer_lr_decay),
     )
     if not groups:
         raise ValueError('No trainable parameters found.')
     return groups
+
+
+def _append_encoder_groups(
+    groups: list[dict[str, Any]],
+    *,
+    named_params: list[tuple[str, torch.nn.Parameter]],
+    modules: dict[str, nn.Module],
+    lr: float,
+    weight_decay: float,
+    layer_lr_decay: float,
+) -> None:
+    """
+    Append encoder optimizer groups, optionally using AIMNet MLP layerwise LR decay.
+
+    With layer_lr_decay < 1, the last AIMNet message block receives ``lr`` and
+    earlier blocks receive progressively smaller rates. Non-MLP encoder
+    parameters are treated as the earliest encoder group. Non-AIMNet encoders or
+    the default decay of 1 preserve the historical single encoder group.
+    """
+    if not named_params:
+        return
+    if layer_lr_decay == 1.0:
+        _append_decay_split_groups(
+            groups,
+            name='encoder',
+            named_params=named_params,
+            modules=modules,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        return
+
+    mlp_indices = sorted(
+        {
+            layer_index
+            for name, _param in named_params
+            if (layer_index := _aimnet_mlp_index(name)) is not None
+        }
+    )
+    if not mlp_indices:
+        _append_decay_split_groups(
+            groups,
+            name='encoder',
+            named_params=named_params,
+            modules=modules,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        return
+
+    max_mlp_index = max(mlp_indices)
+    buckets: dict[tuple[str, int], list[tuple[str, torch.nn.Parameter]]] = defaultdict(
+        list
+    )
+    for name, param in named_params:
+        mlp_index = _aimnet_mlp_index(name)
+        if mlp_index is None:
+            bucket_name = 'encoder_base'
+            exponent = max_mlp_index + 1
+        else:
+            bucket_name = f'encoder_mlp{mlp_index}'
+            exponent = max_mlp_index - mlp_index
+        buckets[(bucket_name, exponent)].append((name, param))
+
+    for (bucket_name, exponent), bucket_params in sorted(
+        buckets.items(), key=lambda item: (-item[0][1], item[0][0])
+    ):
+        _append_decay_split_groups(
+            groups,
+            name=bucket_name,
+            named_params=bucket_params,
+            modules=modules,
+            lr=lr * (layer_lr_decay**exponent),
+            weight_decay=weight_decay,
+        )
+
+
+def _aimnet_mlp_index(param_name: str) -> int | None:
+    """
+    Return the AIMNet ``model.mlps.<idx>`` block index for an encoder parameter.
+    """
+    match = re.search(r'(?:^|\.)model\.mlps\.(\d+)\.', param_name)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _append_decay_split_groups(

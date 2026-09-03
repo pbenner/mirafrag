@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, default_collate
 from tqdm.auto import tqdm
@@ -13,13 +14,15 @@ from mirafrag.checkpoint import save_checkpoint
 from mirafrag.data import move_batch_to_device
 from mirafrag.losses import (
     LOSS_REGISTRY,
+    _fragment_only_log_probs,
+    exclude_precursor_prediction_candidates,
     sparse_binned_cosine_similarity,
     sparse_decoupled_oos_probability,
     sparse_fragment_only_binned_cosine_similarity,
     sparse_oos_probability,
     spectrum_loss,
 )
-from mirafrag.model import MiraFragModel
+from mirafrag.model import MiraFragModel, set_encoder_finetune_strategy
 from mirafrag.optim import (
     _build_scheduler,
     _current_lr,
@@ -47,6 +50,13 @@ def run_epoch(
     coverage_weight: float = 0.1,
     target_power: float = 1.0,
     entropy_weight: float = 0.0,
+    head_delta_regularization: float = 0.0,
+    head_delta_reference: dict[str, torch.Tensor] | None = None,
+    encoder_delta_regularization: float = 0.0,
+    encoder_delta_reference: dict[str, torch.Tensor] | None = None,
+    distill_spectra: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    distill_loss_weight: float = 0.0,
+    distill_min_overlap_mass: float = 0.05,
 ) -> dict[str, float]:
     """
     Run one training or evaluation epoch.
@@ -63,6 +73,8 @@ def run_epoch(
     loss_sum = 0.0
     cosine_sum = 0.0
     oos_sum = 0.0
+    distill_loss_sum = 0.0
+    distill_active = distill_spectra is not None and float(distill_loss_weight) > 0.0
     objective_name = _objective_display_name(loss_name)
     progress = tqdm(
         loader,
@@ -82,6 +94,7 @@ def run_epoch(
         with grad_context:
             pred = model(batch)
             batch_size = int(pred['batch_size'])
+            sample_weight = batch.get('sample_weight') if training else None
             loss = spectrum_loss(
                 pred,
                 batch,
@@ -93,7 +106,45 @@ def run_epoch(
                 coverage_weight=coverage_weight,
                 target_power=target_power,
                 entropy_weight=entropy_weight,
+                reduction='none' if sample_weight is not None else 'mean',
             )
+            if sample_weight is not None:
+                weights = sample_weight.to(device=loss.device, dtype=loss.dtype)
+                if loss.ndim != 1 or weights.shape != loss.shape:
+                    raise ValueError(
+                        'sample_weight requires one unreduced loss per spectrum.'
+                    )
+                loss = (loss * weights).mean()
+            distill_loss = loss.new_tensor(float('nan'))
+            if training and distill_active:
+                distill_pred = exclude_precursor_prediction_candidates(pred, batch)
+                distill_loss = _teacher_projection_kl(
+                    distill_pred,
+                    batch,
+                    distill_spectra,
+                    min_overlap_mass=distill_min_overlap_mass,
+                )
+                loss = loss + float(distill_loss_weight) * distill_loss
+            if training and head_delta_regularization > 0.0:
+                if head_delta_reference is None:
+                    raise ValueError(
+                        'head_delta_reference is required when '
+                        'head_delta_regularization is positive.'
+                    )
+                loss = loss + float(head_delta_regularization) * _delta_penalty(
+                    model,
+                    head_delta_reference,
+                )
+            if training and encoder_delta_regularization > 0.0:
+                if encoder_delta_reference is None:
+                    raise ValueError(
+                        'encoder_delta_reference is required when '
+                        'encoder_delta_regularization is positive.'
+                    )
+                loss = loss + float(encoder_delta_regularization) * _delta_penalty(
+                    model,
+                    encoder_delta_reference,
+                )
         if training:
             loss.backward()
             optimizer.step()
@@ -101,31 +152,50 @@ def run_epoch(
                 scheduler.step()
         with torch.no_grad():
             loss_value = float(loss.detach().cpu())
-            if loss_name == 'decoupled_kl':
-                cosine = sparse_fragment_only_binned_cosine_similarity(pred, batch)
+            scored_pred = exclude_precursor_prediction_candidates(pred, batch)
+            if loss_name in {
+                'decoupled_kl',
+                'fiora_decoupled_kl',
+                'responsibility_decoupled_kl',
+                'fragment_cosine',
+                'fragment_sqrt_cosine',
+            }:
+                cosine = sparse_fragment_only_binned_cosine_similarity(
+                    scored_pred, batch
+                )
                 oos_probability = sparse_decoupled_oos_probability(pred)
             else:
-                cosine = sparse_binned_cosine_similarity(pred, batch)
+                cosine = sparse_binned_cosine_similarity(scored_pred, batch)
                 oos_probability = sparse_oos_probability(pred)
             cosine_value = float(cosine.mean().cpu())
             oos_value = float(oos_probability.mean().cpu())
+            distill_value = (
+                float(distill_loss.detach().cpu())
+                if training and distill_active
+                else float('nan')
+            )
             total_examples += batch_size
             loss_sum += loss_value * batch_size
             cosine_sum += cosine_value * batch_size
             oos_sum += oos_value * batch_size
+            if training and distill_active:
+                distill_loss_sum += distill_value * batch_size
             if show_progress:
-                progress.set_postfix(
-                    {
-                        f'{objective_name}_avg': (
-                            f'{loss_sum / max(total_examples, 1):.4f}'
-                        ),
-                        'cosine_avg': (f'{cosine_sum / max(total_examples, 1):.4f}'),
-                        'oos_avg': f'{oos_sum / max(total_examples, 1):.4f}',
-                        'lr': f'{_current_lr(optimizer):.2e}'
-                        if optimizer is not None
-                        else 'n/a',
-                    }
-                )
+                postfix = {
+                    f'{objective_name}_avg': (
+                        f'{loss_sum / max(total_examples, 1):.4f}'
+                    ),
+                    'cosine_avg': (f'{cosine_sum / max(total_examples, 1):.4f}'),
+                    'oos_avg': f'{oos_sum / max(total_examples, 1):.4f}',
+                    'lr': f'{_current_lr(optimizer):.2e}'
+                    if optimizer is not None
+                    else 'n/a',
+                }
+                if training and distill_active:
+                    postfix['distill_avg'] = (
+                        f'{distill_loss_sum / max(total_examples, 1):.4f}'
+                    )
+                progress.set_postfix(postfix)
 
     if processed_batches != total_batches:
         print(
@@ -133,10 +203,175 @@ def run_epoch(
             f'{total_batches} batches.'
         )
 
-    return {
+    stats = {
         'loss': float(loss_sum / max(total_examples, 1)),
         'cosine': float(cosine_sum / max(total_examples, 1)),
         'oos_probability': float(oos_sum / max(total_examples, 1)),
+    }
+    if training and distill_active:
+        stats['distill_loss'] = float(distill_loss_sum / max(total_examples, 1))
+    return stats
+
+
+def _teacher_projection_kl(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    teacher_spectra: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    *,
+    min_overlap_mass: float = 0.05,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Distill teacher spectra onto the model's currently supported fragment bins.
+
+    Teacher peaks outside the generated candidate support are ignored and the
+    overlapping teacher mass is renormalized. This trains candidate scoring while
+    avoiding a support-coverage penalty that the scorer cannot fix.
+    """
+    fragment_log_probs = _fragment_only_log_probs(pred)
+    pred_bins = pred['bins'].long()
+    pred_batch = pred['batch'].long()
+    identifiers = batch.get('identifier') or []
+    losses: list[torch.Tensor] = []
+    for batch_idx, identifier in enumerate(identifiers):
+        teacher = teacher_spectra.get(str(identifier))
+        if teacher is None:
+            continue
+        mask = pred_batch == batch_idx
+        if not bool(mask.any()):
+            continue
+        local_bins = pred_bins[mask]
+        local_log_probs = fragment_log_probs[mask]
+        unique_bins, inverse = torch.unique(
+            local_bins, sorted=True, return_inverse=True
+        )
+        bin_log_probs = local_log_probs.new_full(
+            (int(unique_bins.numel()),), -float('inf')
+        )
+        for local_idx in range(int(unique_bins.numel())):
+            bin_log_probs[local_idx] = torch.logsumexp(
+                local_log_probs[inverse == local_idx], dim=0
+            )
+        teacher_bins = teacher[0].to(device=pred_bins.device).long()
+        teacher_values = teacher[1].to(
+            device=local_log_probs.device, dtype=local_log_probs.dtype
+        )
+        if teacher_bins.numel() == 0:
+            continue
+        positions = torch.searchsorted(unique_bins, teacher_bins)
+        in_bounds = positions < unique_bins.numel()
+        valid = torch.zeros_like(in_bounds, dtype=torch.bool)
+        if bool(in_bounds.any()):
+            valid[in_bounds] = (
+                unique_bins[positions[in_bounds]] == teacher_bins[in_bounds]
+            )
+        if not bool(valid.any()):
+            continue
+        positions = positions[valid]
+        target = teacher_values[valid]
+        overlap_mass = target.sum()
+        if float(overlap_mass.detach().cpu()) < float(min_overlap_mass):
+            continue
+        target = target / overlap_mass.clamp_min(eps)
+        losses.append(F.kl_div(bin_log_probs[positions], target, reduction='sum'))
+    if not losses:
+        return pred['logits'].sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def run_retrieval_epoch(
+    model: MiraFragModel,
+    loader: DataLoader,
+    *,
+    optimizer: torch.optim.Optimizer | None,
+    device: str | torch.device,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    scheduler_interval: str = 'step',
+    desc: str | None = None,
+    show_progress: bool = True,
+    loss_weight: float = 1.0,
+) -> dict[str, float]:
+    """Run one auxiliary retrieval-ranking epoch over expanded candidate rows."""
+    if scheduler_interval not in {'epoch', 'step'}:
+        raise ValueError('scheduler_interval must be one of: epoch, step.')
+    training = optimizer is not None
+    model.train(training)
+    total_groups = 0
+    loss_sum = 0.0
+    top1_sum = 0.0
+    progress = tqdm(
+        loader,
+        desc=desc,
+        total=len(loader),
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+    )
+    for raw_batch in progress:
+        if bool(raw_batch.pop('_retrieval_empty', False)):
+            continue
+        raw_batch.pop('_retrieval_errors', None)
+        batch = move_batch_to_device(raw_batch, device)
+        if '_retrieval_group' not in batch or '_retrieval_is_true' not in batch:
+            raise ValueError('retrieval batches require group and truth labels.')
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        grad_context = torch.enable_grad() if training else torch.no_grad()
+        with grad_context:
+            pred = model(batch)
+            scored_pred = exclude_precursor_prediction_candidates(pred, batch)
+            scores = sparse_fragment_only_binned_cosine_similarity(scored_pred, batch)
+            retrieval_logit = pred.get('retrieval_logit')
+            if retrieval_logit is not None:
+                scores = scores + retrieval_logit.to(
+                    device=scores.device,
+                    dtype=scores.dtype,
+                )
+            group = batch['_retrieval_group'].long()
+            is_true = batch['_retrieval_is_true'].bool()
+            losses: list[torch.Tensor] = []
+            correct = 0
+            for group_id in torch.unique(group, sorted=True):
+                mask = group == group_id
+                true_positions = torch.nonzero(is_true[mask], as_tuple=False).flatten()
+                if true_positions.numel() == 0:
+                    continue
+                local_scores = scores[mask]
+                label = true_positions[:1].to(
+                    device=local_scores.device, dtype=torch.long
+                )
+                losses.append(F.cross_entropy(local_scores.unsqueeze(0), label))
+                correct += int(torch.argmax(local_scores).item() == int(label.item()))
+            if losses:
+                loss = torch.stack(losses).mean()
+            else:
+                loss = scores.sum() * 0.0
+        weighted_loss = loss * float(loss_weight)
+        if training:
+            weighted_loss.backward()
+            optimizer.step()
+            if scheduler is not None and scheduler_interval == 'step':
+                scheduler.step()
+        groups = len(losses)
+        if groups:
+            total_groups += groups
+            loss_value = float(loss.detach().cpu())
+            loss_sum += loss_value * groups
+            top1_sum += float(correct)
+            if show_progress:
+                progress.set_postfix(
+                    {
+                        'retrieval_loss_avg': f'{loss_sum / max(total_groups, 1):.4f}',
+                        'retrieval_top1_avg': f'{top1_sum / max(total_groups, 1):.4f}',
+                        'lr': f'{_current_lr(optimizer):.2e}'
+                        if optimizer is not None
+                        else 'n/a',
+                    }
+                )
+    return {
+        'loss': float(loss_sum / max(total_groups, 1)),
+        'top1': float(top1_sum / max(total_groups, 1)),
+        'groups': float(total_groups),
     }
 
 
@@ -145,6 +380,11 @@ def train_model(
     train_loader: DataLoader,
     val_loader: DataLoader | None,
     *,
+    retrieval_loader: DataLoader | None = None,
+    retrieval_loss_weight: float = 0.0,
+    distill_spectra: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    distill_loss_weight: float = 0.0,
+    distill_min_overlap_mass: float = 0.05,
     epochs: int,
     lr: float,
     weight_decay: float,
@@ -153,9 +393,11 @@ def train_model(
     encoder_lr: float | None = None,
     head_weight_decay: float = 0.0,
     encoder_weight_decay: float | None = None,
+    encoder_layer_lr_decay: float = 1.0,
     output: str | Path,
     loss_name: str = 'cosine',
     train_config: dict[str, Any] | None = None,
+    graph_config: Any | None = None,
     show_progress: bool = True,
     scheduler_name: str = 'exponential',
     scheduler_interval: str = 'epoch',
@@ -171,6 +413,8 @@ def train_model(
     coverage_weight: float = 0.1,
     target_power: float = 1.0,
     entropy_weight: float = 0.0,
+    head_delta_regularization: float = 0.0,
+    encoder_delta_regularization: float = 0.0,
     checkpoint_metric: str = 'val_loss',
     verbose_epoch_config: bool = False,
     swa: bool = False,
@@ -195,6 +439,28 @@ def train_model(
         )
     model.to(device)
     _materialize_lazy_modules(model, train_loader, device=device)
+    set_encoder_finetune_strategy(
+        model,
+        getattr(model.config, 'encoder_finetune_strategy', 'head'),
+    )
+    if head_delta_regularization < 0.0:
+        raise ValueError('head_delta_regularization must be non-negative.')
+    if encoder_delta_regularization < 0.0:
+        raise ValueError('encoder_delta_regularization must be non-negative.')
+    if encoder_layer_lr_decay <= 0.0 or encoder_layer_lr_decay > 1.0:
+        raise ValueError('encoder_layer_lr_decay must be in the interval (0, 1].')
+    if distill_loss_weight < 0.0:
+        raise ValueError('distill_loss_weight must be non-negative.')
+    if distill_min_overlap_mass < 0.0:
+        raise ValueError('distill_min_overlap_mass must be non-negative.')
+    if distill_loss_weight > 0.0 and not distill_spectra:
+        raise ValueError('distill_spectra is required when distill_loss_weight > 0.')
+    head_delta_reference = (
+        _head_delta_reference(model) if head_delta_regularization > 0.0 else None
+    )
+    encoder_delta_reference = (
+        _encoder_delta_reference(model) if encoder_delta_regularization > 0.0 else None
+    )
     resolved_head_lr = float(lr if head_lr is None else head_lr)
     resolved_encoder_lr = float(lr if encoder_lr is None else encoder_lr)
     resolved_encoder_weight_decay = float(
@@ -209,6 +475,7 @@ def train_model(
             encoder_lr=resolved_encoder_lr,
             head_weight_decay=head_weight_decay,
             encoder_weight_decay=resolved_encoder_weight_decay,
+            encoder_layer_lr_decay=encoder_layer_lr_decay,
         ),
         lr=lr,
         weight_decay=0.0,
@@ -258,8 +525,14 @@ def train_model(
     train_config['head_lr'] = resolved_head_lr
     train_config['encoder_lr'] = resolved_encoder_lr
     train_config['head_weight_decay'] = float(head_weight_decay)
+    train_config['head_delta_regularization'] = float(head_delta_regularization)
+    train_config['encoder_delta_regularization'] = float(encoder_delta_regularization)
     train_config['encoder_weight_decay'] = resolved_encoder_weight_decay
+    train_config['encoder_layer_lr_decay'] = float(encoder_layer_lr_decay)
     train_config['checkpoint_metric'] = checkpoint_metric
+    train_config['retrieval_loss_weight'] = float(retrieval_loss_weight)
+    train_config['distill_loss_weight'] = float(distill_loss_weight)
+    train_config['distill_min_overlap_mass'] = float(distill_min_overlap_mass)
     train_config['prediction_probability_mode'] = _prediction_probability_mode(
         loss_name
     )
@@ -273,6 +546,9 @@ def train_model(
         'train_loss': [],
         'train_cosine': [],
         'train_oos_probability': [],
+        'train_retrieval_loss': [],
+        'train_retrieval_top1': [],
+        'train_distill_loss': [],
         'val_loss': [],
         'val_cosine': [],
         'val_oos_probability': [],
@@ -325,6 +601,7 @@ def train_model(
                 output,
                 model,
                 train_config=_checkpoint_train_config(train_config),
+                graph_config=graph_config,
             )
             print(
                 f'saved checkpoint to {output} '
@@ -374,7 +651,34 @@ def train_model(
             coverage_weight=coverage_weight,
             target_power=target_power,
             entropy_weight=entropy_weight,
+            head_delta_regularization=head_delta_regularization,
+            head_delta_reference=head_delta_reference,
+            encoder_delta_regularization=encoder_delta_regularization,
+            encoder_delta_reference=encoder_delta_reference,
+            distill_spectra=distill_spectra,
+            distill_loss_weight=distill_loss_weight,
+            distill_min_overlap_mass=distill_min_overlap_mass,
         )
+        retrieval_stats = None
+        if retrieval_loader is not None and retrieval_loss_weight > 0.0:
+            retrieval_stats = run_retrieval_epoch(
+                model,
+                retrieval_loader,
+                optimizer=optimizer,
+                scheduler=batch_scheduler,
+                scheduler_interval=scheduler_interval,
+                device=device,
+                desc=f'retrieval epoch {epoch}/{epochs}',
+                show_progress=show_progress,
+                loss_weight=float(retrieval_loss_weight),
+            )
+            train_stats = dict(train_stats)
+            train_stats['loss'] = train_stats['loss'] + float(
+                retrieval_loss_weight
+            ) * float(retrieval_stats['loss'])
+            train_stats['retrieval_loss'] = float(retrieval_stats['loss'])
+            train_stats['retrieval_top1'] = float(retrieval_stats['top1'])
+
         val_stats = (
             run_epoch(
                 model,
@@ -411,7 +715,18 @@ def train_model(
             f'val_{objective_name}={val_stats["loss"]:.5f} '
             f'val_cosine={val_stats["cosine"]:.5f} '
             f'val_oos={val_stats["oos_probability"]:.5f} '
-            f'lr={epoch_lr:.2e}'
+            + (
+                f'train_retrieval_loss={train_stats["retrieval_loss"]:.5f} '
+                f'train_retrieval_top1={train_stats["retrieval_top1"]:.5f} '
+                if 'retrieval_loss' in train_stats
+                else ''
+            )
+            + (
+                f'train_distill_loss={train_stats["distill_loss"]:.5f} '
+                if 'distill_loss' in train_stats
+                else ''
+            )
+            + f'lr={epoch_lr:.2e}'
         )
 
         checkpoint_stats = _checkpoint_stats(
@@ -433,6 +748,7 @@ def train_model(
                 output,
                 model,
                 train_config=_checkpoint_train_config(train_config),
+                graph_config=graph_config,
             )
             print(
                 f'saved checkpoint to {output} '
@@ -487,6 +803,7 @@ def train_model(
                                 swa_checkpoint=True,
                                 swa_n_averaged=n_averaged,
                             ),
+                            graph_config=graph_config,
                         )
                         print(
                             f'saved SWA checkpoint to {output} '
@@ -589,6 +906,71 @@ def _checkpoint_train_config(
     return config
 
 
+def _head_delta_reference(model: MiraFragModel) -> dict[str, torch.Tensor]:
+    """
+    Snapshot trainable spectrum-head weight matrices for checkpoint-centered regularization.
+    """
+    refs = _module_delta_reference(model.head, prefix='head')
+    if not refs:
+        raise ValueError(
+            'head_delta_regularization requires trainable spectrum-head weight matrices.'
+        )
+    return refs
+
+
+def _encoder_delta_reference(model: MiraFragModel) -> dict[str, torch.Tensor]:
+    """
+    Snapshot trainable encoder weight matrices for checkpoint-centered regularization.
+    """
+    refs = _module_delta_reference(model.encoder, prefix='encoder')
+    if not refs:
+        raise ValueError(
+            'encoder_delta_regularization requires trainable encoder weight matrices.'
+        )
+    return refs
+
+
+def _module_delta_reference(
+    module: torch.nn.Module,
+    *,
+    prefix: str,
+) -> dict[str, torch.Tensor]:
+    """
+    Snapshot trainable weight matrices from a module using full model parameter names.
+    """
+    refs: dict[str, torch.Tensor] = {}
+    for name, param in module.named_parameters(prefix=prefix):
+        if param.requires_grad and param.ndim >= 2:
+            refs[name] = param.detach().clone()
+    return refs
+
+
+def _delta_penalty(
+    model: MiraFragModel,
+    reference: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """
+    Return mean squared deviation from checkpoint weights.
+    """
+    named_params = dict(model.named_parameters())
+    total_penalty: torch.Tensor | None = None
+    total_elements = 0
+    for name, ref in reference.items():
+        param = named_params.get(name)
+        if param is None:
+            raise ValueError(f'Delta reference parameter {name!r} is missing.')
+        delta_sum = (
+            (param - ref.to(device=param.device, dtype=param.dtype)).square().sum()
+        )
+        total_penalty = (
+            delta_sum if total_penalty is None else total_penalty + delta_sum
+        )
+        total_elements += int(param.numel())
+    if total_penalty is None or total_elements == 0:
+        raise ValueError('Delta reference is empty.')
+    return total_penalty / float(total_elements)
+
+
 def _print_epoch_config(
     *,
     epoch: int,
@@ -656,7 +1038,18 @@ def _prediction_probability_mode(loss_name: str) -> str:
     """
     Return the prediction probability semantics implied by a training loss.
     """
-    return 'decoupled' if loss_name == 'decoupled_kl' else 'joint'
+    return (
+        'decoupled'
+        if loss_name
+        in {
+            'decoupled_kl',
+            'fiora_decoupled_kl',
+            'responsibility_decoupled_kl',
+            'fragment_cosine',
+            'fragment_sqrt_cosine',
+        }
+        else 'joint'
+    )
 
 
 def _append_history(
@@ -674,10 +1067,22 @@ def _append_history(
         history['train_loss'].append(float('nan'))
         history['train_cosine'].append(float('nan'))
         history['train_oos_probability'].append(float('nan'))
+        history.setdefault('train_retrieval_loss', []).append(float('nan'))
+        history.setdefault('train_retrieval_top1', []).append(float('nan'))
+        history.setdefault('train_distill_loss', []).append(float('nan'))
     else:
         history['train_loss'].append(float(train_stats['loss']))
         history['train_cosine'].append(float(train_stats['cosine']))
         history['train_oos_probability'].append(float(train_stats['oos_probability']))
+        history.setdefault('train_retrieval_loss', []).append(
+            float(train_stats.get('retrieval_loss', float('nan')))
+        )
+        history.setdefault('train_retrieval_top1', []).append(
+            float(train_stats.get('retrieval_top1', float('nan')))
+        )
+        history.setdefault('train_distill_loss', []).append(
+            float(train_stats.get('distill_loss', float('nan')))
+        )
     history['val_loss'].append(float(val_stats['loss']))
     history['val_cosine'].append(float(val_stats['cosine']))
     history['val_oos_probability'].append(float(val_stats['oos_probability']))

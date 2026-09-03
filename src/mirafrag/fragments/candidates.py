@@ -12,6 +12,7 @@ from mirafrag.adducts import (
     parse_adduct as parse_fragment_adduct,
 )
 from mirafrag.fragments.config import FragmentConfig
+from mirafrag.fragments.constants import FRAGMENT_FORMULA_ELEMENTS
 from mirafrag.fragments.engine import _MiraFragFragmentEngine
 from mirafrag.fragments.graph import _fragment_graph_edges
 from mirafrag.fragments.isotopes import (
@@ -21,6 +22,7 @@ from mirafrag.fragments.isotopes import (
 from mirafrag.fragments.mol import (
     _atom_implicit_hydrogens,
     _bond_break_stats,
+    _fragment_bond_breaks,
     _fragment_break_score,
 )
 
@@ -64,6 +66,9 @@ def smiles_to_fragment_candidates(
         candidates.values(),
         max_fragments=max(0, int(config.max_fragments)),
     )
+    if config.include_bond_breaks:
+        _attach_bond_break_provenance(formulas, bond_stats)
+    nodes, formula_node_index = _fragment_nodes_from_formulas(formulas)
     edge_index, edge_features = _fragment_graph_edges(
         formulas,
         max_edges=max(0, int(config.max_edges)),
@@ -71,14 +76,43 @@ def smiles_to_fragment_candidates(
         max_h_transfers=max(1, int(config.max_broken_bonds)),
         max_isotope_peaks=max(1, int(config.max_isotope_peaks)),
     )
+    node_edge_index, node_edge_features = _fragment_node_graph_edges(
+        nodes,
+        max_edges=max(0, int(config.max_edges)),
+        mz_max=float(mz_max),
+        max_h_transfers=max(1, int(config.max_broken_bonds)),
+        max_isotope_peaks=max(1, int(config.max_isotope_peaks)),
+    )
     peak_groups = _formula_peak_groups(peaks)
 
-    return {
+    out = {
         'atom_indices': [item['atom_indices'] for item in formulas],
         'mzs': [item['mz'] for item in peaks],
         'bins': [item['bin'] for item in peaks],
         'log_priors': [item['log_prior'] for item in peaks],
         'formula_index': peak_formula_index,
+        'formula_node_index': formula_node_index,
+        'formula_h_shift': [int(item['h_shift']) for item in formulas],
+        'node_atom_indices': [item['atom_indices'] for item in nodes],
+        'node_features': [
+            _node_features(
+                item,
+                mz_max=float(mz_max),
+                max_tree_depth=max(float(config.max_tree_depth), 1.0),
+                max_atoms=max(float(mol.GetNumAtoms()), 1.0),
+                max_bonds=max(float(len(bond_stats)), 1.0),
+            )
+            for item in nodes
+        ],
+        'node_formula_counts': [
+            _formula_count_features(
+                _fragment_element_counts(mol, item['atom_indices'], atom_hs, 0),
+                max_atoms=max(float(mol.GetNumAtoms()), 1.0),
+            )
+            for item in nodes
+        ],
+        'node_edge_index': node_edge_index,
+        'node_edge_features': node_edge_features,
         'edge_index': edge_index,
         'edge_features': edge_features,
         'features': [
@@ -94,7 +128,45 @@ def smiles_to_fragment_candidates(
             )
             for item in formulas
         ],
+        'formula_counts': [
+            _formula_count_features(
+                item.get('element_counts', {}),
+                max_atoms=max(float(mol.GetNumAtoms()), 1.0),
+            )
+            for item in formulas
+        ],
     }
+    if config.include_bond_breaks:
+        out['bond_atom_indices'] = [
+            item.get('bond_break_pairs', ()) for item in formulas
+        ]
+        out['bond_features'] = [
+            item.get('bond_break_features', ()) for item in formulas
+        ]
+    return out
+
+
+def _attach_bond_break_provenance(
+    formulas: list[dict[str, Any]],
+    bond_stats: list[dict[str, Any]],
+) -> None:
+    """Attach oriented boundary-bond provenance to retained formulas only."""
+    max_bond_score = max((float(item['score']) for item in bond_stats), default=1.0)
+    denominator = max(max_bond_score, 1.0)
+    for formula in formulas:
+        atom_set = set(int(idx) for idx in formula['atom_indices'])
+        bond_breaks = _fragment_bond_breaks(atom_set, bond_stats)
+        formula['bond_break_pairs'] = tuple(
+            (int(item['inside']), int(item['outside'])) for item in bond_breaks
+        )
+        formula['bond_break_features'] = tuple(
+            (
+                float(item['order_weight']) / 3.0,
+                float(item['score']) / denominator,
+                1.0 if bool(item.get('hetero', False)) else 0.0,
+            )
+            for item in bond_breaks
+        )
 
 
 def _prune_fragment_candidates(
@@ -136,6 +208,137 @@ def _prune_fragment_candidates(
             peaks.append(peak)
             peak_formula_index.append(formula_idx)
     return formulas, peaks, peak_formula_index
+
+
+def _fragment_nodes_from_formulas(
+    formulas: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """
+    Collapse retained formula/H candidates to structural fragment DAG nodes.
+
+    FraGNNet models a structural fragment node separately from its possible
+    formula/H variants. MiraFrag formula rows are already pruned, so the node set
+    is the unique retained atom masks and each formula row points back to one
+    node.
+    """
+    nodes: list[dict[str, Any]] = []
+    node_by_mask: dict[int, int] = {}
+    formula_node_index: list[int] = []
+    for formula in formulas:
+        mask = int(formula['mask'])
+        node_idx = node_by_mask.get(mask)
+        if node_idx is None:
+            node_idx = len(nodes)
+            node_by_mask[mask] = node_idx
+            nodes.append(_representative_fragment_node(formula))
+        else:
+            nodes[node_idx] = _merge_fragment_node(nodes[node_idx], formula)
+        formula_node_index.append(node_idx)
+    return nodes, formula_node_index
+
+
+def _representative_fragment_node(formula: dict[str, Any]) -> dict[str, Any]:
+    """Return formula metadata with H/isotope-specific fields neutralized."""
+    node = dict(formula)
+    node['h_shift'] = 0
+    node['isotope_rank'] = 0
+    node['isotope_prob'] = 1.0
+    node['log_prior'] = 0.0
+    return node
+
+
+def _merge_fragment_node(
+    node: dict[str, Any], formula: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep the strongest structural metadata across formula variants."""
+    out = dict(node)
+    out['score'] = min(float(out['score']), float(formula['score']))
+    out['max_broken'] = min(
+        int(out.get('max_broken', out['num_broken_bonds'])),
+        int(formula.get('max_broken', formula['num_broken_bonds'])),
+    )
+    out['num_broken_bonds'] = min(
+        int(out['num_broken_bonds']),
+        int(formula['num_broken_bonds']),
+    )
+    out['cut_count'] = min(int(out['cut_count']), int(formula['cut_count']))
+    parent_hashes = {str(value) for value in out.get('parent_hashes', [])}
+    parent_hashes.update(str(value) for value in formula.get('parent_hashes', []))
+    out['parent_hashes'] = sorted(parent_hashes)
+    return out
+
+
+def _fragment_node_graph_edges(
+    nodes: list[dict[str, Any]],
+    *,
+    max_edges: int,
+    mz_max: float,
+    max_h_transfers: int,
+    max_isotope_peaks: int,
+) -> tuple[list[tuple[int, int]], list[list[float]]]:
+    """Build directed parent/child edges over structural fragment nodes."""
+    if max_edges <= 0 or len(nodes) <= 1:
+        return [], []
+    indices_by_hash: dict[str, int] = {
+        str(item['fragment_hash']): idx for idx, item in enumerate(nodes)
+    }
+    edges: list[tuple[int, int]] = []
+    features: list[list[float]] = []
+    seen: set[tuple[int, int, str]] = set()
+
+    def add_edge(src: int, dst: int, relation: str) -> bool:
+        if src == dst or len(edges) >= max_edges:
+            return False
+        key = (int(src), int(dst), relation)
+        if key in seen:
+            return True
+        seen.add(key)
+        edges.append((int(src), int(dst)))
+        features.append(
+            _node_edge_features(
+                nodes[src],
+                nodes[dst],
+                relation=relation,
+                mz_max=mz_max,
+                max_h_transfers=max_h_transfers,
+                max_isotope_peaks=max_isotope_peaks,
+            )
+        )
+        return len(edges) < max_edges
+
+    for child_idx, child in enumerate(nodes):
+        for parent_hash in child.get('parent_hashes', []):
+            parent_idx = indices_by_hash.get(str(parent_hash))
+            if parent_idx is None:
+                continue
+            if not add_edge(parent_idx, child_idx, 'parent_to_child'):
+                return edges, features
+            if not add_edge(child_idx, parent_idx, 'child_to_parent'):
+                return edges, features
+    return edges, features
+
+
+def _node_edge_features(
+    src: dict[str, Any],
+    dst: dict[str, Any],
+    *,
+    relation: str,
+    mz_max: float,
+    max_h_transfers: int,
+    max_isotope_peaks: int,
+) -> list[float]:
+    """Reuse the fragment-edge feature layout for structural node edges."""
+    mass_delta = (float(dst['mz']) - float(src['mz'])) / max(float(mz_max), 1.0)
+    return [
+        1.0 if relation == 'parent_to_child' else 0.0,
+        1.0 if relation == 'child_to_parent' else 0.0,
+        0.0,
+        0.0,
+        0.0,
+        float(mass_delta),
+        0.0 / max(float(max_h_transfers), 1.0),
+        0.0 / max(float(max_isotope_peaks - 1), 1.0),
+    ]
 
 
 def _representative_formula_peak(group: list[dict[str, Any]]) -> dict[str, Any]:
@@ -186,6 +389,42 @@ def _formula_features(
         float(item['num_broken_bonds']) / max(float(max_bonds), 1.0),
         float(len(formula_peaks)) / max(float(max_isotope_peaks), 1.0),
         float(isotope_prob),
+    ]
+
+
+def _node_features(
+    item: dict[str, Any],
+    *,
+    mz_max: float,
+    max_tree_depth: float,
+    max_atoms: float,
+    max_bonds: float,
+) -> list[float]:
+    """Build normalized features for one structural fragment DAG node."""
+    return [
+        float(item['mz']) / max(float(mz_max), 1.0),
+        float(item['cut_count']) / max(float(max_tree_depth), 1.0),
+        float(len(item['atom_indices'])) / max(float(max_atoms), 1.0),
+        0.0,
+        float(item['score']) / max(float(item['score_max']), 1.0),
+        float(item['num_broken_bonds']) / max(float(max_bonds), 1.0),
+        0.0,
+        1.0,
+    ]
+
+
+def _formula_count_features(
+    element_counts: dict[str, int],
+    *,
+    max_atoms: float,
+) -> list[float]:
+    """
+    Return normalized fragment formula composition in a fixed element order.
+    """
+    denominator = max(float(max_atoms), 1.0)
+    return [
+        float(element_counts.get(symbol, 0)) / denominator
+        for symbol in FRAGMENT_FORMULA_ELEMENTS
     ]
 
 
@@ -287,12 +526,8 @@ def _add_fragment_candidate(
         return
 
     atom_set = set(atom_indices)
-    num_broken_bonds, score = _fragment_break_score(
-        atom_set,
-        bond_stats,
-    )
-
     score_max = float(sum(item['score'] for item in bond_stats))
+    num_broken_bonds, score = _fragment_break_score(atom_set, bond_stats)
     for h_shift in range(-int(max_remove_hs), int(max_add_hs) + 1):
         element_counts = _fragment_element_counts(mol, atom_indices, atom_hs, h_shift)
         if not element_counts:
@@ -325,8 +560,9 @@ def _add_fragment_candidate(
                 if existing_rank <= new_rank:
                     continue
             safe_prob = max(float(isotope_prob), 1e-12)
-            candidates[key] = {
+            candidate = {
                 'atom_indices': atom_indices,
+                'element_counts': dict(element_counts),
                 'mask': int(mask),
                 'fragment_hash': str(fragment_hash),
                 'parent_hashes': list(parent_hashes),
@@ -342,3 +578,4 @@ def _add_fragment_candidate(
                 'isotope_prob': safe_prob,
                 'log_prior': math.log(safe_prob),
             }
+            candidates[key] = candidate

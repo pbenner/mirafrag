@@ -55,12 +55,43 @@ def parse_number_list(value) -> list[float]:
     return [float(x) for x in values]
 
 
+def filter_precursor_peaks(
+    mzs: np.ndarray | Iterable[float],
+    intensities: np.ndarray | Iterable[float],
+    *,
+    precursor_mz: float | None,
+    tolerance: float = MASS_SPEC_GYM_BIN_WIDTH,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Remove peaks at the precursor m/z using the MassSpecGym simulation convention.
+
+    MassSpecGym excludes precursor signals from both ground truth and predictions
+    for spectrum simulation. Missing or non-positive precursor m/z values leave the
+    spectrum unchanged.
+    """
+    mz_arr = np.asarray(mzs, dtype=np.float32)
+    int_arr = np.asarray(intensities, dtype=np.float32)
+    if mz_arr.size == 0:
+        return mz_arr, int_arr
+    try:
+        precursor = float(precursor_mz) if precursor_mz is not None else float('nan')
+    except (TypeError, ValueError):
+        precursor = float('nan')
+    if not math.isfinite(precursor) or precursor <= 0:
+        return mz_arr, int_arr
+    keep = np.abs(mz_arr - precursor) > float(tolerance)
+    return mz_arr[keep], int_arr[keep]
+
+
 def parse_peaks(
     row,
     *,
     mzs_col: str = 'mzs',
     intensities_col: str = 'intensities',
     peaks_col: str = 'peaks',
+    precursor_mz: float | None = None,
+    exclude_precursor: bool = False,
+    precursor_tolerance: float = MASS_SPEC_GYM_BIN_WIDTH,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Parse m/z and intensity arrays from a spectrum table row.
@@ -85,7 +116,16 @@ def parse_peaks(
             f'm/z and intensity lengths differ: {len(mz_arr)} != {len(int_arr)}'
         )
     mask = np.isfinite(mz_arr) & np.isfinite(int_arr) & (int_arr > 0)
-    return mz_arr[mask], int_arr[mask]
+    mz_arr = mz_arr[mask]
+    int_arr = int_arr[mask]
+    if exclude_precursor:
+        mz_arr, int_arr = filter_precursor_peaks(
+            mz_arr,
+            int_arr,
+            precursor_mz=precursor_mz,
+            tolerance=precursor_tolerance,
+        )
+    return mz_arr, int_arr
 
 
 def bin_spectrum(

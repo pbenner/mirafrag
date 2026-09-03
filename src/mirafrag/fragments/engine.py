@@ -56,6 +56,7 @@ class _MiraFragFragmentEngine:
             self.bondscore[bond_bits] = bond_type * hetero_weight
             self.bonds.add(bond_bits)
         self.frag_to_entry: dict[str, dict[str, Any]] = {}
+        self._wl_hash_cache: dict[int, str] = {}
 
     def generate_fragments(self) -> list[tuple[str, dict[str, Any]]]:
         """
@@ -89,13 +90,13 @@ class _MiraFragFragmentEngine:
                 for atom_idx in range(self.natoms):
                     extended_fragments = self.remove_atom(parent_mask, atom_idx)
                     for fragment in extended_fragments:
-                        new_hash = str(fragment['new_hash'])
                         new_mask = int(fragment['new_frag'])
                         removed_bond_order = int(fragment['rm_bond_t'])
                         max_broken = parent_broken + removed_bond_order
                         if max_broken > self.max_broken_bonds:
                             continue
 
+                        new_hash = self.wl_hash(new_mask)
                         old_entry = self.frag_to_entry.get(new_hash)
                         if old_entry is None:
                             current_id += 1
@@ -181,7 +182,6 @@ class _MiraFragFragmentEngine:
             return [
                 {
                     'new_frag': template,
-                    'new_hash': self.wl_hash(template),
                     'removed_atom': int(atom_idx),
                     'rm_bond_t': removed_bond_order,
                 }
@@ -197,7 +197,6 @@ class _MiraFragFragmentEngine:
             out.append(
                 {
                     'new_frag': new_fragment,
-                    'new_hash': self.wl_hash(new_fragment),
                     'removed_atom': int(atom_idx),
                     'rm_bond_t': int(removed_bond_order),
                 }
@@ -210,6 +209,11 @@ class _MiraFragFragmentEngine:
 
         The hash is invariant to many symmetric atom-ordering cases and is used to collapse duplicate fragment states in the recursive tree.
         """
+        template_fragment = int(template_fragment)
+        cached = self._wl_hash_cache.get(template_fragment)
+        if cached is not None:
+            return cached
+
         cur_hashes = [str(symbol) for symbol in self.atom_symbols]
 
         def graph_hash(full_hashes: list[str]) -> str:
@@ -251,6 +255,7 @@ class _MiraFragFragmentEngine:
             current_graph_hash = next_graph_hash
             cur_hashes = new_hashes
             count += 1
+        self._wl_hash_cache[template_fragment] = current_graph_hash
         return current_graph_hash
 
 

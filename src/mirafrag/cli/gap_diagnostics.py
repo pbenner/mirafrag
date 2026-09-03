@@ -11,13 +11,21 @@ from tqdm.auto import tqdm
 
 from mirafrag.chem import quiet_rdkit_logs
 from mirafrag.data import (
+    ADDUCT_ALIASES,
     CE_ALIASES,
     INSTRUMENT_ALIASES,
+    PRECURSOR_ALIASES,
     SMILES_ALIASES,
     filter_massspecgym_simulation,
     find_column,
     read_table,
     select_split,
+)
+from mirafrag.sparse_spectra import SparseSpectrum, sparse_cosine, sparse_from_peaks
+from mirafrag.spectra import (
+    MASS_SPEC_GYM_BIN_WIDTH,
+    MASS_SPEC_GYM_MZ_MAX,
+    parse_peaks,
 )
 
 DEFAULT_SIMILARITY_BINS = (0.0, 0.3, 0.5, 0.7, 0.85, 0.95, 1.0)
@@ -36,6 +44,13 @@ METRIC_COLUMNS = (
     'tolerance_scorer_gap',
     'oos_calibration_error',
     'oos_calibration_abs_error',
+    'nearest_exp_spectrum_cosine',
+    'nearest_exp_spectrum_sqrt_cosine',
+    'nearest_exp_spectrum_cosine_mean_topk',
+    'nearest_exp_similarity',
+    'nearest_exp_top_similarity',
+    'nearest_exp_ce_delta',
+    'nearest_exp_pool_size',
 )
 
 
@@ -89,6 +104,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-eval-rows', type=int, default=None)
     parser.add_argument('--max-rows', type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
+        '--spectrum-neighbor-k',
+        type=int,
+        default=0,
+        help=(
+            'If positive, estimate a data/metadata ceiling by comparing each '
+            'evaluation spectrum with the top-k chemically nearest training '
+            'spectra under metadata constraints.'
+        ),
+    )
+    parser.add_argument(
+        '--spectrum-ce-window',
+        type=float,
+        default=10.0,
+        help='Collision-energy window for constrained spectrum-neighbor lookup.',
+    )
+    parser.add_argument(
+        '--spectrum-same-instrument',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Require same instrument for spectrum-neighbor lookup when available.',
+    )
+    parser.add_argument(
+        '--spectrum-same-adduct',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Require same adduct for spectrum-neighbor lookup when available.',
+    )
+    parser.add_argument(
+        '--spectrum-relaxed-fallback',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Relax CE/instrument constraints if no spectrum neighbors are found.',
+    )
+    parser.add_argument('--mz-max', type=float, default=MASS_SPEC_GYM_MZ_MAX)
+    parser.add_argument('--bin-width', type=float, default=MASS_SPEC_GYM_BIN_WIDTH)
+    parser.add_argument(
         '--progress',
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -128,6 +179,13 @@ def main() -> None:
         fingerprint_radius=args.fingerprint_radius,
         fingerprint_size=args.fingerprint_size,
         similarity_bins=_parse_float_sequence(args.similarity_bins),
+        spectrum_neighbor_k=args.spectrum_neighbor_k,
+        spectrum_ce_window=args.spectrum_ce_window,
+        spectrum_same_instrument=args.spectrum_same_instrument,
+        spectrum_same_adduct=args.spectrum_same_adduct,
+        spectrum_relaxed_fallback=args.spectrum_relaxed_fallback,
+        mz_max=args.mz_max,
+        bin_width=args.bin_width,
         show_progress=args.progress,
     )
     summary = summarize_gap_diagnostics(diagnostics, min_count=args.min_count)
@@ -149,6 +207,13 @@ def build_gap_diagnostics(
     fingerprint_radius: int = 2,
     fingerprint_size: int = 2048,
     similarity_bins: Sequence[float] = DEFAULT_SIMILARITY_BINS,
+    spectrum_neighbor_k: int = 0,
+    spectrum_ce_window: float = 10.0,
+    spectrum_same_instrument: bool = True,
+    spectrum_same_adduct: bool = True,
+    spectrum_relaxed_fallback: bool = True,
+    mz_max: float = MASS_SPEC_GYM_MZ_MAX,
+    bin_width: float = MASS_SPEC_GYM_BIN_WIDTH,
     show_progress: bool = True,
 ) -> pd.DataFrame:
     """
@@ -181,6 +246,22 @@ def build_gap_diagnostics(
     )
     eval_rows = _attach_metadata(eval_rows, eval_df)
     eval_rows = _attach_overlap_context(eval_rows, train_df)
+    if int(spectrum_neighbor_k) > 0:
+        eval_rows = _attach_nearest_experimental_spectra(
+            eval_rows,
+            train_df,
+            eval_df,
+            fingerprint_radius=fingerprint_radius,
+            fingerprint_size=fingerprint_size,
+            k=int(spectrum_neighbor_k),
+            ce_window=float(spectrum_ce_window),
+            same_instrument=bool(spectrum_same_instrument),
+            same_adduct=bool(spectrum_same_adduct),
+            relaxed_fallback=bool(spectrum_relaxed_fallback),
+            mz_max=float(mz_max),
+            bin_width=float(bin_width),
+            show_progress=show_progress,
+        )
     eval_rows['nearest_train_similarity_bin'] = _similarity_bin_labels(
         eval_rows['nearest_train_similarity'],
         bins=similarity_bins,
@@ -356,12 +437,385 @@ def _attach_nearest_train_similarity(
     return out
 
 
+def _attach_nearest_experimental_spectra(
+    eval_rows: pd.DataFrame,
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    *,
+    fingerprint_radius: int,
+    fingerprint_size: int,
+    k: int,
+    ce_window: float,
+    same_instrument: bool,
+    same_adduct: bool,
+    relaxed_fallback: bool,
+    mz_max: float,
+    bin_width: float,
+    show_progress: bool,
+) -> pd.DataFrame:
+    """
+    Attach nearest-training experimental spectrum similarities.
+
+    Candidate training spectra are first constrained by metadata, then ranked by
+    Morgan similarity. The recorded cosine is the best experimental-spectrum
+    cosine among the top-k chemically nearest candidates, which estimates an
+    empirical data/metadata ceiling rather than a model score.
+    """
+    if k <= 0:
+        return eval_rows
+    train = _training_spectrum_rows(
+        train_df,
+        fingerprint_radius=fingerprint_radius,
+        fingerprint_size=fingerprint_size,
+        mz_max=mz_max,
+        bin_width=bin_width,
+    )
+    out = eval_rows.copy()
+    if train.empty:
+        return _attach_empty_nearest_experimental_columns(out)
+
+    train_fps = list(train['fingerprint'])
+    train_spectra = list(train['spectrum'])
+    train_instrument = train['instrument_type'].astype(str).to_numpy()
+    train_adduct = train['adduct'].astype(str).to_numpy()
+    train_ce = pd.to_numeric(train['collision_energy'], errors='coerce').to_numpy(
+        dtype=float
+    )
+    eval_spectra = _evaluation_spectrum_rows(
+        eval_df,
+        fingerprint_radius=fingerprint_radius,
+        fingerprint_size=fingerprint_size,
+        mz_max=mz_max,
+        bin_width=bin_width,
+    )
+
+    rows = []
+    iterator = tqdm(
+        eval_spectra.to_dict('records'),
+        desc='nearest experimental spectrum',
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    all_indices = np.arange(len(train), dtype=np.int64)
+    for row in iterator:
+        result = _nearest_experimental_spectrum_row(
+            row,
+            train=train,
+            train_fps=train_fps,
+            train_spectra=train_spectra,
+            train_instrument=train_instrument,
+            train_adduct=train_adduct,
+            train_ce=train_ce,
+            all_indices=all_indices,
+            k=k,
+            ce_window=ce_window,
+            same_instrument=same_instrument,
+            same_adduct=same_adduct,
+            relaxed_fallback=relaxed_fallback,
+        )
+        rows.append(result)
+    nearest = pd.DataFrame(rows)
+    return pd.concat([out.reset_index(drop=True), nearest], axis=1)
+
+
+def _training_spectrum_rows(
+    train_df: pd.DataFrame,
+    *,
+    fingerprint_radius: int,
+    fingerprint_size: int,
+    mz_max: float,
+    bin_width: float,
+) -> pd.DataFrame:
+    source = train_df.reset_index(drop=True)
+    smiles_col = find_column(source, SMILES_ALIASES)
+    identifier_col = 'identifier' if 'identifier' in source.columns else None
+    instrument_col = find_column(source, INSTRUMENT_ALIASES, required=False)
+    adduct_col = find_column(source, ADDUCT_ALIASES, required=False)
+    ce_col = find_column(source, CE_ALIASES, required=False)
+    precursor_col = find_column(source, PRECURSOR_ALIASES, required=False)
+    rows = []
+    for position, (_, row) in enumerate(source.iterrows()):
+        mol = Chem.MolFromSmiles(str(row[smiles_col]))
+        if mol is None:
+            continue
+        try:
+            mzs, intensities = parse_peaks(
+                row,
+                precursor_mz=row.get(precursor_col)
+                if precursor_col is not None
+                else None,
+                exclude_precursor=True,
+                precursor_tolerance=bin_width,
+            )
+        except Exception:
+            continue
+        spectrum = sparse_from_peaks(
+            mzs,
+            intensities,
+            mz_max=mz_max,
+            bin_width=bin_width,
+        )
+        if spectrum.values.size == 0:
+            continue
+        rows.append(
+            {
+                'train_row_index': position,
+                'train_identifier': str(row[identifier_col])
+                if identifier_col is not None
+                else str(position),
+                'train_smiles': str(row[smiles_col]),
+                'train_canonical_smiles': Chem.MolToSmiles(mol, isomericSmiles=True),
+                'train_inchikey': str(row.get('inchikey', '')),
+                'instrument_type': _metadata_value(row, instrument_col),
+                'adduct': _metadata_value(row, adduct_col),
+                'collision_energy': _float_or_nan(row[ce_col])
+                if ce_col is not None
+                else float('nan'),
+                'fingerprint': _morgan_fingerprint(
+                    mol,
+                    radius=fingerprint_radius,
+                    size=fingerprint_size,
+                ),
+                'spectrum': spectrum,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _evaluation_spectrum_rows(
+    eval_df: pd.DataFrame,
+    *,
+    fingerprint_radius: int,
+    fingerprint_size: int,
+    mz_max: float,
+    bin_width: float,
+) -> pd.DataFrame:
+    source = eval_df.reset_index(drop=True)
+    smiles_col = find_column(source, SMILES_ALIASES)
+    instrument_col = find_column(source, INSTRUMENT_ALIASES, required=False)
+    adduct_col = find_column(source, ADDUCT_ALIASES, required=False)
+    ce_col = find_column(source, CE_ALIASES, required=False)
+    precursor_col = find_column(source, PRECURSOR_ALIASES, required=False)
+    rows = []
+    for _, row in source.iterrows():
+        mol = Chem.MolFromSmiles(str(row[smiles_col]))
+        fingerprint = (
+            _morgan_fingerprint(mol, radius=fingerprint_radius, size=fingerprint_size)
+            if mol is not None
+            else None
+        )
+        try:
+            mzs, intensities = parse_peaks(
+                row,
+                precursor_mz=row.get(precursor_col)
+                if precursor_col is not None
+                else None,
+                exclude_precursor=True,
+                precursor_tolerance=bin_width,
+            )
+            spectrum = sparse_from_peaks(
+                mzs,
+                intensities,
+                mz_max=mz_max,
+                bin_width=bin_width,
+            )
+        except Exception:
+            spectrum = SparseSpectrum(
+                np.asarray([], dtype=np.int64),
+                np.asarray([], dtype=np.float32),
+            )
+        rows.append(
+            {
+                'fingerprint': fingerprint,
+                'spectrum': spectrum,
+                'instrument_type': _metadata_value(row, instrument_col),
+                'adduct': _metadata_value(row, adduct_col),
+                'collision_energy': _float_or_nan(row[ce_col])
+                if ce_col is not None
+                else float('nan'),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _nearest_experimental_spectrum_row(
+    row: dict[str, object],
+    *,
+    train: pd.DataFrame,
+    train_fps: list[object],
+    train_spectra: list[SparseSpectrum],
+    train_instrument: np.ndarray,
+    train_adduct: np.ndarray,
+    train_ce: np.ndarray,
+    all_indices: np.ndarray,
+    k: int,
+    ce_window: float,
+    same_instrument: bool,
+    same_adduct: bool,
+    relaxed_fallback: bool,
+) -> dict[str, object]:
+    fingerprint = row.get('fingerprint')
+    spectrum = row.get('spectrum')
+    if fingerprint is None or not isinstance(spectrum, SparseSpectrum):
+        return _empty_nearest_experimental_result('invalid_eval')
+    if spectrum.values.size == 0:
+        return _empty_nearest_experimental_result('empty_eval_spectrum')
+
+    candidate_indices, fallback = _experimental_candidate_indices(
+        row,
+        train_instrument=train_instrument,
+        train_adduct=train_adduct,
+        train_ce=train_ce,
+        all_indices=all_indices,
+        ce_window=ce_window,
+        same_instrument=same_instrument,
+        same_adduct=same_adduct,
+        relaxed_fallback=relaxed_fallback,
+    )
+    if candidate_indices.size == 0:
+        return _empty_nearest_experimental_result('no_candidates')
+
+    candidate_fps = [train_fps[int(idx)] for idx in candidate_indices]
+    similarities = np.asarray(
+        DataStructs.BulkTanimotoSimilarity(fingerprint, candidate_fps),
+        dtype=float,
+    )
+    if similarities.size == 0:
+        return _empty_nearest_experimental_result('no_fingerprints')
+    top_count = min(int(k), similarities.size)
+    top_local = np.argpartition(-similarities, top_count - 1)[:top_count]
+    top_local = top_local[np.argsort(-similarities[top_local])]
+    best_cosine = -1.0
+    best_sqrt = float('nan')
+    best_local = int(top_local[0])
+    cosines = []
+    for local_idx in top_local:
+        train_idx = int(candidate_indices[int(local_idx)])
+        train_spectrum = train_spectra[train_idx]
+        cosine = sparse_cosine(spectrum, train_spectrum)
+        cosines.append(cosine)
+        if cosine > best_cosine:
+            best_cosine = cosine
+            best_sqrt = sparse_cosine(spectrum, train_spectrum, sqrt=True)
+            best_local = int(local_idx)
+    best_train_idx = int(candidate_indices[best_local])
+    ce_delta = _abs_delta(row.get('collision_energy'), train_ce[best_train_idx])
+    return {
+        'nearest_exp_spectrum_cosine': float(best_cosine),
+        'nearest_exp_spectrum_sqrt_cosine': float(best_sqrt),
+        'nearest_exp_spectrum_cosine_mean_topk': float(np.mean(cosines)),
+        'nearest_exp_similarity': float(similarities[best_local]),
+        'nearest_exp_top_similarity': float(similarities[top_local[0]]),
+        'nearest_exp_ce_delta': ce_delta,
+        'nearest_exp_pool_size': int(candidate_indices.size),
+        'nearest_exp_fallback': fallback,
+        'nearest_exp_identifier': str(train.iloc[best_train_idx]['train_identifier']),
+        'nearest_exp_smiles': str(train.iloc[best_train_idx]['train_canonical_smiles']),
+    }
+
+
+def _experimental_candidate_indices(
+    row: dict[str, object],
+    *,
+    train_instrument: np.ndarray,
+    train_adduct: np.ndarray,
+    train_ce: np.ndarray,
+    all_indices: np.ndarray,
+    ce_window: float,
+    same_instrument: bool,
+    same_adduct: bool,
+    relaxed_fallback: bool,
+) -> tuple[np.ndarray, str]:
+    levels = ['strict']
+    if relaxed_fallback:
+        levels.extend(['no_ce_window', 'adduct_only', 'all'])
+    for level in levels:
+        mask = np.ones(all_indices.shape[0], dtype=bool)
+        if level in {'strict', 'no_ce_window'}:
+            mask &= _metadata_mask(
+                train_instrument,
+                row.get('instrument_type'),
+                enabled=same_instrument,
+            )
+            mask &= _metadata_mask(train_adduct, row.get('adduct'), enabled=same_adduct)
+        elif level == 'adduct_only':
+            mask &= _metadata_mask(train_adduct, row.get('adduct'), enabled=same_adduct)
+        if level == 'strict':
+            eval_ce = _float_or_nan(row.get('collision_energy'))
+            if np.isfinite(eval_ce) and np.isfinite(ce_window) and ce_window >= 0.0:
+                mask &= np.isfinite(train_ce) & (
+                    np.abs(train_ce - eval_ce) <= ce_window
+                )
+        indices = all_indices[mask]
+        if indices.size > 0:
+            return indices, level
+    return np.asarray([], dtype=np.int64), 'none'
+
+
+def _metadata_mask(values: np.ndarray, query: object, *, enabled: bool) -> np.ndarray:
+    if not enabled:
+        return np.ones(values.shape[0], dtype=bool)
+    query_text = str(query) if query is not None else ''
+    if not query_text or query_text == 'nan':
+        return np.ones(values.shape[0], dtype=bool)
+    return values == query_text
+
+
+def _metadata_value(row: pd.Series, column: str | None) -> str:
+    if column is None:
+        return ''
+    value = row[column]
+    if pd.isna(value):
+        return ''
+    return str(value)
+
+
+def _float_or_nan(value: object) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float('nan')
+    return out if np.isfinite(out) else float('nan')
+
+
+def _abs_delta(left: object, right: object) -> float:
+    left_value = _float_or_nan(left)
+    right_value = _float_or_nan(right)
+    if not np.isfinite(left_value) or not np.isfinite(right_value):
+        return float('nan')
+    return float(abs(left_value - right_value))
+
+
+def _empty_nearest_experimental_result(reason: str) -> dict[str, object]:
+    return {
+        'nearest_exp_spectrum_cosine': float('nan'),
+        'nearest_exp_spectrum_sqrt_cosine': float('nan'),
+        'nearest_exp_spectrum_cosine_mean_topk': float('nan'),
+        'nearest_exp_similarity': float('nan'),
+        'nearest_exp_top_similarity': float('nan'),
+        'nearest_exp_ce_delta': float('nan'),
+        'nearest_exp_pool_size': 0,
+        'nearest_exp_fallback': reason,
+        'nearest_exp_identifier': '',
+        'nearest_exp_smiles': '',
+    }
+
+
+def _attach_empty_nearest_experimental_columns(out: pd.DataFrame) -> pd.DataFrame:
+    empty = _empty_nearest_experimental_result('no_train_spectra')
+    result = out.copy()
+    for column, value in empty.items():
+        result[column] = value
+    return result
+
+
 def _attach_metadata(out: pd.DataFrame, eval_df: pd.DataFrame) -> pd.DataFrame:
     source = eval_df.reset_index(drop=True)
     out = out.copy()
     for output_name, aliases in (
         ('instrument_type', INSTRUMENT_ALIASES),
         ('collision_energy', CE_ALIASES),
+        ('adduct', ADDUCT_ALIASES),
     ):
         column = find_column(source, aliases, required=False)
         if column is None:
@@ -609,6 +1063,12 @@ def _print_overview(
             f'eval_support_gap_mean={support_gap:.5f} '
             f'eval_scorer_gap_mean={scorer_gap:.5f}'
         )
+    if 'nearest_exp_spectrum_cosine' in diagnostics:
+        nearest = diagnostics['nearest_exp_spectrum_cosine']
+        print(
+            f'nearest_exp_spectrum_cosine_mean={nearest.mean():.5f} '
+            f'nearest_exp_valid_fraction={nearest.notna().mean():.2%}'
+        )
 
 
 def _print_summary(summary: pd.DataFrame) -> None:
@@ -627,6 +1087,13 @@ def _print_summary(summary: pd.DataFrame) -> None:
         'scorer_gap_mean',
         'tolerance_scorer_gap_mean',
         'oos_calibration_abs_error_mean',
+        'nearest_exp_spectrum_cosine_mean',
+        'nearest_exp_spectrum_sqrt_cosine_mean',
+        'nearest_exp_spectrum_cosine_mean_topk_mean',
+        'nearest_exp_similarity_mean',
+        'nearest_exp_top_similarity_mean',
+        'nearest_exp_ce_delta_mean',
+        'nearest_exp_pool_size_mean',
         'nearest_train_similarity_mean',
         'same_inchikey_fraction',
         'same_molecule_min_ce_delta_mean',

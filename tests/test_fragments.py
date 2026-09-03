@@ -20,6 +20,7 @@ from mirafrag.config import MiraFragConfig, mirafrag_config_from_dict
 from mirafrag.data import (
     BinnedSpectrumDataset,
     MetadataConfig,
+    _fragment_config_cache_settings,
     collate_spectrum_batch,
     dataloader_performance_kwargs,
     filter_massspecgym_simulation,
@@ -29,7 +30,10 @@ from mirafrag.data import (
 from mirafrag.encoders.mace import repair_mace_cuequivariance_config
 from mirafrag.evaluation import _sparse_prediction_rows
 from mirafrag.fragments import (
+    BOND_BREAK_FEATURE_DIM,
     FRAGMENT_EDGE_FEATURE_DIM,
+    FRAGMENT_FEATURE_DIM,
+    FRAGMENT_FORMULA_DIM,
     PROTON_MASS,
     SODIUM_ADDUCT_MASS,
     FragmentConfig,
@@ -77,6 +81,48 @@ def test_fragment_candidates_include_recursive_fragments():
     assert fragments['bins']
     assert any(len(atom_indices) < 3 for atom_indices in fragments['atom_indices'])
     assert any(feature[3] != 0.0 for feature in fragments['features'])
+
+
+def test_fragment_candidates_include_structural_dag_nodes():
+    fragments = smiles_to_fragment_candidates(
+        'CCO',
+        mz_max=128.0,
+        bin_width=0.01,
+        config=FragmentConfig(max_tree_depth=2, max_fragments=32),
+    )
+
+    assert fragments['node_atom_indices']
+    assert fragments['node_features']
+    assert fragments['node_formula_counts']
+    assert len(fragments['node_formula_counts']) == len(fragments['node_atom_indices'])
+    assert all(
+        len(counts) == FRAGMENT_FORMULA_DIM
+        for counts in fragments['node_formula_counts']
+    )
+    assert len(fragments['formula_node_index']) == len(fragments['atom_indices'])
+    assert len(fragments['formula_h_shift']) == len(fragments['atom_indices'])
+    assert max(fragments['formula_node_index']) < len(fragments['node_atom_indices'])
+    assert len(fragments['node_features'][0]) == FRAGMENT_FEATURE_DIM
+    assert len(
+        set(tuple(indices) for indices in fragments['node_atom_indices'])
+    ) == len(fragments['node_atom_indices'])
+
+
+def test_fragment_candidates_include_formula_count_features():
+    fragments = smiles_to_fragment_candidates(
+        'CCO',
+        mz_max=64.0,
+        bin_width=1.0,
+        config=FragmentConfig(max_tree_depth=1, max_fragments=16),
+    )
+
+    assert len(fragments['formula_counts']) == len(fragments['atom_indices'])
+    assert all(
+        len(counts) == FRAGMENT_FORMULA_DIM for counts in fragments['formula_counts']
+    )
+    assert any(counts[0] > 0.0 for counts in fragments['formula_counts'])
+    assert any(counts[1] > 0.0 for counts in fragments['formula_counts'])
+    assert any(counts[3] > 0.0 for counts in fragments['formula_counts'])
 
 
 def test_fragment_candidates_include_fragment_graph_edges():
@@ -145,6 +191,66 @@ def test_collate_offsets_formula_indices_between_molecules():
         batch['formula_index'][:first_count].max()
         < batch['formula_index'][first_count:].min()
     )
+
+
+def test_collate_fragment_candidates_formula_counts_and_legacy_fallback():
+    first = smiles_to_fragment_candidates(
+        'CCO',
+        mz_max=128.0,
+        bin_width=0.01,
+        config=FragmentConfig(max_tree_depth=1, max_fragments=16),
+    )
+    second = dict(first)
+    second.pop('formula_counts')
+    second.pop('formula_node_index')
+    second.pop('formula_h_shift')
+    second.pop('node_atom_indices')
+    second.pop('node_features')
+    second.pop('node_formula_counts')
+    second.pop('node_edge_index')
+    second.pop('node_edge_features')
+
+    batch = collate_fragment_candidates([first, second], node_offsets=[0, 3])
+
+    first_formula_count = len(first['atom_indices'])
+    assert batch['formula_counts'].shape == (
+        2 * first_formula_count,
+        FRAGMENT_FORMULA_DIM,
+    )
+    assert torch.count_nonzero(batch['formula_counts'][:first_formula_count]) > 0
+    assert torch.count_nonzero(batch['formula_counts'][first_formula_count:]) == 0
+    assert bool(batch['has_fragment_nodes'].item()) is False
+    assert batch['node_formula_counts'].shape == (
+        batch['node_features'].shape[0],
+        FRAGMENT_FORMULA_DIM,
+    )
+
+
+def test_collate_fragment_candidates_preserves_structural_dag_nodes():
+    first = smiles_to_fragment_candidates(
+        'CCO',
+        mz_max=128.0,
+        bin_width=0.01,
+        config=FragmentConfig(max_tree_depth=2, max_fragments=32),
+    )
+    second = smiles_to_fragment_candidates(
+        'CCN',
+        mz_max=128.0,
+        bin_width=0.01,
+        config=FragmentConfig(max_tree_depth=2, max_fragments=32),
+    )
+
+    batch = collate_fragment_candidates([first, second], node_offsets=[0, 3])
+
+    assert bool(batch['has_fragment_nodes'].item()) is True
+    assert batch['formula_node_index'].numel() == batch['features'].shape[0]
+    assert batch['formula_h_shift'].numel() == batch['features'].shape[0]
+    assert batch['node_atom_ptr'].numel() == batch['node_features'].shape[0] + 1
+    assert batch['node_formula_counts'].shape == (
+        batch['node_features'].shape[0],
+        FRAGMENT_FORMULA_DIM,
+    )
+    assert batch['formula_node_index'].max() < batch['node_features'].shape[0]
 
 
 def test_recursive_fragment_candidates_reach_atom_pull_depth():
@@ -477,3 +583,73 @@ def test_default_fragment_config_matches_model_config():
         == fragment_config.max_isotope_peaks
         == 1
     )
+
+
+def test_fragment_candidates_include_bond_break_provenance_when_enabled():
+    fragments = smiles_to_fragment_candidates(
+        'CCO',
+        mz_max=128.0,
+        bin_width=0.01,
+        config=FragmentConfig(
+            max_tree_depth=2,
+            max_broken_bonds=4,
+            max_fragments=32,
+            include_isotopes=False,
+            include_bond_breaks=True,
+        ),
+    )
+
+    assert 'bond_atom_indices' in fragments
+    assert 'bond_features' in fragments
+    assert len(fragments['bond_atom_indices']) == len(fragments['atom_indices'])
+    assert len(fragments['bond_features']) == len(fragments['atom_indices'])
+    assert any(fragments['bond_atom_indices'])
+    for pairs, features in zip(
+        fragments['bond_atom_indices'], fragments['bond_features']
+    ):
+        assert len(pairs) == len(features)
+        for inside, outside in pairs:
+            assert inside != outside
+            assert 0 <= inside < 3
+            assert 0 <= outside < 3
+        for feature in features:
+            assert len(feature) == BOND_BREAK_FEATURE_DIM
+            assert all(0.0 <= float(value) <= 1.0 for value in feature)
+
+
+def test_collate_fragment_candidates_offsets_bond_break_pairs():
+    config = FragmentConfig(
+        max_tree_depth=2,
+        max_broken_bonds=4,
+        max_fragments=32,
+        include_isotopes=False,
+        include_bond_breaks=True,
+    )
+    first = smiles_to_fragment_candidates(
+        'CCO', mz_max=128.0, bin_width=0.01, config=config
+    )
+    second = smiles_to_fragment_candidates(
+        'CCO', mz_max=128.0, bin_width=0.01, config=config
+    )
+
+    batch = collate_fragment_candidates([first, second], node_offsets=[0, 3])
+
+    first_break_count = sum(len(pairs) for pairs in first['bond_atom_indices'])
+    assert batch['bond_ptr'].numel() == batch['formula_batch'].numel() + 1
+    assert batch['bond_features'].shape[1] == BOND_BREAK_FEATURE_DIM
+    assert batch['bond_atom_index'].shape[1] == 2
+    assert batch['bond_atom_index'].shape[0] == batch['bond_features'].shape[0]
+    assert batch['bond_atom_index'].shape[0] == int(batch['bond_ptr'][-1])
+    assert torch.all(batch['bond_atom_index'][:first_break_count] < 3)
+    assert torch.all(batch['bond_atom_index'][first_break_count:] >= 3)
+
+
+def test_fragment_config_cache_settings_share_bond_break_payload_extension():
+    disabled = _fragment_config_cache_settings(FragmentConfig())
+    enabled = _fragment_config_cache_settings(FragmentConfig(include_bond_breaks=True))
+
+    assert disabled['fragment_feature_schema'] == 3
+    assert enabled['fragment_feature_schema'] == 3
+    assert 'include_bond_breaks' not in disabled
+    assert 'include_bond_breaks' not in enabled
+    assert disabled == enabled

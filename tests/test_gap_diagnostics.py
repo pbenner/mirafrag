@@ -13,7 +13,10 @@ def test_gap_diagnostics_tracks_train_overlap_and_prediction_metrics():
             'smiles': ['CCO', 'c1ccccc1'],
             'inchikey': ['ethanol', 'benzene'],
             'instrument_type': ['Orbitrap', 'QTOF'],
+            'adduct': ['[M+H]+', '[M+H]+'],
             'collision_energy': [20.0, 50.0],
+            'mzs': ['[10, 20]', '[50]'],
+            'intensities': ['[1, 1]', '[1]'],
             'fold': ['train', 'train'],
         }
     )
@@ -23,7 +26,10 @@ def test_gap_diagnostics_tracks_train_overlap_and_prediction_metrics():
             'smiles': ['CCO', 'CCN'],
             'inchikey': ['ethanol', 'ethylamine'],
             'instrument_type': ['Orbitrap', 'QTOF'],
+            'adduct': ['[M+H]+', '[M+H]+'],
             'collision_energy': [30.0, 70.0],
+            'mzs': ['[10, 20]', '[50]'],
+            'intensities': ['[1, 1]', '[1]'],
             'fold': ['val', 'val'],
         }
     )
@@ -40,6 +46,10 @@ def test_gap_diagnostics_tracks_train_overlap_and_prediction_metrics():
         train,
         eval_df,
         predictions=predictions,
+        spectrum_neighbor_k=1,
+        spectrum_ce_window=15.0,
+        mz_max=100.0,
+        bin_width=1.0,
         show_progress=False,
     )
 
@@ -49,7 +59,11 @@ def test_gap_diagnostics_tracks_train_overlap_and_prediction_metrics():
     assert by_id.loc['v1', 'same_molecule_min_ce_delta'] == 10.0
     assert not bool(by_id.loc['v2', 'same_smiles_in_train'])
     assert by_id.loc['v1', 'cosine'] == 0.9
+    assert by_id.loc['v1', 'nearest_exp_spectrum_cosine'] > 0.999
+    assert by_id.loc['v1', 'nearest_exp_fallback'] == 'strict'
+    assert by_id.loc['v2', 'nearest_exp_spectrum_cosine'] > 0.999
 
     summary = summarize_gap_diagnostics(diagnostics, min_count=1)
     assert {'nearest_train_similarity', 'instrument'} <= set(summary['group_type'])
     assert 'cosine_mean' in summary.columns
+    assert 'nearest_exp_spectrum_cosine_mean' in summary.columns

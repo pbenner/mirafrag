@@ -7,6 +7,7 @@ from mirafrag.spectra import (
     MASS_SPEC_GYM_NUM_BINS,
     bin_spectrum,
     cosine_similarity,
+    filter_precursor_peaks,
     num_spectrum_bins,
     parse_peaks,
     peaks_from_bins,
@@ -18,6 +19,31 @@ def test_parse_massspecgym_peaks():
     mzs, ints = parse_peaks(row)
     assert mzs.tolist() == [10.0, 20.0, 20.0]
     assert ints.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_parse_peaks_excludes_precursor_signal_when_requested():
+    row = {
+        'mzs': '46.99,47.0,47.02,60.0',
+        'intensities': '1,10,2,3',
+    }
+    mzs, ints = parse_peaks(
+        row,
+        precursor_mz=47.0,
+        exclude_precursor=True,
+        precursor_tolerance=0.01,
+    )
+    assert mzs.tolist() == [47.02000045776367, 60.0]
+    assert ints.tolist() == [2.0, 3.0]
+
+
+def test_filter_precursor_peaks_ignores_missing_precursor():
+    mzs, ints = filter_precursor_peaks(
+        np.asarray([47.0], dtype=np.float32),
+        np.asarray([1.0], dtype=np.float32),
+        precursor_mz=None,
+    )
+    assert mzs.tolist() == [47.0]
+    assert ints.tolist() == [1.0]
 
 
 def test_bin_spectrum_l1():

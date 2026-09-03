@@ -30,6 +30,10 @@ aimnet = [
 mace = [
   "mace-model",
 ]
+unimol = [
+  "unimol_tools",
+  "huggingface_hub",
+]
 all = [
   "aimnet",
   "mace-model",
@@ -41,6 +45,19 @@ mirafrag-eval = "mirafrag.cli.eval:main"
 mirafrag-retrieval-eval = "mirafrag.cli.retrieval_eval:main"
 mirafrag-predict = "mirafrag.cli.predict:main"
 mirafrag-cache = "mirafrag.cli.cache:main"
+mirafrag-physical-sidecar-manifest = "mirafrag.cli.physical_sidecar_manifest:main"
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "mace" },
+    { extra = "unimol" },
+  ],
+  [
+    { extra = "all" },
+    { extra = "unimol" },
+  ],
+]
 
 [tool.uv.sources]
 mace-model = { path = "../mace-model", editable = true }

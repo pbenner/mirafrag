@@ -22,6 +22,57 @@ class LossSpec:
     display_name: str
 
 
+def exclude_precursor_prediction_candidates(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    tolerance: float = 0.01,
+) -> dict[str, Any]:
+    """
+    Drop predicted precursor-signal candidates for MassSpecGym-style scoring.
+    """
+    precursor_mz = batch.get('precursor_mz')
+    if precursor_mz is None or 'batch' not in pred:
+        return pred
+    candidate_batch = pred['batch'].long()
+    if candidate_batch.numel() == 0:
+        return pred
+    device = candidate_batch.device
+    dtype = pred.get('mzs', pred.get('logits')).dtype
+    precursor = precursor_mz.to(device=device, dtype=dtype)
+    candidate_precursor = precursor[candidate_batch]
+    if 'mzs' in pred:
+        candidate_mz = pred['mzs'].to(device=device, dtype=dtype)
+    else:
+        candidate_mz = (
+            pred['bins'].to(device=device, dtype=dtype)
+            + dtype_to_tensor(0.5, device=device, dtype=dtype)
+        ) * dtype_to_tensor(_bin_width_from_batch(batch), device=device, dtype=dtype)
+    keep = (candidate_precursor <= 0) | (
+        torch.abs(candidate_mz - candidate_precursor) > float(tolerance)
+    )
+    if bool(keep.all()):
+        return pred
+    out: dict[str, Any] = {}
+    n_candidates = int(candidate_batch.numel())
+    for key, value in pred.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == n_candidates
+        ):
+            out[key] = value[keep]
+        else:
+            out[key] = value
+    return out
+
+
+def dtype_to_tensor(
+    value: float, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    return torch.tensor(float(value), device=device, dtype=dtype)
+
+
 def spectrum_loss(
     pred: dict[str, Any],
     batch: dict[str, Any],
@@ -34,11 +85,12 @@ def spectrum_loss(
     coverage_weight: float = 0.1,
     target_power: float = 1.0,
     entropy_weight: float = 0.0,
+    reduction: str = 'mean',
 ) -> torch.Tensor:
     """
     Compute the configured sparse spectrum training loss.
 
-    The prediction dictionary must come from :class:`MiraFragModel` and the batch must contain flattened target m/z, target intensity, and target batch tensors. The returned scalar is suitable for backpropagation.
+    The prediction dictionary must come from :class:`MiraFragModel` and the batch must contain flattened target m/z, target intensity, and target batch tensors. With the default reduction, the returned scalar is suitable for backpropagation; ``reduction='none'`` returns one loss per spectrum.
     """
     return _sparse_spectrum_loss(
         pred,
@@ -51,6 +103,7 @@ def spectrum_loss(
         coverage_weight=coverage_weight,
         target_power=target_power,
         entropy_weight=entropy_weight,
+        reduction=reduction,
     )
 
 
@@ -66,6 +119,7 @@ def _sparse_spectrum_loss(
     coverage_weight: float,
     target_power: float,
     entropy_weight: float,
+    reduction: str,
 ) -> torch.Tensor:
     """
     Dispatch a sparse prediction to the selected registered loss implementation.
@@ -86,15 +140,35 @@ def _sparse_spectrum_loss(
         kl_weight=kl_weight,
         coverage_weight=coverage_weight,
         target_power=target_power,
+        reduction=reduction,
     )
     if entropy_weight > 0.0:
         entropy = (
             sparse_fragment_prediction_entropy(pred)
-            if loss == 'decoupled_kl'
+            if loss
+            in {
+                'decoupled_kl',
+                'decoupled_kl_cosine',
+                'fiora_decoupled_kl',
+                'responsibility_decoupled_kl',
+                'fragment_cosine',
+                'fragment_sqrt_cosine',
+            }
             else sparse_prediction_entropy(pred)
         )
-        loss_value = loss_value + float(entropy_weight) * entropy.mean()
+        loss_value = loss_value + _reduce_loss(
+            float(entropy_weight) * entropy,
+            reduction=reduction,
+        )
     return loss_value
+
+
+def _reduce_loss(loss: torch.Tensor, *, reduction: str) -> torch.Tensor:
+    if reduction == 'mean':
+        return loss.mean()
+    if reduction == 'none':
+        return loss
+    raise ValueError("reduction must be one of: 'mean', 'none'.")
 
 
 def sparse_binned_cosine_similarity(
@@ -882,6 +956,191 @@ def fragnnet_sparse_cross_entropy(
     return out
 
 
+def fiora_bond_break_event_kl_divergence(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    tolerance: float = 0.01,
+    relative: bool = False,
+    tolerance_min_mz: float = 200.0,
+    target_power: float = 1.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Supervise oriented bond-break events from matched fragment candidates.
+
+    The target projection is FIORA-like but keeps MiraFrag's richer candidate
+    paths: a matched measured peak assigns mass to matching candidate formulas,
+    then each multi-break formula spreads its assigned mass over all boundary
+    bond events in that candidate path. Event logits are normalized per spectrum.
+    """
+    logits = pred['logits']
+    event_logits = pred.get('bond_break_logits')
+    event_formula_index = pred.get('bond_break_formula_index')
+    event_batch = pred.get('bond_break_batch')
+    if not isinstance(event_logits, torch.Tensor):
+        return logits.sum() * 0.0 + logits.new_zeros(int(pred['batch_size']))
+    if not isinstance(event_formula_index, torch.Tensor) or not isinstance(
+        event_batch, torch.Tensor
+    ):
+        return (
+            logits.sum() * 0.0
+            + event_logits.sum() * 0.0
+            + logits.new_zeros(int(pred['batch_size']))
+        )
+
+    event_logits = event_logits.to(device=logits.device, dtype=logits.dtype)
+    event_formula_index = event_formula_index.to(device=logits.device).long()
+    event_batch = event_batch.to(device=logits.device).long()
+    pred_mzs = pred['mzs'].to(device=logits.device, dtype=logits.dtype)
+    pred_batch = pred['batch'].to(device=logits.device).long()
+    peak_formula_index = pred['formula_index'].to(device=logits.device).long()
+    target_mzs = batch['target_mz'].to(device=logits.device, dtype=logits.dtype)
+    target_values = batch['target_intensity'].to(
+        device=logits.device, dtype=logits.dtype
+    )
+    target_batch = batch['target_batch'].to(device=logits.device).long()
+    batch_size = int(pred['batch_size'])
+    out = logits.sum() * 0.0 + event_logits.sum() * 0.0 + logits.new_zeros(batch_size)
+    if event_logits.numel() == 0:
+        return out
+
+    num_formulas = int(pred['formula_batch'].numel())
+    for batch_idx in range(batch_size):
+        e_mask = event_batch == batch_idx
+        p_mask = pred_batch == batch_idx
+        t_mask = target_batch == batch_idx
+        if not bool(e_mask.any()) or not bool(p_mask.any()) or not bool(t_mask.any()):
+            continue
+
+        event_indices = torch.nonzero(e_mask, as_tuple=False).flatten()
+        local_event_formulas = event_formula_index[event_indices]
+        event_counts = logits.new_zeros(num_formulas)
+        event_counts.index_add_(
+            0, local_event_formulas, logits.new_ones(local_event_formulas.shape[0])
+        )
+
+        peak_indices = torch.nonzero(p_mask, as_tuple=False).flatten()
+        peak_mzs = pred_mzs[peak_indices]
+        peak_formulas = peak_formula_index[peak_indices]
+        t_mzs = target_mzs[t_mask]
+        t_probs = _target_probs(
+            target_values[t_mask], target_power=target_power, eps=eps
+        )
+        tolerances = _target_tolerances(
+            t_mzs,
+            tolerance=tolerance,
+            relative=relative,
+            tolerance_min_mz=tolerance_min_mz,
+        )
+        matched = torch.abs(t_mzs.unsqueeze(1) - peak_mzs.unsqueeze(0))
+        matched = matched <= tolerances.unsqueeze(1)
+
+        target_events = logits.new_zeros(event_indices.shape[0])
+        for target_idx in range(t_mzs.shape[0]):
+            peak_match = matched[target_idx]
+            if not bool(peak_match.any()):
+                continue
+            matched_formulas = peak_formulas[peak_match]
+            peak_share = t_probs[target_idx] / matched_formulas.numel()
+            for formula_idx in matched_formulas:
+                formula_event_count = event_counts[formula_idx].clamp_min(1.0)
+                local_event_mask = local_event_formulas == formula_idx
+                target_events = target_events + torch.where(
+                    local_event_mask,
+                    peak_share / formula_event_count,
+                    target_events.new_zeros(target_events.shape),
+                )
+
+        assigned_mass = target_events.sum()
+        if float(assigned_mass.detach().cpu()) <= eps:
+            continue
+        target_events = target_events / assigned_mass.clamp_min(eps)
+        event_log_probs = torch.log_softmax(event_logits[event_indices], dim=0)
+        out[batch_idx] = torch.sum(
+            target_events * (torch.log(target_events.clamp_min(eps)) - event_log_probs)
+        )
+    return out
+
+
+def candidate_responsibility_kl_divergence(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    tolerance: float = 0.01,
+    relative: bool = False,
+    tolerance_min_mz: float = 200.0,
+    target_power: float = 1.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Train candidate logits with posterior responsibilities for matched peaks.
+
+    The binned decoupled KL only supervises aggregate mass per m/z bin. This
+    auxiliary term projects each measured peak onto the candidate peaks within
+    mass tolerance, assigns target mass to those candidates proportional to the
+    current detached model posterior, and applies a candidate-level KL against
+    the fragment-only probabilities. Candidates in the same bin but outside the
+    measured peak tolerance therefore receive direct negative pressure.
+    """
+    logits = pred['logits']
+    pred_mzs = pred['mzs'].to(device=logits.device, dtype=logits.dtype)
+    pred_batch = pred['batch'].to(device=logits.device).long()
+    target_mzs = batch['target_mz'].to(device=logits.device, dtype=logits.dtype)
+    target_values = batch['target_intensity'].to(
+        device=logits.device, dtype=logits.dtype
+    )
+    target_batch = batch['target_batch'].to(device=logits.device).long()
+    fragment_log_probs = _fragment_only_log_probs(pred)
+    batch_size = int(pred['batch_size'])
+    out = logits.sum() * 0.0 + logits.new_zeros(batch_size)
+    for batch_idx in range(batch_size):
+        p_mask = pred_batch == batch_idx
+        t_mask = target_batch == batch_idx
+        if not bool(p_mask.any()) or not bool(t_mask.any()):
+            continue
+
+        p_log_probs = fragment_log_probs[p_mask]
+        p_mzs = pred_mzs[p_mask]
+        t_mzs = target_mzs[t_mask]
+        t_probs = _target_probs(
+            target_values[t_mask], target_power=target_power, eps=eps
+        )
+        tolerances = _target_tolerances(
+            t_mzs,
+            tolerance=tolerance,
+            relative=relative,
+            tolerance_min_mz=tolerance_min_mz,
+        )
+        matched = torch.abs(t_mzs.unsqueeze(1) - p_mzs.unsqueeze(0))
+        matched = matched <= tolerances.unsqueeze(1)
+
+        target_candidates = logits.new_zeros(p_log_probs.shape)
+        detached_log_probs = p_log_probs.detach()
+        for target_idx in range(t_mzs.shape[0]):
+            candidate_match = matched[target_idx]
+            if not bool(candidate_match.any()):
+                continue
+            responsibilities = torch.softmax(
+                detached_log_probs[candidate_match],
+                dim=0,
+            )
+            target_candidates[candidate_match] = (
+                target_candidates[candidate_match]
+                + t_probs[target_idx] * responsibilities
+            )
+
+        assigned_mass = target_candidates.sum()
+        if float(assigned_mass.detach().cpu()) <= eps:
+            continue
+        target_distribution = target_candidates / assigned_mass.clamp_min(eps)
+        out[batch_idx] = assigned_mass * torch.sum(
+            target_distribution
+            * (torch.log(target_distribution.clamp_min(eps)) - p_log_probs)
+        )
+    return out
+
+
 def _loss_kl(
     pred: dict[str, Any],
     batch: dict[str, Any],
@@ -892,7 +1151,10 @@ def _loss_kl(
     """
     Loss-registry wrapper for sparse binned KL.
     """
-    return sparse_binned_kl_divergence(pred, batch, target_power=target_power).mean()
+    return _reduce_loss(
+        sparse_binned_kl_divergence(pred, batch, target_power=target_power),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_decoupled_kl(
@@ -905,11 +1167,86 @@ def _loss_decoupled_kl(
     """
     Loss-registry wrapper for decoupled fragment-shape KL and OOS KL.
     """
-    return decoupled_sparse_binned_kl_divergence(
+    return _reduce_loss(
+        decoupled_sparse_binned_kl_divergence(
+            pred,
+            batch,
+            target_power=target_power,
+        ),
+        reduction=_.get('reduction', 'mean'),
+    )
+
+
+def _loss_fiora_decoupled_kl(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    target_power: float,
+    coverage_weight: float,
+    mass_tolerance: float,
+    relative_mass_tolerance: bool,
+    mass_tolerance_min_mz: float,
+    **_: Any,
+) -> torch.Tensor:
+    """
+    Decoupled spectrum KL plus FIORA-like bond-event auxiliary KL.
+    """
+    reduction = _.get('reduction', 'mean')
+    spectrum = decoupled_sparse_binned_kl_divergence(
         pred,
         batch,
         target_power=target_power,
-    ).mean()
+    )
+    if coverage_weight <= 0.0:
+        return _reduce_loss(spectrum, reduction=reduction)
+    event_loss = fiora_bond_break_event_kl_divergence(
+        pred,
+        batch,
+        tolerance=mass_tolerance,
+        relative=relative_mass_tolerance,
+        tolerance_min_mz=mass_tolerance_min_mz,
+        target_power=target_power,
+    )
+    return _reduce_loss(
+        spectrum + float(coverage_weight) * event_loss,
+        reduction=reduction,
+    )
+
+
+def _loss_responsibility_decoupled_kl(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    target_power: float,
+    coverage_weight: float,
+    mass_tolerance: float,
+    relative_mass_tolerance: bool,
+    mass_tolerance_min_mz: float,
+    **_: Any,
+) -> torch.Tensor:
+    """
+    Decoupled spectrum KL plus candidate posterior-responsibility KL.
+    """
+    reduction = _.get('reduction', 'mean')
+    spectrum = decoupled_sparse_binned_kl_divergence(
+        pred,
+        batch,
+        target_power=target_power,
+    )
+    if coverage_weight <= 0.0:
+        return _reduce_loss(spectrum, reduction=reduction)
+    responsibility = candidate_responsibility_kl_divergence(
+        pred,
+        batch,
+        tolerance=mass_tolerance,
+        relative=relative_mass_tolerance,
+        tolerance_min_mz=mass_tolerance_min_mz,
+        target_power=target_power,
+    )
+    return _reduce_loss(
+        spectrum + float(coverage_weight) * responsibility,
+        reduction=reduction,
+    )
 
 
 def _loss_projected_kl(
@@ -922,9 +1259,10 @@ def _loss_projected_kl(
     """
     Loss-registry wrapper for projected sparse binned KL.
     """
-    return projected_sparse_binned_kl_divergence(
-        pred, batch, target_power=target_power
-    ).mean()
+    return _reduce_loss(
+        projected_sparse_binned_kl_divergence(pred, batch, target_power=target_power),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_soft_projected_kl(
@@ -939,13 +1277,16 @@ def _loss_soft_projected_kl(
     """
     Loss-registry wrapper for soft projected KL.
     """
-    return soft_projected_sparse_kl_divergence(
-        pred,
-        batch,
-        tolerance=mass_tolerance,
-        relative=relative_mass_tolerance,
-        tolerance_min_mz=mass_tolerance_min_mz,
-    ).mean()
+    return _reduce_loss(
+        soft_projected_sparse_kl_divergence(
+            pred,
+            batch,
+            tolerance=mass_tolerance,
+            relative=relative_mass_tolerance,
+            tolerance_min_mz=mass_tolerance_min_mz,
+        ),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_soft_binned_kl(
@@ -960,13 +1301,16 @@ def _loss_soft_binned_kl(
     """
     Loss-registry wrapper for soft binned KL.
     """
-    return soft_binned_kl_divergence(
-        pred,
-        batch,
-        tolerance=mass_tolerance,
-        relative=relative_mass_tolerance,
-        tolerance_min_mz=mass_tolerance_min_mz,
-    ).mean()
+    return _reduce_loss(
+        soft_binned_kl_divergence(
+            pred,
+            batch,
+            tolerance=mass_tolerance,
+            relative=relative_mass_tolerance,
+            tolerance_min_mz=mass_tolerance_min_mz,
+        ),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_soft_binned_coverage_kl(
@@ -982,14 +1326,17 @@ def _loss_soft_binned_coverage_kl(
     """
     Loss-registry wrapper for soft binned KL with coverage penalty.
     """
-    return soft_binned_coverage_kl_divergence(
-        pred,
-        batch,
-        tolerance=mass_tolerance,
-        relative=relative_mass_tolerance,
-        tolerance_min_mz=mass_tolerance_min_mz,
-        coverage_weight=coverage_weight,
-    ).mean()
+    return _reduce_loss(
+        soft_binned_coverage_kl_divergence(
+            pred,
+            batch,
+            tolerance=mass_tolerance,
+            relative=relative_mass_tolerance,
+            tolerance_min_mz=mass_tolerance_min_mz,
+            coverage_weight=coverage_weight,
+        ),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_fragnnet_ce(
@@ -1004,13 +1351,16 @@ def _loss_fragnnet_ce(
     """
     Loss-registry wrapper for FraGNNet-style sparse cross entropy.
     """
-    return fragnnet_sparse_cross_entropy(
-        pred,
-        batch,
-        tolerance=mass_tolerance,
-        relative=relative_mass_tolerance,
-        tolerance_min_mz=mass_tolerance_min_mz,
-    ).mean()
+    return _reduce_loss(
+        fragnnet_sparse_cross_entropy(
+            pred,
+            batch,
+            tolerance=mass_tolerance,
+            relative=relative_mass_tolerance,
+            tolerance_min_mz=mass_tolerance_min_mz,
+        ),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_cosine(
@@ -1021,7 +1371,28 @@ def _loss_cosine(
     """
     Loss-registry wrapper for direct binned cosine loss.
     """
-    return 1.0 - sparse_binned_cosine_similarity(pred, batch).mean()
+    return _reduce_loss(
+        1.0 - sparse_binned_cosine_similarity(pred, batch),
+        reduction=_.get('reduction', 'mean'),
+    )
+
+
+def _loss_fragment_cosine(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    **_: Any,
+) -> torch.Tensor:
+    """
+    Loss-registry wrapper for direct fragment-only binned cosine loss.
+
+    This ignores the OOS head entirely. It is intended for metric-aligned
+    fine-tuning after decoupled/OOS pretraining, where emitted peak quality is
+    the target and suppressing OOS should not consume gradient.
+    """
+    return _reduce_loss(
+        1.0 - sparse_fragment_only_binned_cosine_similarity(pred, batch),
+        reduction=_.get('reduction', 'mean'),
+    )
 
 
 def _loss_kl_cosine(
@@ -1036,9 +1407,46 @@ def _loss_kl_cosine(
     Loss-registry wrapper for weighted KL and cosine losses.
     """
     kl_weight = max(0.0, min(float(kl_weight), 1.0))
-    kl = sparse_binned_kl_divergence(pred, batch, target_power=target_power).mean()
-    cosine_loss = 1.0 - sparse_binned_cosine_similarity(pred, batch).mean()
-    return kl_weight * kl + (1.0 - kl_weight) * cosine_loss
+    reduction = _.get('reduction', 'mean')
+    kl = sparse_binned_kl_divergence(pred, batch, target_power=target_power)
+    cosine_loss = 1.0 - sparse_binned_cosine_similarity(pred, batch)
+    return _reduce_loss(
+        kl_weight * kl + (1.0 - kl_weight) * cosine_loss,
+        reduction=reduction,
+    )
+
+
+def _loss_decoupled_kl_cosine(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    kl_weight: float,
+    target_power: float,
+    **_: Any,
+) -> torch.Tensor:
+    """
+    Loss-registry wrapper for weighted decoupled KL and fragment-shape cosine losses.
+
+    The cosine component ignores OOS probability. The decoupled KL term already
+    supervises OOS mass, while standard cosine would reward suppressing OOS to
+    reduce the prediction norm.
+    """
+    kl_weight = max(0.0, min(float(kl_weight), 1.0))
+    reduction = _.get('reduction', 'mean')
+    kl = decoupled_sparse_binned_kl_divergence(
+        pred,
+        batch,
+        target_power=target_power,
+    )
+    cosine_loss = 1.0 - sparse_binned_cosine_similarity(
+        pred,
+        batch,
+        include_oos=False,
+    )
+    return _reduce_loss(
+        kl_weight * kl + (1.0 - kl_weight) * cosine_loss,
+        reduction=reduction,
+    )
 
 
 def _loss_sqrt_cosine(
@@ -1049,13 +1457,33 @@ def _loss_sqrt_cosine(
     """
     Loss-registry wrapper for square-root transformed cosine loss.
     """
-    return (
+    return _reduce_loss(
         1.0
         - sparse_binned_cosine_similarity(
             pred,
             batch,
             sqrt=True,
-        ).mean()
+        ),
+        reduction=_.get('reduction', 'mean'),
+    )
+
+
+def _loss_fragment_sqrt_cosine(
+    pred: dict[str, Any],
+    batch: dict[str, Any],
+    **_: Any,
+) -> torch.Tensor:
+    """
+    Loss-registry wrapper for square-root fragment-only binned cosine loss.
+    """
+    return _reduce_loss(
+        1.0
+        - sparse_fragment_only_binned_cosine_similarity(
+            pred,
+            batch,
+            sqrt=True,
+        ),
+        reduction=_.get('reduction', 'mean'),
     )
 
 
@@ -1071,7 +1499,7 @@ def _loss_tolerance_cosine(
     """
     Loss-registry wrapper for tolerance-based cosine loss.
     """
-    return (
+    return _reduce_loss(
         1.0
         - sparse_tolerance_cosine_similarity(
             pred,
@@ -1079,13 +1507,19 @@ def _loss_tolerance_cosine(
             tolerance=mass_tolerance,
             relative=relative_mass_tolerance,
             tolerance_min_mz=mass_tolerance_min_mz,
-        ).mean()
+        ),
+        reduction=_.get('reduction', 'mean'),
     )
 
 
 LOSS_REGISTRY: dict[str, LossSpec] = {
     'kl': LossSpec(_loss_kl, 'kl'),
     'decoupled_kl': LossSpec(_loss_decoupled_kl, 'decoupled_kl'),
+    'fiora_decoupled_kl': LossSpec(_loss_fiora_decoupled_kl, 'fiora_decoupled_kl'),
+    'responsibility_decoupled_kl': LossSpec(
+        _loss_responsibility_decoupled_kl,
+        'responsibility_decoupled_kl',
+    ),
     'projected_kl': LossSpec(_loss_projected_kl, 'projected_kl'),
     'soft_projected_kl': LossSpec(_loss_soft_projected_kl, 'soft_projected_kl'),
     'soft_binned_kl': LossSpec(_loss_soft_binned_kl, 'soft_binned_kl'),
@@ -1095,8 +1529,17 @@ LOSS_REGISTRY: dict[str, LossSpec] = {
     ),
     'fragnnet_ce': LossSpec(_loss_fragnnet_ce, 'fragnnet_ce'),
     'kl_cosine': LossSpec(_loss_kl_cosine, 'kl_cosine_loss'),
+    'decoupled_kl_cosine': LossSpec(
+        _loss_decoupled_kl_cosine,
+        'decoupled_kl_cosine_loss',
+    ),
     'cosine': LossSpec(_loss_cosine, 'cosine_loss'),
+    'fragment_cosine': LossSpec(_loss_fragment_cosine, 'fragment_cosine_loss'),
     'sqrt_cosine': LossSpec(_loss_sqrt_cosine, 'sqrt_cosine_loss'),
+    'fragment_sqrt_cosine': LossSpec(
+        _loss_fragment_sqrt_cosine,
+        'fragment_sqrt_cosine_loss',
+    ),
     'tolerance_cosine': LossSpec(_loss_tolerance_cosine, 'tolerance_cosine_loss'),
 }
 LOSS_NAMES = tuple(LOSS_REGISTRY.keys())

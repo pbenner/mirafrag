@@ -27,6 +27,7 @@ from mirafrag.data import (
 )
 from mirafrag.encoders import load_foundation_encoder
 from mirafrag.encoders.aimnet import AIMNET2_ATOMIC_NUMBERS, AIMNET2_R_MAX
+from mirafrag.encoders.small3d import SMALL3D_R_MAX
 from mirafrag.evaluation import support_diagnostics
 from mirafrag.fragments import (
     collate_fragment_candidates,
@@ -288,6 +289,11 @@ def _graph_config_from_static_encoder_config(
             atomic_numbers=tuple(AIMNET2_ATOMIC_NUMBERS),
             cutoff=float(AIMNET2_R_MAX),
         )
+    if config.encoder_type == 'small3d':
+        return GraphConfig(
+            atomic_numbers=tuple(AIMNET2_ATOMIC_NUMBERS),
+            cutoff=float(SMALL3D_R_MAX),
+        )
     return None
 
 
@@ -524,7 +530,17 @@ def _oracle_batch(
     rows = []
     for batch_idx, idx in enumerate(indices):
         row = dataset.df.iloc[idx]
-        mzs, intensities = parse_peaks(row)
+        precursor_mz = (
+            row.get(dataset.precursor_col)
+            if dataset.precursor_col is not None
+            else None
+        )
+        mzs, intensities = parse_peaks(
+            row,
+            precursor_mz=precursor_mz,
+            exclude_precursor=dataset.exclude_precursor_peaks,
+            precursor_tolerance=dataset.precursor_peak_tolerance,
+        )
         fragments.append(dataset._fragments(idx))
         target_mzs.append(torch.as_tensor(mzs, dtype=torch.get_default_dtype()))
         target_intensities.append(

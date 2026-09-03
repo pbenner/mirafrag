@@ -21,6 +21,7 @@ def save_checkpoint(
     model: MiraFragModel,
     *,
     train_config: dict[str, Any] | None = None,
+    graph_config: Any | None = None,
 ) -> None:
     """
     Write a strict MiraFrag state checkpoint.
@@ -34,7 +35,7 @@ def save_checkpoint(
         'model_state_dict': model.state_dict(),
         'mirafrag_config': asdict(model.config),
         'metadata_config': model.metadata_config.to_dict(),
-        'graph_config': asdict(infer_graph_config(model.encoder)),
+        'graph_config': asdict(graph_config or infer_graph_config(model.encoder)),
         'train_config': train_config or {},
     }
     torch.save(payload, path)
@@ -103,10 +104,33 @@ def _load_state_checkpoint_model(
         foundation_path=config.foundation_path,
         aimnet_model=config.aimnet_model,
         aimnet_path=config.aimnet_path,
+        unimol_model_name=config.unimol_model_name,
+        unimol_model_size=config.unimol_model_size,
+        unimol_pretrained_model_path=config.unimol_pretrained_model_path,
+        unimol_pretrained_dict_path=config.unimol_pretrained_dict_path,
+        unimol_max_atoms=config.unimol_max_atoms,
+        unimol_mode=config.unimol_mode,
         device=device,
     )
+    if (
+        config.encoder_type == 'unimol'
+        and getattr(config, 'unimol_mode', 'trainable') == 'trainable'
+        and hasattr(encoder, '_unimol_model')
+    ):
+        encoder._unimol_model()
     model = MiraFragModel(encoder, metadata_config=metadata_config, config=config).to(
         device
     )
-    model.load_state_dict(payload['model_state_dict'])
+    incompatible = model.load_state_dict(payload['model_state_dict'], strict=False)
+    allowed_missing_prefixes = ('head.formula_count_', 'head.fragnnet_dag_')
+    missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            'Error(s) in loading state_dict for MiraFragModel: '
+            f'missing={missing} unexpected={incompatible.unexpected_keys}'
+        )
     return model

@@ -14,6 +14,7 @@ from mirafrag.losses import (
     _bin_width_from_batch,
     _fragment_only_log_probs,
     _target_tolerances,
+    exclude_precursor_prediction_candidates,
     sparse_binned_cosine_similarity,
     sparse_decoupled_oos_probability,
     sparse_fragment_only_binned_cosine_similarity,
@@ -32,6 +33,8 @@ def evaluate_model(
     min_intensity: float = 0.001,
     top_k: int = 100,
     show_progress: bool = True,
+    exclude_precursor_peaks: bool = True,
+    precursor_peak_tolerance: float = 0.01,
     mass_tolerance: float = 0.01,
     relative_mass_tolerance: bool = False,
     mass_tolerance_min_mz: float = 200.0,
@@ -40,7 +43,7 @@ def evaluate_model(
     """
     Evaluate a MiraFrag model and return predictions plus summary metrics.
 
-    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result. ``probability_mode='decoupled'`` uses fragment-only probabilities and sigmoid OOS semantics for checkpoints trained with ``LOSS=decoupled_kl``.
+    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result. ``probability_mode='decoupled'`` uses fragment-only probabilities and sigmoid OOS semantics for checkpoints trained with ``LOSS in {decoupled_kl, fiora_decoupled_kl, responsibility_decoupled_kl, fragment_cosine, fragment_sqrt_cosine}``.
     """
     if probability_mode not in {'joint', 'decoupled'}:
         raise ValueError("probability_mode must be one of: 'joint', 'decoupled'.")
@@ -68,28 +71,39 @@ def evaluate_model(
     for raw_batch in progress:
         batch = move_batch_to_device(raw_batch, device)
         probs = model.predict_proba(batch)
+        scored_probs = (
+            exclude_precursor_prediction_candidates(
+                probs,
+                batch,
+                tolerance=precursor_peak_tolerance,
+            )
+            if exclude_precursor_peaks
+            else probs
+        )
         cos = sqrt_cos = diagnostics = None
         if 'target_mz' in batch:
             if probability_mode == 'decoupled':
-                cos = sparse_fragment_only_binned_cosine_similarity(probs, batch)
+                cos = sparse_fragment_only_binned_cosine_similarity(scored_probs, batch)
                 sqrt_cos = sparse_fragment_only_binned_cosine_similarity(
-                    probs,
+                    scored_probs,
                     batch,
                     sqrt=True,
                 )
                 cos_no_oos = cos
                 predicted_oos = sparse_decoupled_oos_probability(probs)
             else:
-                cos = sparse_binned_cosine_similarity(probs, batch)
-                sqrt_cos = sparse_binned_cosine_similarity(probs, batch, sqrt=True)
+                cos = sparse_binned_cosine_similarity(scored_probs, batch)
+                sqrt_cos = sparse_binned_cosine_similarity(
+                    scored_probs, batch, sqrt=True
+                )
                 cos_no_oos = sparse_binned_cosine_similarity(
-                    probs,
+                    scored_probs,
                     batch,
                     include_oos=False,
                 )
                 predicted_oos = sparse_oos_probability(probs)
             diagnostics = support_diagnostics(
-                probs,
+                scored_probs,
                 batch,
                 tolerance=mass_tolerance,
                 relative=relative_mass_tolerance,
@@ -112,11 +126,13 @@ def evaluate_model(
                 float(x) for x in diagnostics['oracle_tolerance_cosine'].detach().cpu()
             )
         sparse_rows = _sparse_prediction_rows(
-            probs,
+            scored_probs,
             bin_width=_bin_width_from_batch(batch),
             min_intensity=min_intensity,
             top_k=top_k,
             probability_mode=probability_mode,
+            precursor_mz=batch.get('precursor_mz') if exclude_precursor_peaks else None,
+            precursor_tolerance=precursor_peak_tolerance,
         )
 
         for i, smiles in enumerate(batch['smiles']):
@@ -190,7 +206,7 @@ def probability_mode_from_checkpoint_payload(payload: dict[str, Any]) -> str:
     """
     Select prediction probability semantics from checkpoint training metadata.
 
-    Checkpoints trained with ``LOSS=decoupled_kl`` use a fragment-only softmax
+    Checkpoints trained with ``LOSS in {decoupled_kl, fiora_decoupled_kl, responsibility_decoupled_kl, fragment_cosine, fragment_sqrt_cosine}`` use a fragment-only softmax
     plus a sigmoid OOS head. Older and standard-loss checkpoints retain the
     joint fragment-plus-OOS softmax semantics.
     """
@@ -200,7 +216,13 @@ def probability_mode_from_checkpoint_payload(payload: dict[str, Any]) -> str:
     mode = train_config.get('prediction_probability_mode')
     if mode in {'joint', 'decoupled'}:
         return str(mode)
-    if train_config.get('loss') == 'decoupled_kl':
+    if train_config.get('loss') in {
+        'decoupled_kl',
+        'fiora_decoupled_kl',
+        'responsibility_decoupled_kl',
+        'fragment_cosine',
+        'fragment_sqrt_cosine',
+    }:
         return 'decoupled'
     return 'joint'
 
@@ -322,6 +344,8 @@ def _sparse_prediction_rows(
     min_intensity: float,
     top_k: int,
     probability_mode: str = 'joint',
+    precursor_mz: torch.Tensor | None = None,
+    precursor_tolerance: float = 0.01,
 ) -> list[dict[str, list[float]]]:
     """
     Convert sparse fragment probabilities into exported peak lists.
@@ -347,6 +371,17 @@ def _sparse_prediction_rows(
             bins[mask],
             values[mask],
         )
+        if precursor_mz is not None and batch_values.numel() > 0:
+            precursor = float(precursor_mz[batch_idx].detach().cpu())
+            if precursor > 0:
+                batch_mzs_for_filter = (
+                    batch_bins.to(dtype=batch_values.dtype) + 0.5
+                ) * float(bin_width)
+                keep = torch.abs(batch_mzs_for_filter - precursor) > float(
+                    precursor_tolerance
+                )
+                batch_bins = batch_bins[keep]
+                batch_values = batch_values[keep]
         if top_k is not None and top_k > 0 and top_k < batch_values.numel():
             batch_values, top_idx = torch.topk(batch_values, k=top_k)
             batch_bins = batch_bins[top_idx]
