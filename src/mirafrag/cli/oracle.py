@@ -27,7 +27,6 @@ from mirafrag.data import (
 )
 from mirafrag.encoders import load_foundation_encoder
 from mirafrag.encoders.aimnet import AIMNET2_ATOMIC_NUMBERS, AIMNET2_R_MAX
-from mirafrag.encoders.small3d import SMALL3D_R_MAX
 from mirafrag.evaluation import support_diagnostics
 from mirafrag.fragments import (
     collate_fragment_candidates,
@@ -288,11 +287,6 @@ def _graph_config_from_static_encoder_config(
         return GraphConfig(
             atomic_numbers=tuple(AIMNET2_ATOMIC_NUMBERS),
             cutoff=float(AIMNET2_R_MAX),
-        )
-    if config.encoder_type == 'small3d':
-        return GraphConfig(
-            atomic_numbers=tuple(AIMNET2_ATOMIC_NUMBERS),
-            cutoff=float(SMALL3D_R_MAX),
         )
     return None
 

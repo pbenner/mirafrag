@@ -26,7 +26,6 @@ from mirafrag.data import (
     filter_supported_elements,
     find_column,
     normalize_collision_energy_dataframe,
-    parse_physical_bond_feature_columns,
     read_table,
     select_split,
 )
@@ -81,16 +80,6 @@ def parse_args() -> argparse.Namespace:
         '--disk-cache-dir',
         default=None,
         help='Optional disk cache for precomputed encoder graphs and fragments.',
-    )
-    parser.add_argument(
-        '--physical-bond-features-path',
-        default=None,
-        help='CSV sidecar from cid-physical-features for checkpoints trained with physical bond features.',
-    )
-    parser.add_argument(
-        '--physical-bond-feature-columns',
-        default=None,
-        help='Override physical bond sidecar columns; defaults to checkpoint columns.',
     )
     parser.add_argument('--min-intensity', type=float, default=0.001)
     parser.add_argument('--top-k', type=int, default=100)
@@ -226,18 +215,6 @@ def main() -> None:
         print(
             'Collision-energy preprocessing: normalized from checkpoint metadata stats'
         )
-    physical_bond_features = bool(
-        getattr(model.config, 'physical_bond_features', False)
-    )
-    physical_bond_feature_columns = (
-        parse_physical_bond_feature_columns(args.physical_bond_feature_columns)
-        if args.physical_bond_feature_columns is not None
-        else tuple(getattr(model.config, 'physical_bond_feature_columns', ()) or ())
-    )
-    if physical_bond_features and not args.physical_bond_features_path:
-        raise SystemExit(
-            'Checkpoint uses physical bond features; pass --physical-bond-features-path.'
-        )
     ds = BinnedSpectrumDataset(
         df,
         graph_config=graph_config,
@@ -251,10 +228,6 @@ def main() -> None:
         fragment_support_profile=fragment_support_profile_from_model_config(
             model.config
         ),
-        physical_bond_features_path=args.physical_bond_features_path
-        if physical_bond_features
-        else None,
-        physical_bond_feature_columns=physical_bond_feature_columns,
     )
     if args.disk_cache_dir is not None:
         prefill_feature_cache(

@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--foundation-path', default=None)
     parser.add_argument(
         '--encoder',
-        choices=['mace', 'aimnet', 'unimol', 'small3d'],
+        choices=['mace', 'aimnet', 'unimol'],
         default='mace',
         help='Foundation atom encoder.',
     )
@@ -104,15 +104,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--fragment-isotope-threshold', type=float, default=None)
     parser.add_argument('--max-fragment-isotope-peaks', type=int, default=None)
     parser.add_argument(
-        '--fragment-bond-break-layers',
-        type=int,
-        default=None,
-        help=(
-            'Include fragment cut-bond provenance in cache entries when positive; '
-            'matches training --fragment-bond-break-layers.'
-        ),
-    )
-    parser.add_argument(
         '--fragment-action-primary-layers',
         type=int,
         default=None,
@@ -135,15 +126,6 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help='Deprecated alias for --bond-break-geometry-features.',
-    )
-    parser.add_argument(
-        '--fragment-action-bond-gnn-layers',
-        type=int,
-        default=None,
-        help=(
-            'Include fragment cut-bond provenance in cache entries when positive; '
-            'matches training --fragment-action-bond-gnn-layers.'
-        ),
     )
     parser.add_argument(
         '--splits',
@@ -200,20 +182,10 @@ def main() -> None:
     """
     args = parse_args()
     if (
-        args.fragment_bond_break_layers is not None
-        and args.fragment_bond_break_layers < 0
-    ):
-        raise SystemExit('--fragment-bond-break-layers must be nonnegative.')
-    if (
         args.fragment_action_primary_layers is not None
         and args.fragment_action_primary_layers < 0
     ):
         raise SystemExit('--fragment-action-primary-layers must be nonnegative.')
-    if (
-        args.fragment_action_bond_gnn_layers is not None
-        and args.fragment_action_bond_gnn_layers < 0
-    ):
-        raise SystemExit('--fragment-action-bond-gnn-layers must be nonnegative.')
     quiet_rdkit_logs()
     device = 'cpu' if args.device == 'auto' else resolve_device(args.device)
 
@@ -438,11 +410,7 @@ def _fragment_config_from_args(args: argparse.Namespace) -> FragmentConfig:
             args.max_fragment_isotope_peaks,
             default.max_isotope_peaks,
         ),
-        include_bond_breaks=bool(
-            (args.fragment_bond_break_layers or 0) > 0
-            or (args.fragment_action_primary_layers or 0) > 0
-            or (args.fragment_action_bond_gnn_layers or 0) > 0
-        ),
+        include_bond_breaks=bool((args.fragment_action_primary_layers or 0) > 0),
     )
 
 

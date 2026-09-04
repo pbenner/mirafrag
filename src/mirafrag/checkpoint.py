@@ -122,7 +122,7 @@ def _load_state_checkpoint_model(
         device
     )
     incompatible = model.load_state_dict(payload['model_state_dict'], strict=False)
-    allowed_missing_prefixes = ('head.formula_count_', 'head.fragnnet_dag_')
+    allowed_missing_prefixes = ('head.formula_count_',)
     missing = [
         key
         for key in incompatible.missing_keys

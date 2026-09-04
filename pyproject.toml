@@ -42,10 +42,8 @@ all = [
 [project.scripts]
 mirafrag-train = "mirafrag.cli.train:main"
 mirafrag-eval = "mirafrag.cli.eval:main"
-mirafrag-retrieval-eval = "mirafrag.cli.retrieval_eval:main"
 mirafrag-predict = "mirafrag.cli.predict:main"
 mirafrag-cache = "mirafrag.cli.cache:main"
-mirafrag-physical-sidecar-manifest = "mirafrag.cli.physical_sidecar_manifest:main"
 
 [tool.uv]
 conflicts = [

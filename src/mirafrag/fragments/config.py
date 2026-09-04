@@ -78,10 +78,7 @@ def fragment_config_from_model_config(config: Any) -> FragmentConfig:
         isotope_threshold=config.fragment_isotope_threshold,
         max_isotope_peaks=config.max_fragment_isotope_peaks,
         include_bond_breaks=bool(
-            getattr(config, 'fragment_bond_break_layers', 0) > 0
-            or getattr(config, 'fragment_action_primary_layers', 0) > 0
-            or getattr(config, 'fragment_action_bond_gnn_layers', 0) > 0
-            or getattr(config, 'physical_bond_features', False)
+            getattr(config, 'fragment_action_primary_layers', 0) > 0
         ),
     )
 

@@ -71,37 +71,6 @@ from tests.helpers import (
 )
 
 
-def test_state_checkpoint_loads_without_fragnnet_dag_parameters(monkeypatch):
-    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
-    old_config = MiraFragConfig(num_bins=16, hidden_dim=8, metadata_dim=4)
-    old_model = MiraFragModel(FakeMace(), metadata_config=metadata, config=old_config)
-    new_config = MiraFragConfig(
-        num_bins=16,
-        hidden_dim=8,
-        metadata_dim=4,
-        fragnnet_dag_layers=1,
-    )
-    payload = {
-        'checkpoint_format': checkpoint_module.CHECKPOINT_FORMAT,
-        'model_state_dict': old_model.state_dict(),
-        'mirafrag_config': asdict(new_config),
-        'metadata_config': metadata.to_dict(),
-        'train_config': {},
-    }
-
-    monkeypatch.setattr(
-        checkpoint_module,
-        'load_foundation_encoder',
-        lambda **_kwargs: FakeMace(),
-    )
-
-    loaded = checkpoint_module._load_state_checkpoint_model(payload, device='cpu')
-
-    assert isinstance(loaded, MiraFragModel)
-    assert loaded.config.fragnnet_dag_layers == 1
-    assert len(loaded.head.fragnnet_dag_message_layers) == 1
-
-
 def test_state_checkpoint_loads_without_formula_count_parameters(monkeypatch):
     metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
     config = MiraFragConfig(num_bins=16, hidden_dim=8, metadata_dim=4)
@@ -129,38 +98,6 @@ def test_state_checkpoint_loads_without_formula_count_parameters(monkeypatch):
 
     assert isinstance(loaded, MiraFragModel)
     assert loaded.head.formula_count_encoder[-1].weight.abs().sum().item() == 0.0
-
-
-def test_mirafrag_forward_with_fragnnet_dag_scorer():
-    graph_config = GraphConfig(atomic_numbers=(1, 6, 8), cutoff=5.0, seed=7)
-    metadata = MetadataConfig(adduct_to_idx={'[M+H]+': 0}, instrument_to_idx={'HCD': 0})
-    dataset = BinnedSpectrumDataset(
-        _tiny_training_df(),
-        graph_config=graph_config,
-        metadata_config=metadata,
-        mz_max=64.0,
-        bin_width=1.0,
-        include_fragments=True,
-        fragment_config=FragmentConfig(max_tree_depth=2, max_fragments=16),
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=2,
-        shuffle=False,
-        collate_fn=collate_spectrum_batch,
-    )
-    config = MiraFragConfig(
-        num_bins=64,
-        hidden_dim=8,
-        metadata_dim=4,
-        fragnnet_dag_layers=2,
-    )
-    model = MiraFragModel(FakeMace(), metadata_config=metadata, config=config)
-    pred = model(next(iter(loader)))
-
-    assert pred['kind'] == 'sparse'
-    assert pred['logits'].shape == pred['mzs'].shape
-    assert pred['oos_logits'].shape == (2,)
 
 
 def test_mirafrag_forward_with_fake_mace():
@@ -588,110 +525,6 @@ def test_fragment_path_gradients_stay_finite_with_unreachable_frontier_nodes():
             assert torch.isfinite(param.grad).all()
 
 
-def test_fragment_action_bond_gnn_branch_preserves_initial_head_predictions():
-    config = MiraFragConfig(
-        num_bins=16,
-        hidden_dim=8,
-        metadata_dim=4,
-        dropout=0.0,
-        fragment_gnn_layers=1,
-    )
-    gnn_config = MiraFragConfig(
-        num_bins=16,
-        hidden_dim=8,
-        metadata_dim=4,
-        dropout=0.0,
-        fragment_gnn_layers=1,
-        fragment_action_bond_gnn_layers=2,
-    )
-    node_feats = torch.randn(4, 5)
-    metadata_features = torch.randn(1, 10)
-    graph_batch = torch.zeros(4, dtype=torch.long)
-    fragments = {
-        'batch': torch.zeros(3, dtype=torch.long),
-        'formula_batch': torch.zeros(3, dtype=torch.long),
-        'atom_index': torch.tensor([0, 1, 2], dtype=torch.long),
-        'atom_ptr': torch.tensor([0, 1, 2, 3], dtype=torch.long),
-        'features': torch.randn(3, 6),
-        'edge_index': torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
-        'edge_attr': torch.zeros(2, FRAGMENT_EDGE_FEATURE_DIM),
-        'formula_index': torch.tensor([0, 1, 2], dtype=torch.long),
-        'mz': torch.tensor([10.0, 20.0, 30.0]),
-        'bin': torch.tensor([10, 20, 30], dtype=torch.long),
-        'log_prior': torch.zeros(3),
-        'bond_atom_index': torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long),
-        'bond_ptr': torch.tensor([0, 1, 3, 3], dtype=torch.long),
-        'bond_features': torch.rand(3, BOND_BREAK_FEATURE_DIM),
-    }
-
-    torch.manual_seed(23)
-    base_head = FragmentSpectrumHead(config)
-    torch.manual_seed(23)
-    gnn_head = FragmentSpectrumHead(gnn_config)
-    torch.manual_seed(29)
-    base_pred = base_head(node_feats, fragments, metadata_features, graph_batch)
-    torch.manual_seed(29)
-    gnn_pred = gnn_head(node_feats, fragments, metadata_features, graph_batch)
-
-    assert torch.allclose(gnn_pred['logits'], base_pred['logits'])
-    assert torch.allclose(gnn_pred['oos_logits'], base_pred['oos_logits'])
-
-
-def test_fragment_action_bond_gnn_residual_can_change_multibreak_scores():
-    config = MiraFragConfig(
-        num_bins=16,
-        hidden_dim=8,
-        metadata_dim=4,
-        dropout=0.0,
-        fragment_action_bond_gnn_layers=1,
-    )
-    head = FragmentSpectrumHead(config)
-    node_feats = torch.randn(4, 5)
-    formula_features = torch.randn(3, 8)
-    context_features = torch.randn(3, 8)
-    collision_features = torch.randn(3, 8)
-    fragment_descriptor = torch.randn(3, 6)
-    formula_batch = torch.zeros(3, dtype=torch.long)
-    base_logits = torch.tensor([0.1, -0.2, 0.3])
-    fragments = {
-        'bond_atom_index': torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long),
-        'bond_ptr': torch.tensor([0, 1, 3, 3], dtype=torch.long),
-        'bond_features': torch.rand(3, BOND_BREAK_FEATURE_DIM),
-    }
-
-    delta = head._fragment_action_bond_gnn_delta(
-        node_feats,
-        formula_features,
-        context_features,
-        collision_features,
-        fragment_descriptor,
-        fragments,
-        formula_batch,
-        batch_size=1,
-        base_logits=base_logits,
-    )
-    assert torch.allclose(delta, torch.zeros_like(delta))
-
-    final_layer = head.fragment_action_bond_gnn_residual[-1]
-    assert isinstance(final_layer, nn.Linear)
-    nn.init.ones_(final_layer.weight)
-    nn.init.zeros_(final_layer.bias)
-    delta = head._fragment_action_bond_gnn_delta(
-        node_feats,
-        formula_features,
-        context_features,
-        collision_features,
-        fragment_descriptor,
-        fragments,
-        formula_batch,
-        batch_size=1,
-        base_logits=base_logits,
-    )
-
-    assert torch.isfinite(delta).all()
-    assert not torch.allclose(delta, torch.zeros_like(delta))
-
-
 def test_fragment_path_branch_preserves_initial_head_predictions():
     config = MiraFragConfig(
         num_bins=16,
@@ -885,41 +718,6 @@ def test_model_uses_instrument_specific_collision_energy_scaling():
     )
     assert torch.allclose(features[:, 0], torch.tensor([0.5, 0.5]))
     assert torch.allclose(features[:, 1], torch.tensor([1.0, 2.0]))
-
-
-def test_metadata_ce_interaction_is_zero_initialized_noop():
-    metadata = MetadataConfig(
-        adduct_to_idx={'[M+H]+': 0},
-        instrument_to_idx={'HCD': 0, 'CID': 1},
-        precursor_mz_max=100.0,
-        collision_energy_center=50.0,
-        collision_energy_scale=10.0,
-    )
-    config = MiraFragConfig(
-        num_bins=16,
-        hidden_dim=8,
-        metadata_dim=4,
-        metadata_ce_interaction=True,
-    )
-    model = MiraFragModel(FakeMace(), metadata_config=metadata, config=config)
-
-    assert model.metadata_ce_interaction is not None
-    assert torch.count_nonzero(model.metadata_ce_interaction.weight).item() == 0
-    assert torch.count_nonzero(model.metadata_ce_interaction.bias).item() == 0
-
-    batch = {
-        'precursor_mz': torch.tensor([50.0, 75.0]),
-        'collision_energy': torch.tensor([60.0, 70.0]),
-        'adduct': torch.tensor([0, 0]),
-        'instrument_type': torch.tensor([0, 1]),
-    }
-    features = model.metadata_features(batch)
-    expected_dim = 2 + 2 * config.metadata_dim
-    assert features.shape == (2, expected_dim)
-    assert torch.allclose(
-        features[:, -config.metadata_dim :],
-        model.instrument_embedding(batch['instrument_type']),
-    )
 
 
 def test_lazy_unimol_parameters_follow_fine_tune_strategy():

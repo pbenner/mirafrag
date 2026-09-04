@@ -5,7 +5,6 @@ from torch import nn
 
 from mirafrag.encoders.aimnet import AimnetNodeEncoder, load_aimnet_encoder
 from mirafrag.encoders.mace import load_mace_encoder, repair_mace_cuequivariance_config
-from mirafrag.encoders.small3d import Small3DNodeEncoder, load_small3d_encoder
 from mirafrag.encoders.unimol import UniMolNodeEncoder, load_unimol_encoder
 
 
@@ -30,11 +29,8 @@ def load_foundation_encoder(
 
     The returned module must expose ``atomic_numbers`` and ``r_max`` and return
     per-atom ``node_feats`` when called by :class:`MiraFragModel`. Supported
-    encoder families are MACE, AIMNet, Uni-Mol, and the compact ``small3d``
-    encoder.
+    encoder families are MACE, AIMNet, and Uni-Mol.
     """
-    if encoder_type == 'small3d':
-        return load_small3d_encoder(device=device)
     if encoder_type == 'mace':
         return load_mace_encoder(
             source=foundation_source,
@@ -59,19 +55,16 @@ def load_foundation_encoder(
             device=device,
         )
     raise ValueError(
-        'Unknown encoder_type '
-        f'{encoder_type!r}; expected one of: mace, aimnet, unimol, small3d.'
+        f'Unknown encoder_type {encoder_type!r}; expected one of: mace, aimnet, unimol.'
     )
 
 
 __all__ = [
     'AimnetNodeEncoder',
-    'Small3DNodeEncoder',
     'UniMolNodeEncoder',
     'load_aimnet_encoder',
     'load_foundation_encoder',
     'load_mace_encoder',
-    'load_small3d_encoder',
     'load_unimol_encoder',
     'repair_mace_cuequivariance_config',
 ]

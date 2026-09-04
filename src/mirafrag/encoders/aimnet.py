@@ -56,7 +56,6 @@ class AimnetNodeEncoder(nn.Module):
             train=True,
         )
         self.model = self.calculator.model
-        self.export_multipass_features = False
         self.node_feature_dim = self._infer_node_feature_dim()
         metadata = self.calculator.metadata or {}
         atomic_numbers = tuple(
@@ -160,9 +159,7 @@ class AimnetNodeEncoder(nn.Module):
             'mol_idx': batch,
         }
         prepared = self.calculator.prepare_input(data)
-        if self.export_multipass_features:
-            out = self._forward_with_multipass_features(prepared)
-        elif isinstance(self.model, torch.jit.ScriptModule):
+        if isinstance(self.model, torch.jit.ScriptModule):
             with torch.jit.optimized_execution(False):  # type: ignore[attr-defined]
                 out = self.model(prepared)
         else:
@@ -171,118 +168,7 @@ class AimnetNodeEncoder(nn.Module):
             raise RuntimeError(
                 'AIMNet model did not return hidden atom features `aim`.'
             )
-        num_atoms = positions.shape[0]
-        result = {'node_feats': out['aim'][:num_atoms]}
-        charge_features = self._charge_features(out, num_atoms=num_atoms)
-        if charge_features is not None:
-            result['aimnet_charge_features'] = charge_features
-        multipass_features = out.get('aimnet_multipass_features')
-        if multipass_features is not None:
-            result['aimnet_multipass_features'] = multipass_features[:num_atoms]
-        return result
-
-    def _forward_with_multipass_features(
-        self, data: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """
-        Run AIMNet2 while retaining intermediate atom states before final pooling.
-        """
-        model = self.model
-        required = (
-            'prepare_input',
-            'afv',
-            'aev',
-            'mlps',
-            '_prepare_in_a',
-            '_prepare_in_q',
-            '_update_q',
-        )
-        if isinstance(model, torch.jit.ScriptModule) or not all(
-            hasattr(model, name) for name in required
-        ):
-            raise RuntimeError(
-                'AIMNet multipass features require an eager AIMNet2 model; '
-                'scripted or unsupported AIMNet variants do not expose intermediate states.'
-            )
-
-        data = model.prepare_input(data)
-        a = model.afv(data['numbers'])
-        if getattr(model, 'd2features', False):
-            a = a.unflatten(-1, (model.nfeature, model.nshifts_s))
-        data['a'] = a
-
-        if getattr(model, 'num_charge_channels', 1) == 2:
-            data = model._preprocess_spin_polarized_charge(data)
-        else:
-            data['charge'] = data['charge'].unsqueeze(-1)
-
-        data = model.aev(data)
-        states: list[torch.Tensor] = []
-        num_passes = len(model.mlps)
-        for pass_idx, mlp in enumerate(model.mlps):
-            if pass_idx == 0:
-                mlp_input = model._prepare_in_a(data)
-            else:
-                mlp_input = torch.cat(
-                    [model._prepare_in_a(data), model._prepare_in_q(data)], dim=-1
-                )
-            mlp_output = mlp(mlp_input)
-            if data['_input_padded'].item():
-                from aimnet import nbops
-
-                mlp_output = nbops.mask_i_(mlp_output, data, mask_value=0.0)
-
-            if pass_idx == 0:
-                data = model._update_q(data, mlp_output, delta_q=False)
-                states.append(data['a'].flatten(-2, -1))
-            elif pass_idx < num_passes - 1:
-                data = model._update_q(data, mlp_output, delta_q=True)
-                states.append(data['a'].flatten(-2, -1))
-            else:
-                data['aim'] = mlp_output
-                states.append(mlp_output)
-
-        if getattr(model, 'num_charge_channels', 1) == 2:
-            data = model._postprocess_spin_polarized_charge(data)
-        else:
-            data['charges'] = data['charges'].squeeze(-1)
-            data['charge'] = data['charge'].squeeze(-1)
-
-        for module in model.outputs.children():
-            data = module(data)
-
-        data['aimnet_multipass_features'] = torch.cat(states, dim=-1)
-        return data
-
-    @staticmethod
-    def _charge_features(
-        out: dict[str, torch.Tensor],
-        *,
-        num_atoms: int,
-    ) -> torch.Tensor | None:
-        """
-        Return fixed-width AIMNet charge channels aligned to real input atoms.
-        """
-        charges = out.get('charges')
-        if charges is None:
-            return None
-        charges = charges[:num_atoms].reshape(num_atoms, 1)
-        pre_charges = out.get('charges_pre')
-        if pre_charges is None:
-            pre = torch.zeros_like(charges)
-        else:
-            pre = pre_charges[:num_atoms].reshape(num_atoms, 1)
-        return torch.cat(
-            [
-                charges,
-                charges.abs(),
-                charges.clamp_min(0.0),
-                (-charges).clamp_min(0.0),
-                pre,
-                charges - pre,
-            ],
-            dim=-1,
-        )
+        return {'node_feats': out['aim'][: positions.shape[0]]}
 
     def _device(self) -> torch.device:
         """

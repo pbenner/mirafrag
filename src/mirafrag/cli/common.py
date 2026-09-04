@@ -18,11 +18,9 @@ BASE_FRAGMENT_CONFIG_ARG_FIELDS = (
     'include_fragment_isotopes',
     'fragment_isotope_threshold',
     'max_fragment_isotope_peaks',
-    'fragment_bond_break_layers',
     'fragment_action_primary_layers',
     'bond_break_geometry_features',
     'fragment_action_geometry_features',
-    'fragment_action_bond_gnn_layers',
 )
 HIGH_CE_FRAGMENT_CONFIG_ARG_FIELDS = (
     'high_ce_fragment_threshold',
@@ -113,9 +111,7 @@ def apply_fragment_args_to_model_config(config, args) -> None:
     """
     Apply safe fragment-candidate overrides to a model config.
 
-    Candidate-generation settings are updated directly. ``fragment_bond_break_layers``
-    is accepted here because it toggles cached bond-break provenance used by
-    optional head/loss experiments.
+    Candidate-generation settings are updated directly.
     """
     for field_name in FRAGMENT_CONFIG_ARG_FIELDS:
         value = getattr(args, field_name, None)

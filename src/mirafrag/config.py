@@ -32,42 +32,9 @@ class MiraFragConfig:
     fragment_gnn_layers: int = 2
     fragment_path_layers: int = 0
     fragment_path_primary: bool = False
-    fragment_action_path_layers: int = 0
     fragment_action_primary_layers: int = 0
-    fragment_action_primary_ce_gate: bool = False
     bond_break_geometry_features: bool = False
-    fragment_action_geometry_features: bool = False
-    fragment_action_bond_gnn_layers: int = 0
-    fragment_bond_break_layers: int = 0
-    physical_bond_features: bool = False
-    physical_bond_feature_columns: tuple[str, ...] = ()
-    fragnnet_dag_layers: int = 0
-    fragnnet_dag_num_hs: int = 4
-    ce_basis_features: bool = False
     ce_embedding: str = 'scalar'
-    ce_fourier_frequencies: int = 8
-    aimnet_charge_features: bool = False
-    aimnet_multipass_features: bool = False
-    encoder_bond_adapter_layers: int = 0
-    encoder_bond_adapter_feature_dim: int = 128
-    encoder_bond_adapter_dropout: float = 0.0
-    encoder_metadata_adapter_layers: int = 0
-    encoder_metadata_adapter_feature_dim: int = 128
-    encoder_metadata_adapter_dropout: float = 0.0
-    metadata_ce_interaction: bool = False
-    candidate_transformer_layers: int = 0
-    candidate_transformer_heads: int = 8
-    candidate_transformer_max_tokens: int = 256
-    conditional_expert_heads: int = 1
-    conditional_expert_hidden_dim: int = 128
-    conditional_expert_dropout: float = 0.0
-    candidate_suppression_gate_hidden_dim: int = 0
-    candidate_suppression_gate_dropout: float = 0.0
-    candidate_suppression_gate_initial_penalty: float = 1e-6
-    molecule_descriptor_features: bool = False
-    molecule_descriptor_hidden_dim: int = 128
-    molecule_descriptor_dropout: float = 0.0
-    retrieval_calibration_head: bool = False
     encoder_type: str = 'mace'
     encoder_finetune_strategy: str = 'head'
     foundation_source: str = 'off'
@@ -91,6 +58,39 @@ _LEGACY_EXPERIMENTAL_FIELDS = {
     'aimnet_adapter_feature_dim',
     'aimnet_adapter_dropout',
     'fragment_transition_features',
+    'fragment_action_path_layers',
+    'fragment_action_primary_ce_gate',
+    'fragment_action_geometry_features',
+    'fragment_action_bond_gnn_layers',
+    'fragment_bond_break_layers',
+    'physical_bond_features',
+    'physical_bond_feature_columns',
+    'fragnnet_dag_layers',
+    'fragnnet_dag_num_hs',
+    'ce_basis_features',
+    'ce_fourier_frequencies',
+    'aimnet_charge_features',
+    'aimnet_multipass_features',
+    'encoder_bond_adapter_layers',
+    'encoder_bond_adapter_feature_dim',
+    'encoder_bond_adapter_dropout',
+    'encoder_metadata_adapter_layers',
+    'encoder_metadata_adapter_feature_dim',
+    'encoder_metadata_adapter_dropout',
+    'metadata_ce_interaction',
+    'candidate_transformer_layers',
+    'candidate_transformer_heads',
+    'candidate_transformer_max_tokens',
+    'conditional_expert_heads',
+    'conditional_expert_hidden_dim',
+    'conditional_expert_dropout',
+    'candidate_suppression_gate_hidden_dim',
+    'candidate_suppression_gate_dropout',
+    'candidate_suppression_gate_initial_penalty',
+    'molecule_descriptor_features',
+    'molecule_descriptor_hidden_dim',
+    'molecule_descriptor_dropout',
+    'retrieval_calibration_head',
 }
 
 
