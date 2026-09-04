@@ -867,19 +867,6 @@ class FragmentSpectrumHead(nn.Module):
         )
         return self.fragment_action_primary_residual(residual_inputs).squeeze(-1)
 
-    def _fragment_action_primary_ce_gate_logit(
-        self,
-        collision_features: torch.Tensor,
-        *,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        gate = getattr(self, 'fragment_action_primary_ce_gate', None)
-        if gate is None:
-            return collision_features.new_zeros(
-                collision_features.shape[0], 1, dtype=dtype
-            )
-        return gate(collision_features).to(dtype=dtype)
-
     def _materialize_empty_fragment_action_primary_scorer(
         self,
         node_feats: torch.Tensor,
