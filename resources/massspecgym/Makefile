@@ -14,9 +14,9 @@ PYTHONPATH := $(ROOT)/src
 INPUT ?= $(RESOURCE_DIR)/data/MassSpecGym.tsv
 PREDICT_INPUT ?= $(RESOURCE_DIR)/data/molecules.csv
 MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
+MSNLIB_ACTION_GEOMETRY_MODEL ?= $(ROOT)/resources/msnlib/checkpoints/mirafrag_msnlib_unimol_action_geometry.pt
+SCRATCH_ACTION_GEOMETRY_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_scratch.pt
 INIT_MODEL ?=
-DELTA_INIT_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
-DELTA_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_delta.pt
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 STRATIFIED_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_stratified_eval.csv
 PREDICT_OUTPUT ?= $(RESOURCE_DIR)/predictions/mirafrag_predictions.csv
@@ -359,7 +359,7 @@ ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-finetune eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-action-geometry-scratch train-from-msnlib-geometry train-finetune eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
 
 
 help:
@@ -372,7 +372,8 @@ help:
 		'  make prepare-retrieval-candidates Download official retrieval candidates' \
 		'  make prepare-cache       Precompute graph/fragment feature cache' \
 		'  make train-finetune      Same as train, with explicit fine-tune target name' \
-		'  make         Continue DELTA_INIT_MODEL with delta fine-tuning' \
+		'  make train-action-geometry-scratch  Train the retained action-geometry model from scratch' \
+		'  make train-from-msnlib-geometry  Reproduce the current best MSnLib-to-MassSpecGym transfer' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
 		'  make eval-stratified    Evaluate checkpoint and group metrics by metadata' \
 		'  make gap-diagnostics    Analyze validation/test gap by train-nearest chemistry' \
@@ -387,8 +388,8 @@ help:
 		'  INPUT=$(INPUT)' \
 		'  MODEL=$(MODEL)' \
 		'  INIT_MODEL=$(INIT_MODEL)' \
-		'  DELTA_INIT_MODEL=$(DELTA_INIT_MODEL)' \
-		'  DELTA_MODEL=$(DELTA_MODEL)' \
+		'  MSNLIB_ACTION_GEOMETRY_MODEL=$(MSNLIB_ACTION_GEOMETRY_MODEL)' \
+		'  SCRATCH_ACTION_GEOMETRY_MODEL=$(SCRATCH_ACTION_GEOMETRY_MODEL)' \
 		'  DISK_CACHE_DIR=$(DISK_CACHE_DIR)' \
 		'  CACHE_SOURCE_MODEL=$(CACHE_SOURCE_MODEL)' \
 		'  CACHE_SPLITS=$(CACHE_SPLITS)' \
@@ -533,6 +534,51 @@ train:
 		--val-split $(VAL_SPLIT) \
 		--split-col $(SPLIT_COL) \
 		$(FINE_TUNE_ARGS)
+
+train-action-geometry-scratch:
+	$(MAKE) train \
+		MODEL=$(SCRATCH_ACTION_GEOMETRY_MODEL) \
+		INIT_MODEL= \
+		ENCODER=unimol \
+		CHECKPOINT_ENCODER=unimol \
+		LOSS=decoupled_kl \
+		CHECKPOINT_METRIC=val_cosine \
+		LR=1e-4 \
+		ENCODER_LR=3e-5 \
+		WEIGHT_DECAY=0 \
+		HEAD_WEIGHT_DECAY=0 \
+		TARGET_POWER=1.2 \
+		ENTROPY_WEIGHT=0.0005 \
+		DROPOUT=0.1 \
+		SCHEDULER=exponential \
+		EXPONENTIAL_GAMMA=0.97 \
+		TRAIN_PREFILL_CACHE=0 \
+		FRAGMENT_PATH_LAYERS=3 \
+		FRAGMENT_ACTION_PRIMARY_LAYERS=2 \
+		BOND_BREAK_GEOMETRY_FEATURES=1 \
+		HIGH_CE_FRAGMENT_THRESHOLD=60
+
+train-from-msnlib-geometry:
+	$(MAKE) train \
+		MODEL=$(RESOURCE_DIR)/checkpoints/mirafrag_massspecgym_from_msnlib_geometry.pt \
+		INIT_MODEL=$(MSNLIB_ACTION_GEOMETRY_MODEL) \
+		ENCODER=unimol \
+		CHECKPOINT_ENCODER=unimol \
+		LOSS=decoupled_kl \
+		CHECKPOINT_METRIC=val_cosine \
+		LR=1.5e-5 \
+		ENCODER_LR=5e-6 \
+		WEIGHT_DECAY=0 \
+		HEAD_WEIGHT_DECAY=0 \
+		TARGET_POWER=1.2 \
+		ENTROPY_WEIGHT=0.0005 \
+		SCHEDULER=exponential \
+		EXPONENTIAL_GAMMA=0.97 \
+		TRAIN_PREFILL_CACHE=0 \
+		FRAGMENT_PATH_LAYERS=3 \
+		FRAGMENT_ACTION_PRIMARY_LAYERS=2 \
+		BOND_BREAK_GEOMETRY_FEATURES=1 \
+		HIGH_CE_FRAGMENT_THRESHOLD=60
 
 train-finetune:
 	mkdir -p $(dir $(MODEL))

@@ -1438,10 +1438,9 @@ def _loss_decoupled_kl_cosine(
         batch,
         target_power=target_power,
     )
-    cosine_loss = 1.0 - sparse_binned_cosine_similarity(
+    cosine_loss = 1.0 - sparse_fragment_only_binned_cosine_similarity(
         pred,
         batch,
-        include_oos=False,
     )
     return _reduce_loss(
         kl_weight * kl + (1.0 - kl_weight) * cosine_loss,

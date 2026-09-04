@@ -43,7 +43,7 @@ def evaluate_model(
     """
     Evaluate a MiraFrag model and return predictions plus summary metrics.
 
-    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result. ``probability_mode='decoupled'`` uses fragment-only probabilities and sigmoid OOS semantics for checkpoints trained with ``LOSS in {decoupled_kl, fiora_decoupled_kl, responsibility_decoupled_kl, fragment_cosine, fragment_sqrt_cosine}``.
+    The function runs the model in evaluation mode, computes sparse binned cosine metrics when targets are present, converts probabilities to sparse peak rows, and returns a dataframe-ready result. ``probability_mode='decoupled'`` uses fragment-only probabilities and sigmoid OOS semantics for checkpoints trained with ``LOSS in {decoupled_kl, decoupled_kl_cosine, fiora_decoupled_kl, responsibility_decoupled_kl, fragment_cosine, fragment_sqrt_cosine}``.
     """
     if probability_mode not in {'joint', 'decoupled'}:
         raise ValueError("probability_mode must be one of: 'joint', 'decoupled'.")
@@ -206,7 +206,7 @@ def probability_mode_from_checkpoint_payload(payload: dict[str, Any]) -> str:
     """
     Select prediction probability semantics from checkpoint training metadata.
 
-    Checkpoints trained with ``LOSS in {decoupled_kl, fiora_decoupled_kl, responsibility_decoupled_kl, fragment_cosine, fragment_sqrt_cosine}`` use a fragment-only softmax
+    Checkpoints trained with ``LOSS in {decoupled_kl, decoupled_kl_cosine, fiora_decoupled_kl, responsibility_decoupled_kl, fragment_cosine, fragment_sqrt_cosine}`` use a fragment-only softmax
     plus a sigmoid OOS head. Older and standard-loss checkpoints retain the
     joint fragment-plus-OOS softmax semantics.
     """
@@ -218,6 +218,7 @@ def probability_mode_from_checkpoint_payload(payload: dict[str, Any]) -> str:
         return str(mode)
     if train_config.get('loss') in {
         'decoupled_kl',
+        'decoupled_kl_cosine',
         'fiora_decoupled_kl',
         'responsibility_decoupled_kl',
         'fragment_cosine',

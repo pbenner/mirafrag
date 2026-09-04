@@ -155,6 +155,7 @@ def run_epoch(
             scored_pred = exclude_precursor_prediction_candidates(pred, batch)
             if loss_name in {
                 'decoupled_kl',
+                'decoupled_kl_cosine',
                 'fiora_decoupled_kl',
                 'responsibility_decoupled_kl',
                 'fragment_cosine',
@@ -1043,6 +1044,7 @@ def _prediction_probability_mode(loss_name: str) -> str:
         if loss_name
         in {
             'decoupled_kl',
+            'decoupled_kl_cosine',
             'fiora_decoupled_kl',
             'responsibility_decoupled_kl',
             'fragment_cosine',

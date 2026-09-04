@@ -722,7 +722,6 @@ def main() -> None:
             ),
             fragment_action_primary_layers=fragment_action_primary_layers,
             bond_break_geometry_features=bond_break_geometry_features,
-            ce_embedding=_mirafrag_config_value(args.ce_embedding, 'ce_embedding'),
             encoder_type=encoder_type,
             encoder_finetune_strategy=fine_tune_strategy,
             foundation_source=args.foundation_source,
