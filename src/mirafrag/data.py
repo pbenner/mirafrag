@@ -714,6 +714,9 @@ def _fragment_config_cache_settings(config: FragmentConfig) -> dict[str, Any]:
     settings = asdict(config)
     settings['fragment_feature_schema'] = 3
     settings.pop('include_bond_breaks', None)
+    if not bool(settings.get('direct_bond_cut_fragments', False)):
+        settings.pop('direct_bond_cut_fragments', None)
+        settings.pop('max_direct_bond_cuts', None)
     return settings
 
 

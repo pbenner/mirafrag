@@ -15,6 +15,8 @@ BASE_FRAGMENT_CONFIG_ARG_FIELDS = (
     'max_fragment_broken_bonds',
     'max_fragments',
     'max_fragment_edges',
+    'direct_bond_cut_fragments',
+    'max_direct_bond_cuts',
     'include_fragment_isotopes',
     'fragment_isotope_threshold',
     'max_fragment_isotope_peaks',

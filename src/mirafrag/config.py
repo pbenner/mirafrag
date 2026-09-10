@@ -21,6 +21,8 @@ class MiraFragConfig:
     max_fragment_broken_bonds: int = 6
     max_fragments: int = 2048
     max_fragment_edges: int = 8192
+    direct_bond_cut_fragments: bool = False
+    max_direct_bond_cuts: int = 2
     high_ce_fragment_threshold: float | None = None
     high_ce_max_fragment_tree_depth: int | None = None
     high_ce_max_fragment_broken_bonds: int | None = None
@@ -34,6 +36,8 @@ class MiraFragConfig:
     fragment_path_primary: bool = False
     fragment_action_primary_layers: int = 0
     bond_break_geometry_features: bool = False
+    bond_break_local_environment_features: bool = False
+    fragment_action_ce_conditioning: bool = False
     ce_embedding: str = 'scalar'
     encoder_type: str = 'mace'
     encoder_finetune_strategy: str = 'head'

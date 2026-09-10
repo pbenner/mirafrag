@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 from typing import Any
 
@@ -61,6 +62,18 @@ def smiles_to_fragment_candidates(
         adduct_spec=adduct_spec,
         config=config,
     )
+    if config.direct_bond_cut_fragments:
+        _add_direct_bond_cut_fragments(
+            candidates=candidates,
+            mol=mol,
+            atom_hs=atom_hs,
+            bond_stats=bond_stats,
+            mz_max=mz_max,
+            bin_width=bin_width,
+            num_bins=num_bins,
+            adduct_spec=adduct_spec,
+            config=config,
+        )
 
     formulas, peaks, peak_formula_index = _prune_fragment_candidates(
         candidates.values(),
@@ -486,6 +499,121 @@ def _add_recursive_fragments(
             adduct_spec=adduct_spec,
             config=config,
         )
+
+
+def _add_direct_bond_cut_fragments(
+    *,
+    candidates: dict[tuple[tuple[int, ...], int, int, int], dict[str, Any]],
+    mol: Chem.Mol,
+    atom_hs: list[int],
+    bond_stats: list[dict[str, Any]],
+    mz_max: float,
+    bin_width: float,
+    num_bins: int,
+    adduct_spec: FragmentAdduct,
+    config: FragmentConfig,
+) -> None:
+    """
+    Add fragments obtained by directly cutting small sets of original bonds.
+
+    Recursive atom-removal support can miss natural connected components that
+    are produced by cutting a few bonds at once. This expansion keeps the same
+    downstream formula/H-shift/isotope machinery but adds those components as
+    extra atom-mask candidates.
+    """
+    max_cuts = max(0, int(config.max_direct_bond_cuts))
+    if max_cuts <= 0 or not bond_stats:
+        return
+    max_cuts = min(max_cuts, len(bond_stats))
+    engine = _MiraFragFragmentEngine(
+        mol=mol,
+        atom_hs=atom_hs,
+        max_tree_depth=max(0, int(config.max_tree_depth)),
+        max_broken_bonds=max(0, int(config.max_broken_bonds)),
+    )
+    root_hash = engine.wl_hash((1 << mol.GetNumAtoms()) - 1)
+    seen_masks: set[int] = set()
+    for cut_count in range(1, max_cuts + 1):
+        for cut_indices in itertools.combinations(range(len(bond_stats)), cut_count):
+            cut_bonds = {_bond_key(bond_stats[index]) for index in cut_indices}
+            for mask in _components_after_bond_cuts(mol, cut_bonds):
+                if mask in seen_masks:
+                    continue
+                atom_indices = _mask_to_atom_indices(mask, mol.GetNumAtoms())
+                if not atom_indices or len(atom_indices) == mol.GetNumAtoms():
+                    continue
+                atom_set = set(atom_indices)
+                max_broken, score = _fragment_break_score(atom_set, bond_stats)
+                if max_broken > max(0, int(config.max_broken_bonds)):
+                    continue
+                seen_masks.add(mask)
+                frag_hs = sum(int(atom_hs[idx]) for idx in atom_indices)
+                h_budget = max(0, min(int(config.max_broken_bonds), int(max_broken)))
+                max_remove_hs = min(frag_hs, h_budget)
+                max_add_hs = min(sum(atom_hs) - frag_hs, h_budget)
+                _add_fragment_candidate(
+                    candidates,
+                    mol,
+                    mask=mask,
+                    fragment_hash=f'direct:{engine.wl_hash(mask)}',
+                    parent_hashes=[root_hash],
+                    atom_indices=atom_indices,
+                    cut_count=cut_count,
+                    max_broken=max_broken,
+                    max_remove_hs=max_remove_hs,
+                    max_add_hs=max_add_hs,
+                    atom_hs=atom_hs,
+                    bond_stats=bond_stats,
+                    mz_max=mz_max,
+                    bin_width=bin_width,
+                    num_bins=num_bins,
+                    adduct_spec=adduct_spec,
+                    config=config,
+                )
+
+
+def _components_after_bond_cuts(
+    mol: Chem.Mol, cut_bonds: set[tuple[int, int]]
+) -> list[int]:
+    """Return connected component masks after removing the selected bonds."""
+    adjacency: list[list[int]] = [[] for _ in range(mol.GetNumAtoms())]
+    for bond in mol.GetBonds():
+        begin = int(bond.GetBeginAtomIdx())
+        end = int(bond.GetEndAtomIdx())
+        if _sorted_bond_key(begin, end) in cut_bonds:
+            continue
+        adjacency[begin].append(end)
+        adjacency[end].append(begin)
+
+    seen: set[int] = set()
+    components: list[int] = []
+    for atom_idx in range(mol.GetNumAtoms()):
+        if atom_idx in seen:
+            continue
+        stack = [atom_idx]
+        seen.add(atom_idx)
+        mask = 0
+        while stack:
+            atom = stack.pop()
+            mask |= 1 << atom
+            for neighbor in adjacency[atom]:
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                stack.append(neighbor)
+        components.append(mask)
+    full_mask = (1 << mol.GetNumAtoms()) - 1
+    return [mask for mask in components if mask and mask != full_mask]
+
+
+def _bond_key(bond: dict[str, Any]) -> tuple[int, int]:
+    """Return a canonical atom-pair key for one bond metadata row."""
+    return _sorted_bond_key(int(bond['begin']), int(bond['end']))
+
+
+def _sorted_bond_key(begin: int, end: int) -> tuple[int, int]:
+    """Return a sorted atom-pair key."""
+    return (begin, end) if begin <= end else (end, begin)
 
 
 def _mask_to_atom_indices(mask: int, num_atoms: int) -> tuple[int, ...]:

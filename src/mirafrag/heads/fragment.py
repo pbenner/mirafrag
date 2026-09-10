@@ -14,6 +14,7 @@ from mirafrag.fragments import (
 )
 
 FRAGMENT_ACTION_GEOMETRY_FEATURE_DIM = 8
+FRAGMENT_ACTION_LOCAL_ENV_FEATURE_DIM = 15
 
 
 class FragmentSpectrumHead(nn.Module):
@@ -39,6 +40,12 @@ class FragmentSpectrumHead(nn.Module):
         )
         self.bond_break_geometry_features = bool(
             getattr(config, 'bond_break_geometry_features', False)
+        )
+        self.bond_break_local_environment_features = bool(
+            getattr(config, 'bond_break_local_environment_features', False)
+        )
+        self.fragment_action_ce_conditioning = bool(
+            getattr(config, 'fragment_action_ce_conditioning', False)
         )
         self.collision_feature_dim = 1
         self.fragment_gnn_layers = nn.ModuleList(
@@ -127,11 +134,18 @@ class FragmentSpectrumHead(nn.Module):
                 self.fragment_action_primary_residual = (
                     self._make_fragment_action_primary_residual(config)
                 )
+                self.fragment_action_primary_conditioner = (
+                    self._make_fragment_action_primary_conditioner(config)
+                    if self.fragment_action_ce_conditioning
+                    else None
+                )
                 self._reset_fragment_action_primary_residual()
+                self._reset_fragment_action_primary_conditioner()
         else:
             self.fragment_action_primary_input_dropout = None
             self.fragment_action_primary_pair_scorer = None
             self.fragment_action_primary_residual = None
+            self.fragment_action_primary_conditioner = None
         self.oos_input_dropout = nn.Dropout(config.dropout)
         self.oos_hidden_dropout = nn.Dropout(config.dropout)
         self.oos_scorer = self._make_oos_scorer(config)
@@ -340,6 +354,17 @@ class FragmentSpectrumHead(nn.Module):
         """
         return cls._make_fragment_action_mlp(4, config, output_zero=True)
 
+    @staticmethod
+    def _make_fragment_action_primary_conditioner(config: MiraFragConfig) -> nn.Module:
+        """Build a CE/instrument FiLM conditioner for bond-action hidden states."""
+        hidden_dim = int(config.hidden_dim)
+        return nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+        )
+
     def _reset_fragment_action_primary_residual(self) -> None:
         """
         Initialize the action-primary residual's output layer as an exact no-op.
@@ -347,6 +372,15 @@ class FragmentSpectrumHead(nn.Module):
         if self.fragment_action_primary_residual is None:
             return
         final_layer = self.fragment_action_primary_residual[-1]
+        if isinstance(final_layer, nn.Linear):
+            nn.init.zeros_(final_layer.weight)
+            nn.init.zeros_(final_layer.bias)
+
+    def _reset_fragment_action_primary_conditioner(self) -> None:
+        """Initialize FiLM conditioning as an exact no-op."""
+        if self.fragment_action_primary_conditioner is None:
+            return
+        final_layer = self.fragment_action_primary_conditioner[-1]
         if isinstance(final_layer, nn.Linear):
             nn.init.zeros_(final_layer.weight)
             nn.init.zeros_(final_layer.bias)
@@ -727,20 +761,157 @@ class FragmentSpectrumHead(nn.Module):
         ratio = length / covalent.clamp_min(1e-6)
         excess = length - covalent
         inv_length = torch.reciprocal(length)
-        return torch.stack(
+        midpoint_molecule_distance = torch.linalg.vector_norm(
+            midpoint - event_molecule_centroid, dim=-1
+        )
+        src_fragment_distance = torch.linalg.vector_norm(
+            src_pos - event_fragment_centroid, dim=-1
+        )
+        dst_fragment_distance = torch.linalg.vector_norm(
+            dst_pos - event_fragment_centroid, dim=-1
+        )
+        midpoint_fragment_distance = torch.linalg.vector_norm(
+            midpoint - event_fragment_centroid, dim=-1
+        )
+        base_features = torch.stack(
             [
                 length / 4.0,
                 inv_length,
                 ratio / 2.0,
                 excess / 2.0,
-                torch.linalg.vector_norm(midpoint - event_molecule_centroid, dim=-1)
-                / 6.0,
-                torch.linalg.vector_norm(src_pos - event_fragment_centroid, dim=-1)
-                / 6.0,
-                torch.linalg.vector_norm(dst_pos - event_fragment_centroid, dim=-1)
-                / 6.0,
-                torch.linalg.vector_norm(midpoint - event_fragment_centroid, dim=-1)
-                / 6.0,
+                midpoint_molecule_distance / 6.0,
+                src_fragment_distance / 6.0,
+                dst_fragment_distance / 6.0,
+                midpoint_fragment_distance / 6.0,
+            ],
+            dim=-1,
+        )
+        if not self.bond_break_local_environment_features:
+            return base_features
+        local_features = self._fragment_action_local_environment_features(
+            positions=positions,
+            src=src,
+            dst=dst,
+            length=length,
+            delta=delta,
+            midpoint=midpoint,
+            midpoint_molecule_distance=midpoint_molecule_distance,
+            atom_index=atom_index,
+            atom_ptr=atom_ptr,
+            formula_index=formula_index,
+            graph=graph,
+            graph_batch=graph_batch,
+            fragment_centroid=fragment_centroid,
+            molecule_centroid=molecule_centroid,
+            event_fragment_centroid=event_fragment_centroid,
+            event_molecule_centroid=event_molecule_centroid,
+            dtype=dtype,
+            device=device,
+        )
+        return torch.cat([base_features, local_features], dim=-1)
+
+    def _fragment_action_local_environment_features(
+        self,
+        *,
+        positions: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        length: torch.Tensor,
+        delta: torch.Tensor,
+        midpoint: torch.Tensor,
+        midpoint_molecule_distance: torch.Tensor,
+        atom_index: torch.Tensor,
+        atom_ptr: torch.Tensor,
+        formula_index: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        graph_batch: torch.Tensor,
+        fragment_centroid: torch.Tensor,
+        molecule_centroid: torch.Tensor,
+        event_fragment_centroid: torch.Tensor,
+        event_molecule_centroid: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return local 3D environment summaries around each broken bond."""
+        num_fragments = max(int(atom_ptr.numel()) - 1, 0)
+        counts = (atom_ptr[1:] - atom_ptr[:-1]).clamp_min(0).to(device=device)
+        fragment_idx = torch.repeat_interleave(
+            torch.arange(num_fragments, device=device), counts
+        )
+        fragment_rg = positions.new_zeros(num_fragments)
+        fragment_mean_radius = positions.new_zeros(num_fragments)
+        fragment_max_radius = positions.new_zeros(num_fragments)
+        if atom_index.numel() > 0 and fragment_idx.numel() == atom_index.numel():
+            atom_positions = positions[atom_index]
+            atom_dist = torch.linalg.vector_norm(
+                atom_positions - fragment_centroid[fragment_idx], dim=-1
+            )
+            fragment_mean_radius.index_add_(0, fragment_idx, atom_dist)
+            fragment_rg.index_add_(0, fragment_idx, atom_dist.square())
+            fragment_max_radius.scatter_reduce_(
+                0, fragment_idx, atom_dist, reduce='amax', include_self=True
+            )
+            denom = counts.to(dtype=dtype).clamp_min(1.0)
+            fragment_mean_radius = fragment_mean_radius / denom
+            fragment_rg = torch.sqrt(fragment_rg / denom)
+
+        batch_size = max(int(molecule_centroid.shape[0]), 1)
+        molecule_rg = positions.new_zeros(batch_size)
+        molecule_counts = positions.new_zeros(batch_size)
+        atom_batch = graph_batch.to(device=device).long()
+        atom_centroid = molecule_centroid[atom_batch]
+        atom_molecule_dist = torch.linalg.vector_norm(positions - atom_centroid, dim=-1)
+        molecule_rg.index_add_(0, atom_batch, atom_molecule_dist.square())
+        molecule_counts.index_add_(0, atom_batch, torch.ones_like(atom_molecule_dist))
+        molecule_rg = torch.sqrt(molecule_rg / molecule_counts.clamp_min(1.0))
+
+        degree = positions.new_zeros(positions.shape[0])
+        edge_index = graph.get('edge_index')
+        if edge_index is not None and edge_index.numel() > 0:
+            edge_index = edge_index.to(device=device).long()
+            degree.index_add_(
+                0, edge_index[0], torch.ones_like(edge_index[0], dtype=dtype)
+            )
+
+        atomic_numbers = graph.get('atomic_numbers')
+        if atomic_numbers is None:
+            z = torch.zeros(positions.shape[0], dtype=dtype, device=device)
+        else:
+            z = atomic_numbers.to(device=device, dtype=dtype)
+
+        unit = delta / length.unsqueeze(-1).clamp_min(1e-6)
+        src_radial = torch.sum(
+            (positions[src] - event_fragment_centroid) * unit, dim=-1
+        )
+        dst_radial = torch.sum(
+            (positions[dst] - event_fragment_centroid) * unit, dim=-1
+        )
+        radial = midpoint - event_molecule_centroid
+        radial_norm = torch.linalg.vector_norm(radial, dim=-1).clamp_min(1e-6)
+        radial_alignment = torch.sum(
+            unit * (radial / radial_norm.unsqueeze(-1)), dim=-1
+        )
+        event_batch = graph_batch[src].clamp(0, max(batch_size - 1, 0))
+        event_molecule_rg = molecule_rg[event_batch]
+        environment_scale = event_molecule_rg.clamp_min(1e-6)
+        event_counts = counts[formula_index].to(dtype=dtype).clamp_min(1.0)
+        return torch.stack(
+            [
+                fragment_rg[formula_index] / 6.0,
+                fragment_mean_radius[formula_index] / 6.0,
+                fragment_max_radius[formula_index] / 6.0,
+                torch.log1p(event_counts) / 4.0,
+                event_molecule_rg / 8.0,
+                midpoint_molecule_distance / environment_scale,
+                src_radial / 4.0,
+                dst_radial / 4.0,
+                radial_alignment,
+                z[src] / 54.0,
+                z[dst] / 54.0,
+                torch.abs(z[src] - z[dst]) / 54.0,
+                degree[src] / 16.0,
+                degree[dst] / 16.0,
+                torch.abs(degree[src] - degree[dst]) / 16.0,
             ],
             dim=-1,
         )
@@ -835,9 +1006,12 @@ class FragmentSpectrumHead(nn.Module):
             return base_logits.new_zeros(base_logits.shape)
         pair_inputs, formula_index, counts = event
         num_formulas = int(formula_features.shape[0])
-        pair_logits = self.fragment_action_primary_pair_scorer(
-            self.fragment_action_primary_input_dropout(pair_inputs)
-        ).squeeze(-1)
+        pair_conditioning = torch.cat(
+            [context_features[formula_index], collision_features[formula_index]], dim=-1
+        )
+        pair_logits = self._fragment_action_primary_pair_logits(
+            pair_inputs, pair_conditioning
+        )
         action_sum = base_logits.new_zeros(num_formulas)
         action_sum.index_add_(0, formula_index, pair_logits)
         action_count = counts.to(device=base_logits.device, dtype=base_logits.dtype)
@@ -866,6 +1040,35 @@ class FragmentSpectrumHead(nn.Module):
             dim=-1,
         )
         return self.fragment_action_primary_residual(residual_inputs).squeeze(-1)
+
+    def _fragment_action_primary_pair_logits(
+        self,
+        pair_inputs: torch.Tensor,
+        conditioning: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score broken-bond events, optionally FiLM-conditioned by CE/instrument context."""
+        if (
+            self.fragment_action_primary_pair_scorer is None
+            or self.fragment_action_primary_input_dropout is None
+        ):
+            return pair_inputs.new_zeros(pair_inputs.shape[0])
+        scorer = self.fragment_action_primary_pair_scorer
+        dropped = self.fragment_action_primary_input_dropout(pair_inputs)
+        if (
+            not self.fragment_action_ce_conditioning
+            or self.fragment_action_primary_conditioner is None
+        ):
+            return scorer(dropped).squeeze(-1)
+        hidden = scorer[0](dropped)
+        hidden = scorer[1](hidden)
+        hidden = scorer[2](hidden)
+        hidden = scorer[3](hidden)
+        film = self.fragment_action_primary_conditioner(conditioning)
+        scale, shift = film.chunk(2, dim=-1)
+        hidden = hidden * (1.0 + 0.1 * torch.tanh(scale)) + shift
+        for layer in scorer[4:]:
+            hidden = layer(hidden)
+        return hidden.squeeze(-1)
 
     def _materialize_empty_fragment_action_primary_scorer(
         self,
@@ -1180,6 +1383,11 @@ class FragmentSpectrumHead(nn.Module):
         dim = BOND_BREAK_FEATURE_DIM
         if self.bond_break_geometry_features:
             dim += FRAGMENT_ACTION_GEOMETRY_FEATURE_DIM
+        if (
+            self.bond_break_geometry_features
+            and self.bond_break_local_environment_features
+        ):
+            dim += FRAGMENT_ACTION_LOCAL_ENV_FEATURE_DIM
         return dim
 
     def _collision_energy_feature(

@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        '--fine-tune-strategy',
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument('--device', default='auto')
     parser.add_argument(
         '--graph-relaxation',
@@ -80,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         '--disk-cache-dir',
         default=None,
         help='Optional disk cache for precomputed encoder graphs and fragments.',
+    )
+    parser.add_argument(
+        '--cache-num-workers',
+        type=int,
+        default=None,
+        help='Worker count for disk-cache prefill. Defaults to --num-workers.',
+    )
+    parser.add_argument(
+        '--cache-chunk-size',
+        type=int,
+        default=1,
+        help='Rows handed to each disk-cache prefill worker task.',
     )
     parser.add_argument('--min-intensity', type=float, default=0.001)
     parser.add_argument('--top-k', type=int, default=100)
@@ -135,6 +152,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help='Number of global quantile bins for collision-energy stratification.',
+    )
+    parser.add_argument('--max-fragment-tree-depth', type=int, default=None)
+    parser.add_argument('--max-fragment-broken-bonds', type=int, default=None)
+    parser.add_argument('--max-fragments', type=int, default=None)
+    parser.add_argument('--max-fragment-edges', type=int, default=None)
+    parser.add_argument(
+        '--include-fragment-isotopes',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--fragment-isotope-threshold', type=float, default=None)
+    parser.add_argument('--max-fragment-isotope-peaks', type=int, default=None)
+    parser.add_argument(
+        '--direct-bond-cut-fragments',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Add direct multi-bond-cut connected components to fragment support.',
+    )
+    parser.add_argument(
+        '--max-direct-bond-cuts',
+        type=int,
+        default=None,
+        help='Maximum number of original bonds cut for direct component support.',
     )
     add_high_ce_fragment_support_args(parser)
     return parser.parse_args()
@@ -233,8 +273,12 @@ def main() -> None:
         prefill_feature_cache(
             ds,
             split_name=str(args.split_value or args.split),
-            chunk_size=args.batch_size,
-            num_workers=args.num_workers,
+            chunk_size=args.cache_chunk_size,
+            num_workers=(
+                args.cache_num_workers
+                if args.cache_num_workers is not None
+                else args.num_workers
+            ),
             show_progress=args.progress,
         )
     loader = DataLoader(

@@ -304,6 +304,40 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--bond-break-local-environment-features',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Append local 3D environment summaries around explicit broken-bond '
+            'events, including fragment shape, radial alignment, element, and '
+            'spatial degree features.'
+        ),
+    )
+    parser.add_argument(
+        '--fragment-action-ce-conditioning',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'FiLM-condition explicit bond-action scoring on collision-energy and '
+            'instrument context.'
+        ),
+    )
+    parser.add_argument(
+        '--direct-bond-cut-fragments',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Add connected components from direct multi-bond cuts to recursive '
+            'fragment support. This forks the fragment cache only when enabled.'
+        ),
+    )
+    parser.add_argument(
+        '--max-direct-bond-cuts',
+        type=int,
+        default=None,
+        help='Maximum number of original bonds cut for direct component support.',
+    )
+    parser.add_argument(
         '--include-fragment-isotopes',
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -675,6 +709,16 @@ def main() -> None:
             args,
             action_primary_layers=fragment_action_primary_layers,
         )
+        bond_break_local_environment_features = _requested_bool_config_value(
+            args.bond_break_local_environment_features,
+            'bond_break_local_environment_features',
+        )
+        if bond_break_local_environment_features:
+            bond_break_geometry_features = True
+        fragment_action_ce_conditioning = _requested_bool_config_value(
+            args.fragment_action_ce_conditioning,
+            'fragment_action_ce_conditioning',
+        )
         config = MiraFragConfig(
             num_bins=num_bins,
             hidden_dim=args.hidden_dim,
@@ -693,6 +737,16 @@ def main() -> None:
             max_fragment_edges=_mirafrag_config_value(
                 args.max_fragment_edges,
                 'max_fragment_edges',
+            ),
+            direct_bond_cut_fragments=bool(
+                _mirafrag_config_value(
+                    args.direct_bond_cut_fragments,
+                    'direct_bond_cut_fragments',
+                )
+            ),
+            max_direct_bond_cuts=_mirafrag_config_value(
+                args.max_direct_bond_cuts,
+                'max_direct_bond_cuts',
             ),
             high_ce_fragment_threshold=args.high_ce_fragment_threshold,
             high_ce_max_fragment_tree_depth=args.high_ce_max_fragment_tree_depth,
@@ -722,6 +776,8 @@ def main() -> None:
             ),
             fragment_action_primary_layers=fragment_action_primary_layers,
             bond_break_geometry_features=bond_break_geometry_features,
+            bond_break_local_environment_features=bond_break_local_environment_features,
+            fragment_action_ce_conditioning=fragment_action_ce_conditioning,
             encoder_type=encoder_type,
             encoder_finetune_strategy=fine_tune_strategy,
             foundation_source=args.foundation_source,
@@ -862,6 +918,16 @@ def main() -> None:
     )
 
 
+def _default_bool_config_value(field_name: str) -> bool:
+    return bool(getattr(MiraFragConfig, field_name))
+
+
+def _requested_bool_config_value(value: bool | None, field_name: str) -> bool:
+    if value is not None:
+        return bool(value)
+    return _default_bool_config_value(field_name)
+
+
 def _config_bond_break_geometry_features(config: MiraFragConfig) -> bool:
     return bool(getattr(config, 'bond_break_geometry_features', False))
 
@@ -892,10 +958,13 @@ def _checkpoint_bond_break_geometry_features(
     config: MiraFragConfig,
     *,
     target_action_primary_layers: int,
+    target_local_environment: bool = False,
 ) -> bool:
     requested = _requested_bond_break_geometry_features(args)
     if requested is not None:
         return requested
+    if target_local_environment:
+        return True
     if (
         int(target_action_primary_layers) > 0
         and int(getattr(config, 'fragment_action_primary_layers', 0)) <= 0
@@ -931,10 +1000,25 @@ def _maybe_rebuild_fragment_bond_break_model(
         if requested_action_primary_layers is None
         else requested_action_primary_layers
     )
+    requested_local_environment = getattr(
+        args, 'bond_break_local_environment_features', None
+    )
+    target_local_environment = (
+        bool(getattr(model.config, 'bond_break_local_environment_features', False))
+        if requested_local_environment is None
+        else bool(requested_local_environment)
+    )
     target_geometry = _checkpoint_bond_break_geometry_features(
         args,
         model.config,
         target_action_primary_layers=target_action_primary_layers,
+        target_local_environment=target_local_environment,
+    )
+    requested_ce_conditioning = getattr(args, 'fragment_action_ce_conditioning', None)
+    target_ce_conditioning = (
+        bool(getattr(model.config, 'fragment_action_ce_conditioning', False))
+        if requested_ce_conditioning is None
+        else bool(requested_ce_conditioning)
     )
 
     current = (
@@ -942,18 +1026,22 @@ def _maybe_rebuild_fragment_bond_break_model(
         bool(getattr(model.config, 'fragment_path_primary', False)),
         int(getattr(model.config, 'fragment_action_primary_layers', 0)),
         bool(getattr(model.config, 'bond_break_geometry_features', False)),
+        bool(getattr(model.config, 'bond_break_local_environment_features', False)),
+        bool(getattr(model.config, 'fragment_action_ce_conditioning', False)),
     )
     target = (
         target_path_layers,
         target_path_primary,
         target_action_primary_layers,
         target_geometry,
+        target_local_environment,
+        target_ce_conditioning,
     )
     if current == target:
         return model
 
     state = model.state_dict()
-    if current[3] != target[3]:
+    if current[3] != target[3] or current[4] != target[4]:
         state = {
             key: value
             for key, value in state.items()
@@ -965,6 +1053,8 @@ def _maybe_rebuild_fragment_bond_break_model(
         fragment_path_primary=target_path_primary,
         fragment_action_primary_layers=target_action_primary_layers,
         bond_break_geometry_features=target_geometry,
+        bond_break_local_environment_features=target_local_environment,
+        fragment_action_ce_conditioning=target_ce_conditioning,
     )
     rebuilt = MiraFragModel(
         model.encoder,
@@ -1022,6 +1112,8 @@ def _apply_fragment_args_to_model_config(
         ('max_fragment_broken_bonds', 'max_fragment_broken_bonds'),
         ('max_fragments', 'max_fragments'),
         ('max_fragment_edges', 'max_fragment_edges'),
+        ('direct_bond_cut_fragments', 'direct_bond_cut_fragments'),
+        ('max_direct_bond_cuts', 'max_direct_bond_cuts'),
         ('include_fragment_isotopes', 'include_fragment_isotopes'),
         ('fragment_isotope_threshold', 'fragment_isotope_threshold'),
         ('max_fragment_isotope_peaks', 'max_fragment_isotope_peaks'),

@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('-m', '--model', required=True, help='MiraFrag checkpoint .pt.')
     parser.add_argument('-o', '--output', required=True, help='Output prediction CSV.')
     parser.add_argument('--device', default='auto')
+    parser.add_argument('--checkpoint-metric', default=None, help=argparse.SUPPRESS)
     parser.add_argument('--mz-max', type=float, default=MASS_SPEC_GYM_MZ_MAX)
     parser.add_argument('--bin-width', type=float, default=MASS_SPEC_GYM_BIN_WIDTH)
     parser.add_argument('--batch-size', type=int, default=8)
@@ -56,6 +57,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--min-intensity', type=float, default=0.001)
     parser.add_argument('--top-k', type=int, default=100)
+    parser.add_argument('--max-fragment-tree-depth', type=int, default=None)
+    parser.add_argument('--max-fragment-broken-bonds', type=int, default=None)
+    parser.add_argument('--max-fragments', type=int, default=None)
+    parser.add_argument('--max-fragment-edges', type=int, default=None)
+    parser.add_argument(
+        '--direct-bond-cut-fragments',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Add direct multi-bond-cut connected components to fragment support.',
+    )
+    parser.add_argument(
+        '--max-direct-bond-cuts',
+        type=int,
+        default=None,
+        help='Maximum number of original bonds cut for direct component support.',
+    )
+    parser.add_argument(
+        '--include-fragment-isotopes',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--fragment-isotope-threshold', type=float, default=None)
+    parser.add_argument('--max-fragment-isotope-peaks', type=int, default=None)
     add_high_ce_fragment_support_args(parser)
     parser.add_argument(
         '--progress',

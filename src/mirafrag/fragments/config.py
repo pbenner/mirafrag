@@ -25,6 +25,8 @@ class FragmentConfig:
     include_root: bool = True
     proton_mass: float = PROTON_MASS
     include_bond_breaks: bool = False
+    direct_bond_cut_fragments: bool = False
+    max_direct_bond_cuts: int = 2
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,10 @@ def fragment_config_from_model_config(config: Any) -> FragmentConfig:
         include_bond_breaks=bool(
             getattr(config, 'fragment_action_primary_layers', 0) > 0
         ),
+        direct_bond_cut_fragments=bool(
+            getattr(config, 'direct_bond_cut_fragments', False)
+        ),
+        max_direct_bond_cuts=int(getattr(config, 'max_direct_bond_cuts', 2)),
     )
 
 
@@ -131,6 +137,8 @@ def high_ce_fragment_config_from_model_config(
         include_root=bool(base.include_root),
         proton_mass=float(base.proton_mass),
         include_bond_breaks=bool(base.include_bond_breaks),
+        direct_bond_cut_fragments=bool(base.direct_bond_cut_fragments),
+        max_direct_bond_cuts=int(base.max_direct_bond_cuts),
     )
 
 

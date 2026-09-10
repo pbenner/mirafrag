@@ -128,10 +128,40 @@ def parse_args() -> argparse.Namespace:
         help='Deprecated alias for --bond-break-geometry-features.',
     )
     parser.add_argument(
+        '--bond-break-local-environment-features',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Accept training head local-environment setting for cache/config parity. '
+            'This does not change cache contents by itself.'
+        ),
+    )
+    parser.add_argument(
+        '--fragment-action-ce-conditioning',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Accept training head CE-conditioning setting for cache/config parity. '
+            'This does not change cache contents by itself.'
+        ),
+    )
+    parser.add_argument(
         '--splits',
         nargs='+',
         default=['train', 'val', 'test'],
         help="Splits to precompute, or 'all' to precompute the filtered table once.",
+    )
+    parser.add_argument(
+        '--direct-bond-cut-fragments',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Add direct multi-bond-cut connected components to fragment support.',
+    )
+    parser.add_argument(
+        '--max-direct-bond-cuts',
+        type=int,
+        default=None,
+        help='Maximum number of original bonds cut for direct component support.',
     )
     add_high_ce_fragment_support_args(parser)
     parser.add_argument('--split-col', default='auto')
@@ -398,6 +428,12 @@ def _fragment_config_from_args(args: argparse.Namespace) -> FragmentConfig:
         ),
         max_fragments=value_or_default(args.max_fragments, default.max_fragments),
         max_edges=value_or_default(args.max_fragment_edges, default.max_edges),
+        direct_bond_cut_fragments=value_or_default(
+            args.direct_bond_cut_fragments, default.direct_bond_cut_fragments
+        ),
+        max_direct_bond_cuts=value_or_default(
+            args.max_direct_bond_cuts, default.max_direct_bond_cuts
+        ),
         include_isotopes=value_or_default(
             args.include_fragment_isotopes,
             default.include_isotopes,

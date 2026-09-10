@@ -165,6 +165,52 @@ def test_fragment_candidates_include_isotope_peak_support():
     assert len(set(fragments['formula_index'])) < len(fragments['formula_index'])
 
 
+def test_direct_bond_cut_support_adds_internal_component():
+    recursive = smiles_to_fragment_candidates(
+        'CCOCC',
+        mz_max=256.0,
+        bin_width=0.01,
+        config=FragmentConfig(
+            max_tree_depth=1,
+            max_broken_bonds=4,
+            max_fragments=128,
+            direct_bond_cut_fragments=False,
+        ),
+    )
+    direct = smiles_to_fragment_candidates(
+        'CCOCC',
+        mz_max=256.0,
+        bin_width=0.01,
+        config=FragmentConfig(
+            max_tree_depth=1,
+            max_broken_bonds=4,
+            max_fragments=128,
+            direct_bond_cut_fragments=True,
+            max_direct_bond_cuts=2,
+        ),
+    )
+
+    recursive_masks = {tuple(indices) for indices in recursive['atom_indices']}
+    direct_masks = {tuple(indices) for indices in direct['atom_indices']}
+
+    assert (2,) not in recursive_masks
+    assert (2,) in direct_masks
+    assert len(direct_masks) > len(recursive_masks)
+
+
+def test_fragment_config_cache_settings_fork_for_direct_bond_cut_support():
+    disabled = _fragment_config_cache_settings(FragmentConfig())
+    enabled = _fragment_config_cache_settings(
+        FragmentConfig(direct_bond_cut_fragments=True, max_direct_bond_cuts=2)
+    )
+
+    assert 'direct_bond_cut_fragments' not in disabled
+    assert 'max_direct_bond_cuts' not in disabled
+    assert enabled['direct_bond_cut_fragments'] is True
+    assert enabled['max_direct_bond_cuts'] == 2
+    assert disabled != enabled
+
+
 def test_collate_offsets_formula_indices_between_molecules():
     config = FragmentConfig(
         max_tree_depth=0,

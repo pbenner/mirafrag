@@ -16,6 +16,8 @@ PREDICT_INPUT ?= $(RESOURCE_DIR)/data/molecules.csv
 MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag.pt
 MSNLIB_ACTION_GEOMETRY_MODEL ?= $(ROOT)/resources/msnlib/checkpoints/mirafrag_msnlib_unimol_action_geometry.pt
 SCRATCH_ACTION_GEOMETRY_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_scratch.pt
+SCRATCH_ACTION_GEOMETRY_V2_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_v2_scratch.pt
+SCRATCH_ACTION_GEOMETRY_V2_DIRECT_CUTS_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_v2_direct_cuts_scratch.pt
 INIT_MODEL ?=
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 STRATIFIED_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_stratified_eval.csv
@@ -43,6 +45,10 @@ CACHE_CHUNK_SIZE ?= 1
 TRAIN_PREFILL_CACHE ?= 1
 TRAIN_CACHE_NUM_WORKERS ?= $(NUM_WORKERS)
 TRAIN_CACHE_CHUNK_SIZE ?= 1
+EVAL_CACHE_NUM_WORKERS ?= $(NUM_WORKERS)
+EVAL_CACHE_CHUNK_SIZE ?= 1
+EVAL_CACHE_TASK_TIMEOUT ?= 0
+EVAL_CACHE_POOL_STALL_TIMEOUT ?= 0
 ORACLE_CHUNK_SIZE ?= $(BATCH_SIZE)
 RETRIEVAL_CANDIDATE_MODE ?= explicit
 RETRIEVAL_MAX_CANDIDATES ?= 256
@@ -140,6 +146,8 @@ MAX_FRAGMENT_TREE_DEPTH ?= 3
 MAX_FRAGMENT_BROKEN_BONDS ?= 4
 MAX_FRAGMENTS ?= 1024
 MAX_FRAGMENT_EDGES ?= 4096
+DIRECT_BOND_CUT_FRAGMENTS ?=
+MAX_DIRECT_BOND_CUTS ?= 2
 HIGH_CE_FRAGMENT_THRESHOLD ?=
 HIGH_CE_MAX_FRAGMENT_TREE_DEPTH ?= 4
 HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS ?= 6
@@ -150,6 +158,8 @@ FRAGMENT_PATH_LAYERS ?= 3
 FRAGMENT_PATH_PRIMARY ?= 0
 FRAGMENT_ACTION_PRIMARY_LAYERS ?=
 BOND_BREAK_GEOMETRY_FEATURES ?=
+BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES ?=
+FRAGMENT_ACTION_CE_CONDITIONING ?=
 INCLUDE_FRAGMENT_ISOTOPES ?= 1
 FINE_TUNE_STRATEGY ?= full
 
@@ -261,12 +271,34 @@ else ifeq ($(strip $(BOND_BREAK_GEOMETRY_FEATURES)),0)
 ACTION_PRIMARY_ARGS += --no-bond-break-geometry-features
 endif
 endif
+ifneq ($(strip $(BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES)),)
+ifeq ($(strip $(BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES)),1)
+ACTION_PRIMARY_ARGS += --bond-break-local-environment-features
+else ifeq ($(strip $(BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES)),0)
+ACTION_PRIMARY_ARGS += --no-bond-break-local-environment-features
+endif
+endif
+ifneq ($(strip $(FRAGMENT_ACTION_CE_CONDITIONING)),)
+ifeq ($(strip $(FRAGMENT_ACTION_CE_CONDITIONING)),1)
+ACTION_PRIMARY_ARGS += --fragment-action-ce-conditioning
+else ifeq ($(strip $(FRAGMENT_ACTION_CE_CONDITIONING)),0)
+ACTION_PRIMARY_ARGS += --no-fragment-action-ce-conditioning
+endif
+endif
 ARCH_ARGS = --hidden-dim $(HIDDEN_DIM) --num-layers $(NUM_LAYERS) --dropout $(DROPOUT) --metadata-dim $(METADATA_DIM) --fragment-gnn-layers $(FRAGMENT_GNN_LAYERS) --fragment-path-layers $(FRAGMENT_PATH_LAYERS) $(PATH_PRIMARY_ARGS) $(ACTION_PRIMARY_ARGS)
 HIGH_CE_FRAGMENT_ARGS =
 ifneq ($(strip $(HIGH_CE_FRAGMENT_THRESHOLD)),)
 HIGH_CE_FRAGMENT_ARGS += --high-ce-fragment-threshold $(HIGH_CE_FRAGMENT_THRESHOLD) --high-ce-max-fragment-tree-depth $(HIGH_CE_MAX_FRAGMENT_TREE_DEPTH) --high-ce-max-fragment-broken-bonds $(HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS) --high-ce-max-fragments $(HIGH_CE_MAX_FRAGMENTS) --high-ce-max-fragment-edges $(HIGH_CE_MAX_FRAGMENT_EDGES)
 endif
-BASE_FRAGMENT_ARGS = --max-fragment-tree-depth $(MAX_FRAGMENT_TREE_DEPTH) --max-fragment-broken-bonds $(MAX_FRAGMENT_BROKEN_BONDS) --max-fragments $(MAX_FRAGMENTS) --max-fragment-edges $(MAX_FRAGMENT_EDGES) $(ISOTOPE_FRAGMENT_ARGS) --fragment-isotope-threshold $(FRAGMENT_ISOTOPE_THRESHOLD) --max-fragment-isotope-peaks $(MAX_FRAGMENT_ISOTOPE_PEAKS)
+DIRECT_BOND_CUT_ARGS =
+ifneq ($(strip $(DIRECT_BOND_CUT_FRAGMENTS)),)
+ifeq ($(strip $(DIRECT_BOND_CUT_FRAGMENTS)),1)
+DIRECT_BOND_CUT_ARGS += --direct-bond-cut-fragments --max-direct-bond-cuts $(MAX_DIRECT_BOND_CUTS)
+else ifeq ($(strip $(DIRECT_BOND_CUT_FRAGMENTS)),0)
+DIRECT_BOND_CUT_ARGS += --no-direct-bond-cut-fragments
+endif
+endif
+BASE_FRAGMENT_ARGS = --max-fragment-tree-depth $(MAX_FRAGMENT_TREE_DEPTH) --max-fragment-broken-bonds $(MAX_FRAGMENT_BROKEN_BONDS) --max-fragments $(MAX_FRAGMENTS) --max-fragment-edges $(MAX_FRAGMENT_EDGES) $(DIRECT_BOND_CUT_ARGS) $(ISOTOPE_FRAGMENT_ARGS) --fragment-isotope-threshold $(FRAGMENT_ISOTOPE_THRESHOLD) --max-fragment-isotope-peaks $(MAX_FRAGMENT_ISOTOPE_PEAKS)
 FRAGMENT_ARGS = $(BASE_FRAGMENT_ARGS) $(HIGH_CE_FRAGMENT_ARGS)
 HEAD_ARGS = $(ARCH_ARGS) $(FRAGMENT_ARGS)
 CHECKPOINT_FRAGMENT_ARGS = $(HIGH_CE_FRAGMENT_ARGS) $(ACTION_PRIMARY_ARGS)
@@ -296,6 +328,7 @@ LOSS_ARGS += --no-relative-mass-tolerance
 endif
 LOSS_ARGS += --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
 EVAL_EXPORT_ARGS = --top-k $(EVAL_TOP_K) --min-intensity $(EVAL_MIN_INTENSITY)
+EVAL_CACHE_PREFILL_ARGS = --cache-num-workers $(EVAL_CACHE_NUM_WORKERS) --cache-chunk-size $(EVAL_CACHE_CHUNK_SIZE)
 EVAL_DIAGNOSTIC_ARGS = --mass-tolerance $(MASS_TOLERANCE) --mass-tolerance-min-mz $(MASS_TOLERANCE_MIN_MZ)
 ifeq ($(strip $(RELATIVE_MASS_TOLERANCE)),1)
 EVAL_DIAGNOSTIC_ARGS += --relative-mass-tolerance
@@ -322,6 +355,7 @@ ifneq ($(strip $(ENSEMBLE_NAMES)),)
 ENSEMBLE_ARGS += --prediction-names $(ENSEMBLE_NAMES)
 endif
 RETRIEVAL_CACHE_ENV = MIRAFRAG_CACHE_TASK_TIMEOUT_SECONDS=$(RETRIEVAL_CACHE_TASK_TIMEOUT) MIRAFRAG_CACHE_POOL_STALL_SECONDS=$(RETRIEVAL_CACHE_POOL_STALL_TIMEOUT)
+EVAL_CACHE_ENV = MIRAFRAG_CACHE_TASK_TIMEOUT_SECONDS=$(EVAL_CACHE_TASK_TIMEOUT) MIRAFRAG_CACHE_POOL_STALL_SECONDS=$(EVAL_CACHE_POOL_STALL_TIMEOUT)
 RETRIEVAL_CANDIDATE_ARGS = --candidate-mode $(RETRIEVAL_CANDIDATE_MODE) --max-candidates $(RETRIEVAL_MAX_CANDIDATES) --query-chunk-size $(RETRIEVAL_QUERY_CHUNK_SIZE) --hit-ks $(RETRIEVAL_HIT_KS) --score $(RETRIEVAL_SCORE) --mass-candidate-tolerance $(RETRIEVAL_MASS_TOLERANCE) --cache-chunk-size $(RETRIEVAL_CACHE_CHUNK_SIZE) --score-num-workers $(RETRIEVAL_SCORE_NUM_WORKERS) --score-sample-timeout $(RETRIEVAL_SCORE_SAMPLE_TIMEOUT) --row-offset $(RETRIEVAL_ROW_OFFSET) $(if $(strip $(RETRIEVAL_CANDIDATES)),--candidate-input $(RETRIEVAL_CANDIDATES),)
 ifneq ($(strip $(RETRIEVAL_SAMPLE_ROWS)),)
 RETRIEVAL_CANDIDATE_ARGS += --sample-rows $(RETRIEVAL_SAMPLE_ROWS) --sample-seed $(RETRIEVAL_SAMPLE_SEED)
@@ -359,7 +393,7 @@ ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-action-geometry-scratch train-from-msnlib-geometry train-finetune eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-action-geometry-scratch train-action-geometry-v2-scratch train-action-geometry-v2-direct-cuts-scratch train-from-msnlib-geometry train-finetune eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
 
 
 help:
@@ -558,6 +592,22 @@ train-action-geometry-scratch:
 		BOND_BREAK_GEOMETRY_FEATURES=1 \
 		HIGH_CE_FRAGMENT_THRESHOLD=60
 
+train-action-geometry-v2-scratch:
+	$(MAKE) train-action-geometry-scratch \
+		SCRATCH_ACTION_GEOMETRY_MODEL=$(SCRATCH_ACTION_GEOMETRY_V2_MODEL) \
+		BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES=1 \
+		FRAGMENT_ACTION_CE_CONDITIONING=1
+
+train-action-geometry-v2-direct-cuts-scratch:
+	$(MAKE) train-action-geometry-scratch \
+		SCRATCH_ACTION_GEOMETRY_MODEL=$(SCRATCH_ACTION_GEOMETRY_V2_DIRECT_CUTS_MODEL) \
+		BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES=1 \
+		FRAGMENT_ACTION_CE_CONDITIONING=1 \
+		DIRECT_BOND_CUT_FRAGMENTS=1 \
+		MAX_DIRECT_BOND_CUTS=2 \
+		MAX_FRAGMENTS=2048 \
+		MAX_FRAGMENT_EDGES=8192
+
 train-from-msnlib-geometry:
 	$(MAKE) train \
 		MODEL=$(RESOURCE_DIR)/checkpoints/mirafrag_massspecgym_from_msnlib_geometry.pt \
@@ -605,16 +655,17 @@ train-finetune:
 
 eval:
 	mkdir -p $(dir $(PREDICTIONS))
-	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.eval \
+	$(EVAL_CACHE_ENV) PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.eval \
 		--input $(INPUT) \
 		--model $(MODEL) \
 		--output $(PREDICTIONS) \
 		$(COMMON_ARGS) \
 		$(GRAPH_RELAXATION_ARGS) \
 		$(CACHE_ARGS) \
+		$(EVAL_CACHE_PREFILL_ARGS) \
 		$(EVAL_EXPORT_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
-		$(HIGH_CE_FRAGMENT_ARGS) \
+		$(FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL) \
@@ -622,17 +673,18 @@ eval:
 
 eval-stratified:
 	mkdir -p $(dir $(PREDICTIONS)) $(dir $(STRATIFIED_OUTPUT))
-	PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.eval \
+	$(EVAL_CACHE_ENV) PYTHONPATH=$(PYTHONPATH) $(CHECKPOINT_PYTHON) -m mirafrag.cli.eval \
 		--input $(INPUT) \
 		--model $(MODEL) \
 		--output $(PREDICTIONS) \
 		$(COMMON_ARGS) \
 		$(GRAPH_RELAXATION_ARGS) \
 		$(CACHE_ARGS) \
+		$(EVAL_CACHE_PREFILL_ARGS) \
 		$(EVAL_EXPORT_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
 		$(EVAL_STRATIFY_ARGS) \
-		$(HIGH_CE_FRAGMENT_ARGS) \
+		$(FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
@@ -676,7 +728,7 @@ retrieval-eval: $(RETRIEVAL_CANDIDATES)
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
 		$(RETRIEVAL_CANDIDATE_ARGS) \
-		$(HIGH_CE_FRAGMENT_ARGS) \
+		$(FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
@@ -690,7 +742,7 @@ oracle:
 		--device $(DEVICE) --mz-max $(MZ_MAX) --bin-width $(BIN_WIDTH) --batch-size $(BATCH_SIZE) --chunk-size $(ORACLE_CHUNK_SIZE) --num-workers $(NUM_WORKERS) $(PROGRESS_ARGS) \
 		$(CACHE_ARGS) \
 		$(EVAL_DIAGNOSTIC_ARGS) \
-		$(HIGH_CE_FRAGMENT_ARGS) \
+		$(FRAGMENT_ARGS) \
 		$(ROW_LIMIT_ARGS) \
 		--split $(EVAL_SPLIT) \
 		--split-col $(SPLIT_COL)
@@ -703,7 +755,7 @@ predict:
 		--output $(PREDICT_OUTPUT) \
 		$(COMMON_ARGS) \
 		$(CACHE_ARGS) \
-		$(HIGH_CE_FRAGMENT_ARGS)
+		$(FRAGMENT_ARGS)
 
 test:
 	PYTHONPATH=$(PYTHONPATH) $(PYTEST) -q $(ROOT)/tests
