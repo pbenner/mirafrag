@@ -18,6 +18,15 @@ MSNLIB_ACTION_GEOMETRY_MODEL ?= $(ROOT)/resources/msnlib/checkpoints/mirafrag_ms
 SCRATCH_ACTION_GEOMETRY_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_scratch.pt
 SCRATCH_ACTION_GEOMETRY_V2_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_v2_scratch.pt
 SCRATCH_ACTION_GEOMETRY_V2_DIRECT_CUTS_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_v2_direct_cuts_scratch.pt
+PAIR_ACTION_BASE_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_action_geometry_v2_direct_cuts3_wd_refine.pt
+PAIR_ACTION_DIAGNOSTIC_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_pair_action_diagnostic.pt
+PAIR_ACTION_TOP2_MODEL ?= $(RESOURCE_DIR)/checkpoints/mirafrag_pair_action_top2_refine.pt
+PAIR_ACTION_RUN_MODEL ?= $(PAIR_ACTION_DIAGNOSTIC_MODEL)
+PAIR_ACTION_INIT_MODEL ?= $(PAIR_ACTION_BASE_MODEL)
+PAIR_ACTION_EPOCHS ?= 5
+PAIR_ACTION_LR ?= 1e-4
+PAIR_ACTION_ENCODER_LR ?= 1e-6
+PAIR_ACTION_TRAIN_ENCODER_LAYERS ?= 0
 INIT_MODEL ?=
 PREDICTIONS ?= $(RESOURCE_DIR)/predictions/massspecgym_test_predictions.csv
 STRATIFIED_OUTPUT ?= $(RESOURCE_DIR)/predictions/massspecgym_stratified_eval.csv
@@ -130,7 +139,7 @@ ENTROPY_WEIGHT ?= 0.0
 MASS_TOLERANCE ?= 0.01
 RELATIVE_MASS_TOLERANCE ?= 0
 MASS_TOLERANCE_MIN_MZ ?= 200
-NUM_WORKERS ?= 16
+NUM_WORKERS ?= 20
 MAX_ROWS ?=
 PROGRESS ?= 1
 CHECKPOINT_METRIC ?= val_loss
@@ -160,6 +169,11 @@ FRAGMENT_ACTION_PRIMARY_LAYERS ?=
 BOND_BREAK_GEOMETRY_FEATURES ?=
 BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES ?=
 FRAGMENT_ACTION_CE_CONDITIONING ?=
+BOND_BREAK_PAIR_FEATURES ?=
+BOND_BREAK_PAIR_DIM ?= 128
+BOND_BREAK_PAIR_DROPOUT ?= 0.2
+PAIR_ACTION_ONLY ?= 0
+PAIR_ACTION_ENCODER_LAYERS ?= 0
 INCLUDE_FRAGMENT_ISOTOPES ?= 1
 FINE_TUNE_STRATEGY ?= full
 
@@ -285,6 +299,17 @@ else ifeq ($(strip $(FRAGMENT_ACTION_CE_CONDITIONING)),0)
 ACTION_PRIMARY_ARGS += --no-fragment-action-ce-conditioning
 endif
 endif
+ifneq ($(strip $(BOND_BREAK_PAIR_FEATURES)),)
+ifeq ($(strip $(BOND_BREAK_PAIR_FEATURES)),1)
+ACTION_PRIMARY_ARGS += --bond-break-pair-features --bond-break-pair-dim $(BOND_BREAK_PAIR_DIM) --bond-break-pair-dropout $(BOND_BREAK_PAIR_DROPOUT)
+else ifeq ($(strip $(BOND_BREAK_PAIR_FEATURES)),0)
+ACTION_PRIMARY_ARGS += --no-bond-break-pair-features
+endif
+endif
+PAIR_ACTION_TRAIN_ARGS =
+ifeq ($(strip $(PAIR_ACTION_ONLY)),1)
+PAIR_ACTION_TRAIN_ARGS += --pair-action-only --pair-action-encoder-layers $(PAIR_ACTION_ENCODER_LAYERS)
+endif
 ARCH_ARGS = --hidden-dim $(HIDDEN_DIM) --num-layers $(NUM_LAYERS) --dropout $(DROPOUT) --metadata-dim $(METADATA_DIM) --fragment-gnn-layers $(FRAGMENT_GNN_LAYERS) --fragment-path-layers $(FRAGMENT_PATH_LAYERS) $(PATH_PRIMARY_ARGS) $(ACTION_PRIMARY_ARGS)
 HIGH_CE_FRAGMENT_ARGS =
 ifneq ($(strip $(HIGH_CE_FRAGMENT_THRESHOLD)),)
@@ -393,7 +418,7 @@ ifneq ($(strip $(MAX_ROWS)),)
 ROW_LIMIT_ARGS += --max-rows $(MAX_ROWS)
 endif
 
-.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-action-geometry-scratch train-action-geometry-v2-scratch train-action-geometry-v2-direct-cuts-scratch train-from-msnlib-geometry train-finetune eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
+.PHONY: help install install-dev install-data-deps prepare-data prepare-retrieval-candidates prepare-cache train train-action-geometry-scratch train-action-geometry-v2-scratch train-action-geometry-v2-direct-cuts-scratch train-pair-action-diagnostic train-pair-action-top2 train-from-msnlib-geometry train-finetune eval eval-stratified gap-diagnostics ensemble-eval retrieval-eval oracle predict test lint format clean
 
 
 help:
@@ -407,6 +432,8 @@ help:
 		'  make prepare-cache       Precompute graph/fragment feature cache' \
 		'  make train-finetune      Same as train, with explicit fine-tune target name' \
 		'  make train-action-geometry-scratch  Train the retained action-geometry model from scratch' \
+		'  make train-pair-action-diagnostic  Add the retained Uni-Mol pair-action branch' \
+		'  make train-pair-action-top2  Adapt the pair branch and final two Uni-Mol layers' \
 		'  make train-from-msnlib-geometry  Reproduce the current best MSnLib-to-MassSpecGym transfer' \
 		'  make eval INPUT=...      Evaluate checkpoint on MassSpecGym split' \
 		'  make eval-stratified    Evaluate checkpoint and group metrics by metadata' \
@@ -564,6 +591,7 @@ train:
 		--epochs $(EPOCHS) \
 		$(LOSS_ARGS) \
 		$(OPTIM_ARGS) \
+		$(PAIR_ACTION_TRAIN_ARGS) \
 		--train-split $(TRAIN_SPLIT) \
 		--val-split $(VAL_SPLIT) \
 		--split-col $(SPLIT_COL) \
@@ -607,6 +635,40 @@ train-action-geometry-v2-direct-cuts-scratch:
 		MAX_DIRECT_BOND_CUTS=2 \
 		MAX_FRAGMENTS=2048 \
 		MAX_FRAGMENT_EDGES=8192
+
+train-pair-action-diagnostic:
+	$(MAKE) train \
+		MODEL=$(PAIR_ACTION_RUN_MODEL) \
+		INIT_MODEL=$(PAIR_ACTION_INIT_MODEL) \
+		ENCODER=unimol CHECKPOINT_ENCODER=unimol \
+		DISK_CACHE_DIR=$(RESOURCE_DIR)/data/cache/mirafrag_features_direct_cuts3 \
+		BATCH_SIZE=16 \
+		EPOCHS=$(PAIR_ACTION_EPOCHS) LOSS=decoupled_kl CHECKPOINT_METRIC=val_cosine \
+		LR=$(PAIR_ACTION_LR) ENCODER_LR=$(PAIR_ACTION_ENCODER_LR) \
+		WEIGHT_DECAY=3e-3 HEAD_WEIGHT_DECAY=1e-4 \
+		TARGET_POWER=1.2 ENTROPY_WEIGHT=0.0005 \
+		SCHEDULER=exponential EXPONENTIAL_GAMMA=0.98 \
+		TRAIN_PREFILL_CACHE=0 \
+		FRAGMENT_PATH_LAYERS=3 FRAGMENT_ACTION_PRIMARY_LAYERS=2 \
+		BOND_BREAK_GEOMETRY_FEATURES=1 \
+		BOND_BREAK_LOCAL_ENVIRONMENT_FEATURES=1 \
+		FRAGMENT_ACTION_CE_CONDITIONING=1 \
+		DIRECT_BOND_CUT_FRAGMENTS=1 MAX_DIRECT_BOND_CUTS=3 \
+		MAX_FRAGMENTS=4096 MAX_FRAGMENT_EDGES=16384 \
+		HIGH_CE_FRAGMENT_THRESHOLD=60 \
+		HIGH_CE_MAX_FRAGMENT_TREE_DEPTH=4 \
+		HIGH_CE_MAX_FRAGMENT_BROKEN_BONDS=6 \
+		HIGH_CE_MAX_FRAGMENTS=4096 \
+		HIGH_CE_MAX_FRAGMENT_EDGES=16384 \
+		BOND_BREAK_PAIR_FEATURES=1 PAIR_ACTION_ONLY=1 \
+		PAIR_ACTION_ENCODER_LAYERS=$(PAIR_ACTION_TRAIN_ENCODER_LAYERS)
+
+train-pair-action-top2:
+	$(MAKE) train-pair-action-diagnostic \
+		PAIR_ACTION_RUN_MODEL=$(PAIR_ACTION_TOP2_MODEL) \
+		PAIR_ACTION_INIT_MODEL=$(PAIR_ACTION_DIAGNOSTIC_MODEL) \
+		PAIR_ACTION_LR=3e-5 PAIR_ACTION_ENCODER_LR=1e-6 \
+		PAIR_ACTION_TRAIN_ENCODER_LAYERS=2
 
 train-from-msnlib-geometry:
 	$(MAKE) train \

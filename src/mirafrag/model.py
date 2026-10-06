@@ -9,6 +9,7 @@ from mirafrag.adducts import parse_adduct
 from mirafrag.config import MiraFragConfig
 from mirafrag.data import MetadataConfig
 from mirafrag.heads.fragment import FragmentSpectrumHead
+from mirafrag.heads.pair_features import unique_candidate_pair_index
 from mirafrag.probability import fragment_oos_log_probs
 
 ENCODER_FINE_TUNE_STRATEGIES = ('head', 'full')
@@ -56,6 +57,12 @@ class MiraFragModel(nn.Module):
             persistent=False,
         )
         self.encoder = self._prepare_encoder(encoder)
+        self.pair_action_only = False
+        self.pair_action_encoder_layers = 0
+        if bool(getattr(config, 'bond_break_pair_features', False)) and not bool(
+            getattr(self.encoder, 'supports_pair_representations', False)
+        ):
+            raise ValueError('bond_break_pair_features requires trainable Uni-Mol v1.')
         self.adduct_embedding = nn.Embedding(
             metadata_config.num_adducts, config.metadata_dim
         )
@@ -307,7 +314,7 @@ class MiraFragModel(nn.Module):
         trainable_encoder = (
             self.training
             and torch.is_grad_enabled()
-            and self._encoder_finetune_strategy() == 'full'
+            and any(param.requires_grad for param in self.encoder.parameters())
         )
         context = torch.enable_grad() if trainable_encoder else torch.no_grad()
         kwargs: dict[str, Any] = {}
@@ -361,8 +368,15 @@ class MiraFragModel(nn.Module):
         metadata_features = self.metadata_features(batch)
         if 'fragments' not in batch:
             raise ValueError("MiraFrag requires batch['fragments'].")
+        encoder_graph = batch['graph']
+        pair_enabled = bool(getattr(self.config, 'bond_break_pair_features', False))
+        if pair_enabled:
+            encoder_graph = dict(encoder_graph)
+            encoder_graph['pair_index'] = unique_candidate_pair_index(
+                batch['fragments']
+            )
         encoder_out = self._encode_node_outputs(
-            batch['graph'],
+            encoder_graph,
             molecular_charge=self._molecular_charge(batch),
             smiles=batch.get('smiles'),
             metadata_features=metadata_features,
@@ -374,6 +388,10 @@ class MiraFragModel(nn.Module):
             metadata_features,
             graph_batch=batch['graph'].get('batch'),
             graph=batch['graph'],
+            pair_feats=encoder_out.get('pair_feats') if pair_enabled else None,
+            pair_edge_index=(
+                encoder_out.get('pair_edge_index') if pair_enabled else None
+            ),
         )
         return pred
 
@@ -396,7 +414,22 @@ def set_encoder_finetune_strategy(model: MiraFragModel, strategy: str) -> None:
             f'Unknown encoder_finetune_strategy {strategy!r}; '
             f'expected one of: {", ".join(ENCODER_FINE_TUNE_STRATEGIES)}.'
         )
-    train_encoder = strategy == 'full'
+    pair_action_only = bool(getattr(model, 'pair_action_only', False))
+    selective_layers = (
+        int(getattr(model, 'pair_action_encoder_layers', 0)) if pair_action_only else 0
+    )
+    configure_top_layers = getattr(
+        model.encoder, 'configure_trainable_top_layers', None
+    )
+    if configure_top_layers is not None:
+        configure_top_layers(0)
+    train_encoder = strategy == 'full' and not pair_action_only
     for param in model.encoder.parameters():
         param.requires_grad_(train_encoder)
+    if selective_layers:
+        if configure_top_layers is None:
+            raise ValueError(
+                'pair_action_encoder_layers requires a compatible Uni-Mol encoder.'
+            )
+        configure_top_layers(selective_layers)
     model.config.encoder_finetune_strategy = strategy

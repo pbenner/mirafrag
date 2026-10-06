@@ -79,6 +79,10 @@ class UniMolNodeEncoder(nn.Module):
         self.max_atoms = int(max_atoms)
         self.mode = mode
         self.uses_smiles = self.mode == 'trainable' and self.model_name == 'unimolv2'
+        self.supports_pair_representations = (
+            self.mode == 'trainable' and self.model_name == 'unimolv1'
+        )
+        self.trainable_top_layers = 0
         self._device_name = _unimol_device_name(device)
         self._repr = None
         self.unimol_model: nn.Module | None = None
@@ -99,7 +103,49 @@ class UniMolNodeEncoder(nn.Module):
         super().train(mode)
         if self.mode == 'frozen':
             super().train(False)
+        elif self.unimol_model is not None:
+            self._set_unimol_training_mode(mode)
         return self
+
+    def configure_trainable_top_layers(self, count: int) -> None:
+        """Restrict adaptation to the final Uni-Mol transformer layers."""
+        count = int(count)
+        if count < 0:
+            raise ValueError('Trainable Uni-Mol layer count must be nonnegative.')
+        if count and not self.supports_pair_representations:
+            raise ValueError(
+                'Selective top-layer training requires trainable Uni-Mol v1.'
+            )
+        self.trainable_top_layers = count
+        if count:
+            model = self._unimol_model()
+            layers = model.encoder.layers
+            if count > len(layers):
+                raise ValueError(
+                    f'Requested {count} Uni-Mol layers, but the encoder has '
+                    f'{len(layers)}.'
+                )
+            for param in model.parameters():
+                param.requires_grad_(False)
+            for layer in layers[-count:]:
+                for param in layer.parameters():
+                    param.requires_grad_(True)
+            final_layer_norm = getattr(model.encoder, 'final_layer_norm', None)
+            if final_layer_norm is not None:
+                for param in final_layer_norm.parameters():
+                    param.requires_grad_(True)
+        if self.unimol_model is not None:
+            self._set_unimol_training_mode(self.training)
+
+    def _set_unimol_training_mode(self, training: bool) -> None:
+        model = self._unimol_model()
+        if self.trainable_top_layers <= 0:
+            model.train(training)
+            return
+        model.eval()
+        if training:
+            for layer in model.encoder.layers[-self.trainable_top_layers :]:
+                layer.train(True)
 
     def forward(
         self,
@@ -132,13 +178,26 @@ class UniMolNodeEncoder(nn.Module):
                 node_feats = torch.empty(0, 0, dtype=torch.float32)
             return {'node_feats': node_feats.to(device=graph['positions'].device)}
 
-        outputs = self._encode_batch_trainable(
-            atomic_numbers,
-            positions,
-            ptr_cpu,
-            training=training,
-            smiles=smiles,
-        )
+        pair_index = graph.get('pair_index')
+        pair_features = None
+        if pair_index is not None:
+            if not self.supports_pair_representations:
+                raise ValueError('Pair representations require trainable Uni-Mol v1.')
+            outputs, pair_features = self._encode_batch_trainable_with_pairs(
+                atomic_numbers,
+                positions,
+                ptr_cpu,
+                pair_index.detach().cpu().long(),
+                training=training,
+            )
+        else:
+            outputs = self._encode_batch_trainable(
+                atomic_numbers,
+                positions,
+                ptr_cpu,
+                training=training,
+                smiles=smiles,
+            )
         if outputs:
             node_feats = torch.cat(outputs, dim=0)
         else:
@@ -148,7 +207,13 @@ class UniMolNodeEncoder(nn.Module):
                 dtype=torch.float32,
                 device=graph['positions'].device,
             )
-        return {'node_feats': node_feats.to(device=graph['positions'].device)}
+        result = {'node_feats': node_feats.to(device=graph['positions'].device)}
+        if pair_features is not None:
+            result['pair_feats'] = pair_features.to(device=graph['positions'].device)
+            result['pair_edge_index'] = pair_index.to(
+                device=graph['positions'].device, dtype=torch.long
+            )
+        return result
 
     def _input_features(
         self,
@@ -214,7 +279,7 @@ class UniMolNodeEncoder(nn.Module):
         if not features:
             return []
         model = self._unimol_model()
-        model.train(training)
+        self._set_unimol_training_mode(training)
         samples = [(feature, None) for feature in features]
         batch, _labels = model.batch_collate_fn(samples)
         device = next(model.parameters()).device
@@ -231,6 +296,37 @@ class UniMolNodeEncoder(nn.Module):
         )
         atomic_reprs = result.get('atomic_reprs') if isinstance(result, dict) else None
         return _validate_atomic_reprs(atomic_reprs, expected_lengths)
+
+    def _encode_batch_trainable_with_pairs(
+        self,
+        atomic_numbers: torch.Tensor,
+        positions: torch.Tensor,
+        ptr: torch.Tensor,
+        pair_index: torch.Tensor,
+        *,
+        training: bool,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        features, expected_lengths = self._input_features(
+            atomic_numbers, positions, ptr
+        )
+        if not features:
+            return [], torch.empty((0, 0), dtype=torch.float32)
+        model = self._unimol_model()
+        self._set_unimol_training_mode(training)
+        samples = [(feature, None) for feature in features]
+        batch, _labels = model.batch_collate_fn(samples)
+        device = next(model.parameters()).device
+        net_input = {
+            key: value.to(device=device) if hasattr(value, 'to') else value
+            for key, value in batch.items()
+        }
+        return self._unimolv1_atomic_and_pair_reprs(
+            model,
+            net_input,
+            expected_lengths,
+            ptr=ptr,
+            pair_index=pair_index,
+        )
 
     def _input_features_v2(
         self,
@@ -370,6 +466,76 @@ class UniMolNodeEncoder(nn.Module):
             tensor = encoder_rep[row, 1 : expected_length + 1, :]
             outputs.append(tensor)
         return _validate_atomic_reprs(outputs, expected_lengths)
+
+    def _unimolv1_atomic_and_pair_reprs(
+        self,
+        model: nn.Module,
+        net_input: dict[str, torch.Tensor],
+        expected_lengths: list[int],
+        *,
+        ptr: torch.Tensor,
+        pair_index: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        src_tokens = net_input['src_tokens']
+        src_distance = net_input['src_distance']
+        src_edge_type = net_input['src_edge_type']
+        padding_mask = src_tokens.eq(model.padding_idx)
+        if not padding_mask.any():
+            padding_mask = None
+        x = model.embed_tokens(src_tokens)
+        n_node = src_distance.size(-1)
+        graph_attn_bias = model.gbf_proj(model.gbf(src_distance, src_edge_type))
+        graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+        graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
+        encoder_rep, pair_repr, delta_pair_repr, *_unused = model.encoder(
+            x,
+            padding_mask=padding_mask,
+            attn_mask=graph_attn_bias,
+        )
+        outputs = [
+            encoder_rep[row, 1 : expected_length + 1, :]
+            for row, expected_length in enumerate(expected_lengths)
+        ]
+        outputs = _validate_atomic_reprs(outputs, expected_lengths)
+
+        if pair_index.ndim != 2 or pair_index.shape[1] != 2:
+            raise ValueError('pair_index must have shape [num_pairs, 2].')
+        if pair_index.numel() == 0:
+            pair_width = 2 * int(pair_repr.shape[-1] + delta_pair_repr.shape[-1])
+            return outputs, pair_repr.new_empty((0, pair_width))
+        total_atoms = int(ptr[-1]) if ptr.numel() else 0
+        if int(pair_index.min()) < 0 or int(pair_index.max()) >= total_atoms:
+            raise ValueError('Requested Uni-Mol pair index exceeds graph atoms.')
+        molecule_index = torch.bucketize(pair_index[:, 0], ptr[1:], right=True)
+        destination_molecule = torch.bucketize(pair_index[:, 1], ptr[1:], right=True)
+        if not torch.equal(molecule_index, destination_molecule):
+            raise ValueError('Requested Uni-Mol atom pairs cross molecule boundaries.')
+        local_pairs = pair_index - ptr[molecule_index].unsqueeze(-1)
+        for row, expected_length in enumerate(expected_lengths):
+            selected = local_pairs[molecule_index.eq(row)]
+            if selected.numel() and (
+                int(selected.min()) < 0 or int(selected.max()) >= expected_length
+            ):
+                raise ValueError('Requested Uni-Mol pair index exceeds molecule atoms.')
+        molecule_index = molecule_index.to(device=pair_repr.device)
+        local_pairs = local_pairs.to(device=pair_repr.device)
+        src = local_pairs[:, 0] + 1
+        dst = local_pairs[:, 1] + 1
+        forward = torch.cat(
+            [
+                pair_repr[molecule_index, src, dst],
+                delta_pair_repr[molecule_index, src, dst],
+            ],
+            dim=-1,
+        )
+        reverse = torch.cat(
+            [
+                pair_repr[molecule_index, dst, src],
+                delta_pair_repr[molecule_index, dst, src],
+            ],
+            dim=-1,
+        )
+        return outputs, torch.cat([forward, reverse], dim=-1)
 
     def _encode_batch_frozen(
         self,

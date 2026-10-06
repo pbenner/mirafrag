@@ -38,6 +38,9 @@ class MiraFragConfig:
     bond_break_geometry_features: bool = False
     bond_break_local_environment_features: bool = False
     fragment_action_ce_conditioning: bool = False
+    bond_break_pair_features: bool = False
+    bond_break_pair_dim: int = 128
+    bond_break_pair_dropout: float = 0.2
     ce_embedding: str = 'scalar'
     encoder_type: str = 'mace'
     encoder_finetune_strategy: str = 'head'

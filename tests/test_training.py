@@ -928,19 +928,19 @@ def test_fragment_action_primary_gradients_reach_pair_scorer_after_residual_open
             fragment_action_primary_layers=1,
         )
     )
-    node_feats = torch.randn(4, 5, requires_grad=True)
-    formula_features = torch.randn(2, 8)
-    context_features = torch.randn(2, 8)
-    collision_features = torch.randn(2, 8)
-    fragment_descriptor = torch.randn(2, FRAGMENT_FEATURE_DIM)
-    formula_batch = torch.zeros(2, dtype=torch.long)
-    base_logits = torch.randn(2)
+    node_feats = torch.randn(6, 5, requires_grad=True)
+    formula_features = torch.randn(3, 8)
+    context_features = torch.randn(3, 8)
+    collision_features = torch.randn(3, 8)
+    fragment_descriptor = torch.randn(3, FRAGMENT_FEATURE_DIM)
+    formula_batch = torch.zeros(3, dtype=torch.long)
+    base_logits = torch.randn(3)
     fragments = {
-        'bond_atom_index': torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
-        'bond_ptr': torch.tensor([0, 1, 2], dtype=torch.long),
-        'bond_features': torch.randn(2, BOND_BREAK_FEATURE_DIM),
+        'bond_atom_index': torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.long),
+        'bond_ptr': torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        'bond_features': torch.randn(3, BOND_BREAK_FEATURE_DIM),
     }
-    head.train()
+    head.eval()
     _ = head._fragment_action_primary_delta(
         node_feats,
         formula_features,

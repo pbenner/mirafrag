@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.parameter import is_lazy
 
@@ -12,6 +13,7 @@ from mirafrag.fragments import (
     FRAGMENT_EDGE_FEATURE_DIM,
     FRAGMENT_FORMULA_DIM,
 )
+from mirafrag.heads.pair_features import align_directional_pair_features
 
 FRAGMENT_ACTION_GEOMETRY_FEATURE_DIM = 8
 FRAGMENT_ACTION_LOCAL_ENV_FEATURE_DIM = 15
@@ -47,6 +49,17 @@ class FragmentSpectrumHead(nn.Module):
         self.fragment_action_ce_conditioning = bool(
             getattr(config, 'fragment_action_ce_conditioning', False)
         )
+        self.bond_break_pair_features = bool(
+            getattr(config, 'bond_break_pair_features', False)
+        )
+        self.bond_break_pair_dim = int(getattr(config, 'bond_break_pair_dim', 128))
+        self.bond_break_pair_dropout = float(
+            getattr(config, 'bond_break_pair_dropout', 0.2)
+        )
+        if self.bond_break_pair_dim <= 0:
+            raise ValueError('bond_break_pair_dim must be positive.')
+        if not 0.0 <= self.bond_break_pair_dropout < 1.0:
+            raise ValueError('bond_break_pair_dropout must be in [0, 1).')
         self.collision_feature_dim = 1
         self.fragment_gnn_layers = nn.ModuleList(
             [
@@ -146,6 +159,22 @@ class FragmentSpectrumHead(nn.Module):
             self.fragment_action_primary_pair_scorer = None
             self.fragment_action_primary_residual = None
             self.fragment_action_primary_conditioner = None
+        if self.bond_break_pair_features:
+            with torch.random.fork_rng(devices=[]):
+                self.fragment_action_pair_projection = (
+                    self._make_fragment_action_pair_projection()
+                )
+                self.fragment_action_pair_event_encoder = (
+                    self._make_fragment_action_pair_event_encoder()
+                )
+                self.fragment_action_pair_residual = (
+                    self._make_fragment_action_pair_residual()
+                )
+                self._reset_fragment_action_pair_residual()
+        else:
+            self.fragment_action_pair_projection = None
+            self.fragment_action_pair_event_encoder = None
+            self.fragment_action_pair_residual = None
         self.oos_input_dropout = nn.Dropout(config.dropout)
         self.oos_hidden_dropout = nn.Dropout(config.dropout)
         self.oos_scorer = self._make_oos_scorer(config)
@@ -385,6 +414,48 @@ class FragmentSpectrumHead(nn.Module):
             nn.init.zeros_(final_layer.weight)
             nn.init.zeros_(final_layer.bias)
 
+    def _make_fragment_action_pair_projection(self) -> nn.Module:
+        dim = self.bond_break_pair_dim
+        return nn.Sequential(
+            nn.LazyLinear(dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Dropout(self.bond_break_pair_dropout),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+        )
+
+    def _make_fragment_action_pair_event_encoder(self) -> nn.Module:
+        dim = self.bond_break_pair_dim
+        return nn.Sequential(
+            nn.LazyLinear(dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Dropout(self.bond_break_pair_dropout),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+        )
+
+    def _make_fragment_action_pair_residual(self) -> nn.Module:
+        dim = self.bond_break_pair_dim
+        return nn.Sequential(
+            nn.LazyLinear(dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Dropout(self.bond_break_pair_dropout),
+            nn.Linear(dim, 1),
+        )
+
+    def _reset_fragment_action_pair_residual(self) -> None:
+        if self.fragment_action_pair_residual is None:
+            return
+        final_layer = self.fragment_action_pair_residual[-1]
+        if isinstance(final_layer, nn.Linear):
+            nn.init.zeros_(final_layer.weight)
+            nn.init.zeros_(final_layer.bias)
+
     @staticmethod
     def _make_oos_scorer(config: MiraFragConfig) -> nn.Module:
         """
@@ -418,6 +489,8 @@ class FragmentSpectrumHead(nn.Module):
         metadata_features: torch.Tensor,
         graph_batch: torch.Tensor | None = None,
         graph: dict[str, torch.Tensor] | None = None,
+        pair_feats: torch.Tensor | None = None,
+        pair_edge_index: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """
         Score sparse fragment peak candidates for a batch.
@@ -568,6 +641,20 @@ class FragmentSpectrumHead(nn.Module):
             batch_size=batch_size,
             base_logits=formula_logits,
             graph=graph,
+        )
+        formula_logits = formula_logits + self._fragment_action_pair_delta(
+            node_feats,
+            formula_features,
+            context_features,
+            collision_features,
+            fragment_descriptor,
+            fragments,
+            formula_batch,
+            batch_size=batch_size,
+            base_logits=formula_logits,
+            graph=graph,
+            pair_feats=pair_feats,
+            pair_edge_index=pair_edge_index,
         )
         bond_break_logits = node_feats.new_empty(0)
         bond_break_formula_index = torch.empty(
@@ -1069,6 +1156,117 @@ class FragmentSpectrumHead(nn.Module):
         for layer in scorer[4:]:
             hidden = layer(hidden)
         return hidden.squeeze(-1)
+
+    @staticmethod
+    def _normalize_directional_pair_features(pair_feats: torch.Tensor) -> torch.Tensor:
+        if pair_feats.ndim != 2 or pair_feats.shape[-1] % 4:
+            raise ValueError(
+                'Uni-Mol directional pair features must have width divisible by four.'
+            )
+        width = int(pair_feats.shape[-1]) // 4
+        return torch.cat(
+            [
+                F.layer_norm(block, (width,))
+                for block in pair_feats.split(width, dim=-1)
+            ],
+            dim=-1,
+        )
+
+    def _fragment_action_pair_delta(
+        self,
+        node_feats: torch.Tensor,
+        formula_features: torch.Tensor,
+        context_features: torch.Tensor,
+        collision_features: torch.Tensor,
+        fragment_descriptor: torch.Tensor,
+        fragments: dict[str, torch.Tensor],
+        formula_batch: torch.Tensor,
+        *,
+        batch_size: int,
+        base_logits: torch.Tensor,
+        graph: dict[str, torch.Tensor] | None,
+        pair_feats: torch.Tensor | None,
+        pair_edge_index: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Add a zero-initialized residual from Uni-Mol bond-pair states."""
+        if not self.bond_break_pair_features or formula_features.numel() == 0:
+            return base_logits.new_zeros(base_logits.shape)
+        if pair_feats is None or pair_edge_index is None:
+            raise ValueError(
+                'bond_break_pair_features requires encoder pair representations.'
+            )
+        if (
+            self.fragment_action_pair_projection is None
+            or self.fragment_action_pair_event_encoder is None
+            or self.fragment_action_pair_residual is None
+        ):
+            return base_logits.new_zeros(base_logits.shape)
+        event = self._fragment_bond_event_inputs(
+            node_feats,
+            formula_features,
+            context_features,
+            collision_features,
+            fragment_descriptor,
+            fragments,
+            include_formula=True,
+            include_fragment_descriptor=True,
+            graph=graph,
+        )
+        if event is None:
+            return base_logits.new_zeros(base_logits.shape)
+        pair_inputs, formula_index, counts = event
+        candidate_pairs = fragments['bond_atom_index'].to(
+            device=node_feats.device, dtype=torch.long
+        )
+        aligned_pairs = align_directional_pair_features(
+            pair_feats,
+            pair_edge_index,
+            candidate_pairs,
+            num_nodes=int(node_feats.shape[0]),
+        )
+        pair_hidden = self.fragment_action_pair_projection(
+            self._normalize_directional_pair_features(aligned_pairs)
+        )
+        event_hidden = self.fragment_action_pair_event_encoder(
+            torch.cat([pair_inputs, pair_hidden], dim=-1)
+        )
+
+        num_formulas = int(formula_features.shape[0])
+        pooled_sum = event_hidden.new_zeros(num_formulas, event_hidden.shape[-1])
+        pooled_sum.index_add_(0, formula_index, event_hidden)
+        action_count = counts.to(device=node_feats.device, dtype=node_feats.dtype)
+        pooled_mean = pooled_sum / action_count.clamp_min(1.0).unsqueeze(-1)
+        pooled_max = event_hidden.new_full(
+            (num_formulas, event_hidden.shape[-1]), float('-inf')
+        )
+        pooled_max.scatter_reduce_(
+            0,
+            formula_index[:, None].expand_as(event_hidden),
+            event_hidden,
+            reduce='amax',
+            include_self=True,
+        )
+        has_event = action_count > 0
+        pooled_max = torch.where(
+            has_event[:, None], pooled_max, torch.zeros_like(pooled_max)
+        )
+        normalized_base = self._standardize_by_batch(
+            base_logits.detach(), formula_batch, batch_size=batch_size
+        )
+        residual_inputs = torch.cat(
+            [
+                formula_features,
+                context_features,
+                collision_features,
+                pooled_mean,
+                pooled_max,
+                normalized_base.unsqueeze(-1),
+                torch.log1p(action_count).unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        delta = self.fragment_action_pair_residual(residual_inputs).squeeze(-1)
+        return torch.where(has_event, delta, torch.zeros_like(delta))
 
     def _materialize_empty_fragment_action_primary_scorer(
         self,

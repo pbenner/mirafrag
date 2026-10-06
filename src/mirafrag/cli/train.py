@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+from torch.nn.parameter import UninitializedParameter
 from torch.utils.data import DataLoader
 
 from mirafrag.cache_fill import prefill_feature_cache
@@ -323,6 +324,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--bond-break-pair-features',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Use directional Uni-Mol pair states for explicit broken bonds.',
+    )
+    parser.add_argument('--bond-break-pair-dim', type=int, default=None)
+    parser.add_argument('--bond-break-pair-dropout', type=float, default=None)
+    parser.add_argument(
+        '--pair-action-only',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Freeze the retained model and train only the Uni-Mol pair branch.',
+    )
+    parser.add_argument(
+        '--pair-action-encoder-layers',
+        type=int,
+        default=0,
+        help='Final Uni-Mol layers to adapt during pair-action-only training.',
+    )
+    parser.add_argument(
         '--direct-bond-cut-fragments',
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -531,6 +552,18 @@ def main() -> None:
         and args.fragment_action_primary_layers < 0
     ):
         raise SystemExit('--fragment-action-primary-layers must be nonnegative.')
+    if args.bond_break_pair_dim is not None and args.bond_break_pair_dim <= 0:
+        raise SystemExit('--bond-break-pair-dim must be positive.')
+    if args.bond_break_pair_dropout is not None and not (
+        0.0 <= args.bond_break_pair_dropout < 1.0
+    ):
+        raise SystemExit('--bond-break-pair-dropout must be in [0, 1).')
+    if args.pair_action_encoder_layers < 0:
+        raise SystemExit('--pair-action-encoder-layers must be nonnegative.')
+    if args.pair_action_encoder_layers and not args.pair_action_only:
+        raise SystemExit('--pair-action-encoder-layers requires --pair-action-only.')
+    if args.pair_action_only and not args.init_checkpoint:
+        raise SystemExit('--pair-action-only requires --init-checkpoint.')
     if (
         args.fragment_path_primary is True
         and not args.init_checkpoint
@@ -719,6 +752,10 @@ def main() -> None:
             args.fragment_action_ce_conditioning,
             'fragment_action_ce_conditioning',
         )
+        bond_break_pair_features = _requested_bool_config_value(
+            args.bond_break_pair_features,
+            'bond_break_pair_features',
+        )
         config = MiraFragConfig(
             num_bins=num_bins,
             hidden_dim=args.hidden_dim,
@@ -778,6 +815,13 @@ def main() -> None:
             bond_break_geometry_features=bond_break_geometry_features,
             bond_break_local_environment_features=bond_break_local_environment_features,
             fragment_action_ce_conditioning=fragment_action_ce_conditioning,
+            bond_break_pair_features=bond_break_pair_features,
+            bond_break_pair_dim=_mirafrag_config_value(
+                args.bond_break_pair_dim, 'bond_break_pair_dim'
+            ),
+            bond_break_pair_dropout=_mirafrag_config_value(
+                args.bond_break_pair_dropout, 'bond_break_pair_dropout'
+            ),
             encoder_type=encoder_type,
             encoder_finetune_strategy=fine_tune_strategy,
             foundation_source=args.foundation_source,
@@ -793,6 +837,11 @@ def main() -> None:
             unimol_mode=args.unimol_mode,
         )
         model = MiraFragModel(encoder, metadata_config=metadata_config, config=config)
+    if args.pair_action_only:
+        _set_pair_action_only(
+            model,
+            encoder_layers=args.pair_action_encoder_layers,
+        )
     fragment_support_profile = fragment_support_profile_from_model_config(model.config)
 
     train_ds = BinnedSpectrumDataset(
@@ -1020,6 +1069,24 @@ def _maybe_rebuild_fragment_bond_break_model(
         if requested_ce_conditioning is None
         else bool(requested_ce_conditioning)
     )
+    requested_pair_features = getattr(args, 'bond_break_pair_features', None)
+    target_pair_features = (
+        bool(getattr(model.config, 'bond_break_pair_features', False))
+        if requested_pair_features is None
+        else bool(requested_pair_features)
+    )
+    requested_pair_dim = getattr(args, 'bond_break_pair_dim', None)
+    target_pair_dim = int(
+        getattr(model.config, 'bond_break_pair_dim', 128)
+        if requested_pair_dim is None
+        else requested_pair_dim
+    )
+    requested_pair_dropout = getattr(args, 'bond_break_pair_dropout', None)
+    target_pair_dropout = float(
+        getattr(model.config, 'bond_break_pair_dropout', 0.2)
+        if requested_pair_dropout is None
+        else requested_pair_dropout
+    )
 
     current = (
         int(getattr(model.config, 'fragment_path_layers', 0)),
@@ -1028,6 +1095,9 @@ def _maybe_rebuild_fragment_bond_break_model(
         bool(getattr(model.config, 'bond_break_geometry_features', False)),
         bool(getattr(model.config, 'bond_break_local_environment_features', False)),
         bool(getattr(model.config, 'fragment_action_ce_conditioning', False)),
+        bool(getattr(model.config, 'bond_break_pair_features', False)),
+        int(getattr(model.config, 'bond_break_pair_dim', 128)),
+        float(getattr(model.config, 'bond_break_pair_dropout', 0.2)),
     )
     target = (
         target_path_layers,
@@ -1036,6 +1106,9 @@ def _maybe_rebuild_fragment_bond_break_model(
         target_geometry,
         target_local_environment,
         target_ce_conditioning,
+        target_pair_features,
+        target_pair_dim,
+        target_pair_dropout,
     )
     if current == target:
         return model
@@ -1047,6 +1120,12 @@ def _maybe_rebuild_fragment_bond_break_model(
             for key, value in state.items()
             if not key.startswith('head.fragment_action_primary_pair_scorer.0.')
         }
+    if current[6:] != target[6:]:
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith('head.fragment_action_pair_')
+        }
     config = replace(
         model.config,
         fragment_path_layers=target_path_layers,
@@ -1055,6 +1134,9 @@ def _maybe_rebuild_fragment_bond_break_model(
         bond_break_geometry_features=target_geometry,
         bond_break_local_environment_features=target_local_environment,
         fragment_action_ce_conditioning=target_ce_conditioning,
+        bond_break_pair_features=target_pair_features,
+        bond_break_pair_dim=target_pair_dim,
+        bond_break_pair_dropout=target_pair_dropout,
     )
     rebuilt = MiraFragModel(
         model.encoder,
@@ -1065,6 +1147,7 @@ def _maybe_rebuild_fragment_bond_break_model(
     allowed_prefixes = (
         'head.fragment_path_',
         'head.fragment_action_primary_',
+        'head.fragment_action_pair_',
         'head.formula_count_',
     )
     missing = [
@@ -1087,6 +1170,46 @@ def _maybe_rebuild_fragment_bond_break_model(
             f'{changed} fragmentation head parameters initialized from defaults.'
         )
     return rebuilt
+
+
+def _set_pair_action_only(
+    model: MiraFragModel,
+    *,
+    encoder_layers: int,
+) -> None:
+    if not bool(getattr(model.config, 'bond_break_pair_features', False)):
+        raise SystemExit('--pair-action-only requires --bond-break-pair-features.')
+    model.pair_action_only = True
+    model.pair_action_encoder_layers = int(encoder_layers)
+    for param in model.parameters():
+        if isinstance(param, UninitializedParameter):
+            param.requires_grad = False
+        else:
+            param.requires_grad_(False)
+    pair_parameters = 0
+    for name, param in model.head.named_parameters():
+        if name.startswith('fragment_action_pair_'):
+            if isinstance(param, UninitializedParameter):
+                param.requires_grad = True
+            else:
+                param.requires_grad_(True)
+            pair_parameters += 1
+    if encoder_layers:
+        configure = getattr(model.encoder, 'configure_trainable_top_layers', None)
+        if configure is None:
+            raise SystemExit(
+                '--pair-action-encoder-layers requires trainable Uni-Mol v1.'
+            )
+        configure(encoder_layers)
+    print(
+        'Pair-action-only training: froze retained model and enabled '
+        f'{pair_parameters} local pair-branch parameters'
+        + (
+            f' plus the final {encoder_layers} Uni-Mol layer(s).'
+            if encoder_layers
+            else '.'
+        )
+    )
 
 
 def _validate_loaded_checkpoint_config(
@@ -1163,6 +1286,8 @@ def _train_config(
         'coverage_weight': float(args.coverage_weight),
         'target_power': float(args.target_power),
         'entropy_weight': float(args.entropy_weight),
+        'pair_action_only': bool(args.pair_action_only),
+        'pair_action_encoder_layers': int(args.pair_action_encoder_layers),
         'scheduler': args.scheduler,
         'scheduler_interval': args.scheduler_interval,
         'exponential_gamma': float(args.exponential_gamma),

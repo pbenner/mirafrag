@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import UninitializedParameter
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, default_collate
 from tqdm.auto import tqdm
@@ -67,6 +68,14 @@ def run_epoch(
         raise ValueError('scheduler_interval must be one of: epoch, step.')
     training = optimizer is not None
     model.train(training)
+    if training and bool(getattr(model, 'pair_action_only', False)):
+        model.eval()
+        model.training = True
+        for name, module in model.head.named_modules():
+            if name.startswith('fragment_action_pair_'):
+                module.train(True)
+        if int(getattr(model, 'pair_action_encoder_layers', 0)) > 0:
+            model.encoder.train(True)
     total_examples = 0
     total_batches = len(loader)
     processed_batches = 0
@@ -93,10 +102,11 @@ def run_epoch(
         grad_context = torch.enable_grad() if training else torch.no_grad()
         with grad_context:
             pred = model(batch)
+            scored_pred = exclude_precursor_prediction_candidates(pred, batch)
             batch_size = int(pred['batch_size'])
             sample_weight = batch.get('sample_weight') if training else None
             loss = spectrum_loss(
-                pred,
+                scored_pred,
                 batch,
                 loss=loss_name,
                 mass_tolerance=mass_tolerance,
@@ -117,9 +127,8 @@ def run_epoch(
                 loss = (loss * weights).mean()
             distill_loss = loss.new_tensor(float('nan'))
             if training and distill_active:
-                distill_pred = exclude_precursor_prediction_candidates(pred, batch)
                 distill_loss = _teacher_projection_kl(
-                    distill_pred,
+                    scored_pred,
                     batch,
                     distill_spectra,
                     min_overlap_mass=distill_min_overlap_mass,
@@ -152,7 +161,6 @@ def run_epoch(
                 scheduler.step()
         with torch.no_grad():
             loss_value = float(loss.detach().cpu())
-            scored_pred = exclude_precursor_prediction_candidates(pred, batch)
             if loss_name in {
                 'decoupled_kl',
                 'decoupled_kl_cosine',
@@ -1129,14 +1137,37 @@ def _materialize_lazy_modules(
     """
     Run one dummy forward pass so lazy modules create their parameters before optimizer setup.
     """
-    try:
-        first_item = loader.dataset[0]
-    except IndexError as exc:
-        raise ValueError('Cannot train MiraFrag with an empty DataLoader.') from exc
     collate_fn = loader.collate_fn or default_collate
-    raw_batch = collate_fn([first_item])
     was_training = model.training
     model.eval()
-    with torch.no_grad():
-        model(move_batch_to_device(raw_batch, device))
+    for index in range(len(loader.dataset)):
+        try:
+            item = loader.dataset[index]
+        except IndexError as exc:
+            if index == 0:
+                raise ValueError(
+                    'Cannot train MiraFrag with an empty DataLoader.'
+                ) from exc
+            break
+        raw_batch = collate_fn([item])
+        with torch.no_grad():
+            model(move_batch_to_device(raw_batch, device))
+        if not any(
+            isinstance(param, UninitializedParameter) and param.requires_grad
+            for param in model.parameters()
+        ):
+            break
+    else:
+        if len(loader.dataset) == 0:
+            raise ValueError('Cannot train MiraFrag with an empty DataLoader.')
+    uninitialized = [
+        name
+        for name, param in model.named_parameters()
+        if isinstance(param, UninitializedParameter) and param.requires_grad
+    ]
     model.train(was_training)
+    if uninitialized:
+        raise RuntimeError(
+            'Could not materialize trainable lazy modules from the training data: '
+            f'{uninitialized}'
+        )
